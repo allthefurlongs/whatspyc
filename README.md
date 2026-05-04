@@ -923,11 +923,3 @@ fake-WPS direct-TCP smoke, and a fake-node-prompt + fake-WPS hop-script
 test (all always run); a remote-node smoke test gated on
 `WHATSPYC_INTEGRATION_HOST`.
 
-## See also
-
-- [`PREREQUISITES.md`](PREREQUISITES.md) — what's still stubbed and what's
-  intentionally out of scope.
-- [`PHASE2-PLAN.md`](PHASE2-PLAN.md) — historical plan that produced the
-  AX.25 L2 stack, reconnect/keep-alive, and the textual TUI.
-- [`CLAUDE.md`](CLAUDE.md) — code architecture for collaborators.
-- `../CLAUDE.md` — workspace-level pointer to docs and references.
