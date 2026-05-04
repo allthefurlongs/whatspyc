@@ -1,0 +1,677 @@
+"""SQLite-backed local store of WPS state.
+
+Used to feed accurate timestamps into the type-`c` connect handshake so the
+server only sends deltas, and to keep a usable local history of messages,
+posts, channel subscriptions, and ham name lookups.
+
+Synchronous SQLite access via the stdlib driver is fine here — calls are
+short, and ``WpsClient`` runs them on the event loop's executor only when it
+matters.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from importlib import resources
+from pathlib import Path
+
+
+class SqliteStore:
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self._path)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_schema_sql())
+        self._migrate()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    # ------------------------------------------------------------------
+    # Schema migration
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema for existing dbs.
+
+        ``CREATE TABLE IF NOT EXISTS`` only creates a missing table; it
+        does not reconcile columns. Pre-existing dbs need an explicit
+        ``ALTER TABLE ... ADD COLUMN`` per missing column. SQLite ignores
+        the column when the schema-script CREATE already produced it on a
+        fresh db, so this is the only path that runs both for upgraders
+        and is a no-op on fresh installs.
+        """
+        for table, column, decl in (
+            ("messages", "received_ts", "INTEGER"),
+            ("messages", "realtime", "INTEGER"),
+            ("messages", "delivered_ts", "INTEGER"),
+            ("posts", "received_ts", "INTEGER"),
+            ("posts", "realtime", "INTEGER"),
+            ("posts", "delivered_ts", "INTEGER"),
+            ("message_emojis", "callsign", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            cols = {
+                row["name"]
+                for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in cols:
+                with self._conn:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {decl}"
+                    )
+
+        # The WhatsPac protocol stores DM ``ts`` in seconds (the web
+        # client sends ``Math.round(Date.now()/1e3)`` and renders with
+        # ``ts*1e3``); channel-post ``ts`` and DM ``edts`` stay in ms.
+        # Earlier versions of this client incorrectly used ms for
+        # outbound DMs, polluting the local store with ms-magnitude
+        # values and leaving ``last_message`` stuck at a ms cursor that
+        # blocks every seconds-based DM the server later tries to
+        # deliver. Rewrite any ms-magnitude DM ``ts`` (and the matching
+        # ``last_message`` cursor) back to seconds. ``1e12`` is the
+        # cliff (year 2001 in ms), so any value at or above it can only
+        # be ms. Posts and DM edit-cursors stay untouched — they're
+        # ms-native by the web-client convention.
+        _MS_THRESHOLD = 1_000_000_000_000
+        with self._conn:
+            self._conn.execute(
+                "UPDATE messages SET ts = ts / 1000 WHERE ts >= ?",
+                (_MS_THRESHOLD,),
+            )
+            self._conn.execute(
+                "UPDATE meta SET value = value / 1000"
+                " WHERE key = 'last_message' AND value >= ?",
+                (_MS_THRESHOLD,),
+            )
+
+    # ------------------------------------------------------------------
+    # Connect-record support
+    # ------------------------------------------------------------------
+
+    def connect_record(self, name: str, callsign: str, version: float) -> dict:
+        """Build a type-`c` client record using stored timestamps."""
+        cur = self._conn.execute("SELECT key, value FROM meta")
+        meta = {row["key"]: row["value"] for row in cur.fetchall()}
+        cur = self._conn.execute(
+            "SELECT cid, last_post, last_emoji, last_edit FROM channels WHERE subscribed = 1"
+        )
+        channels = [
+            {
+                "cid": r["cid"],
+                "lp": r["last_post"],
+                "le": r["last_emoji"],
+                "led": r["last_edit"],
+            }
+            for r in cur.fetchall()
+        ]
+        return {
+            "t": "c",
+            "n": name,
+            "c": callsign.upper(),
+            "lm": meta.get("last_message", 0),
+            "le": meta.get("last_emoji", 0),
+            "led": meta.get("last_edit", 0),
+            "lhts": meta.get("last_ham_ts", 0),
+            "v": version,
+            "cc": channels,
+        }
+
+    def bump_meta(self, key: str, value: int) -> None:
+        """Set ``meta[key]`` to ``max(existing, value)``."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
+                (key, value),
+            )
+
+    # ------------------------------------------------------------------
+    # Messages
+    # ------------------------------------------------------------------
+
+    def upsert_message(
+        self,
+        m: dict,
+        *,
+        realtime: bool | None = None,
+        received_ts: int | None = None,
+        delivered_ts: int | None = None,
+    ) -> None:
+        msg_id = m.get("_id") or f"{m['ts']}-{m['fc']}"
+        rt = None if realtime is None else (1 if realtime else 0)
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO messages(id, from_call, to_call, body, ts, edit_ts,"
+                " reply_id, msg_status, received_ts, realtime, delivered_ts)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET body=excluded.body,"
+                " edit_ts=COALESCE(excluded.edit_ts, messages.edit_ts),"
+                # Receipt info is a property of the *first* time we saw
+                # the row — never overwrite it on a later upsert (e.g. an
+                # edit batch re-upserting an existing row).
+                " received_ts=COALESCE(messages.received_ts, excluded.received_ts),"
+                " realtime=COALESCE(messages.realtime, excluded.realtime),"
+                # delivered_ts is set by the `mr` ack handler when we get
+                # an authoritative server timestamp; on inbound paths
+                # carrying our own callsign (a row coming back from the
+                # server, e.g. cpb backfill or a different client
+                # instance's send) the caller seeds a synthetic value so
+                # the row doesn't render as still-pending. Either way,
+                # never let a later upsert clobber an existing value.
+                " delivered_ts=COALESCE(messages.delivered_ts, excluded.delivered_ts)",
+                (
+                    msg_id,
+                    m.get("fc"),
+                    m.get("tc"),
+                    m.get("m"),
+                    m.get("ts"),
+                    m.get("edts"),
+                    m.get("r"),
+                    m.get("ms"),
+                    received_ts,
+                    rt,
+                    delivered_ts,
+                ),
+            )
+        # DM `ts` is **seconds** since epoch on the wire (the web client
+        # sends `Math.round(Date.now()/1e3)`). `lm` in the type-`c`
+        # connect record uses the same unit. Storing what the wire gave
+        # us keeps `bump_meta` and the server's `ts > lm` filter in
+        # agreement; mixing in ms-magnitude values would push the cursor
+        # past every legitimate seconds-based DM and look like "0 new
+        # DMs" forever.
+        if (ts := m.get("ts")) is not None:
+            self.bump_meta("last_message", int(ts))
+
+    def mark_message_delivered(self, msg_id: str, delivered_ts: int) -> int:
+        """Flip ``msg_status = 1`` and record ``delivered_ts`` for the
+        message acked by a `mr` frame. Returns the count of rows updated
+        — `0` is fine and just means the ack arrived for a row we don't
+        have a copy of (e.g. cleared `state_dir` between send and ack).
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE messages SET msg_status = 1, delivered_ts = ?"
+                " WHERE id = ?",
+                (int(delivered_ts), msg_id),
+            )
+        return cur.rowcount
+
+    def apply_message_edit(self, msg_id: str, body: str, edit_ts: int) -> int:
+        """UPDATE-only: rewrite the body of an existing DM and bump its
+        ``edit_ts``. Returns the rowcount — ``0`` means the row isn't in
+        our store (e.g. an edit landed for a message that predates our
+        local cursor) and the caller can decide whether to render
+        anything for it.
+
+        Receipt metadata (``received_ts`` / ``realtime``) is *not*
+        touched: it describes the first observation, not later edits.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE messages SET body = ?,"
+                " edit_ts = MAX(COALESCE(edit_ts, 0), ?)"
+                " WHERE id = ?",
+                (body, int(edit_ts), msg_id),
+            )
+        return cur.rowcount
+
+    def recent_messages(
+        self, peer: str, limit: int = 50, *, before_ts: int | None = None
+    ) -> list[dict]:
+        """Return up to ``limit`` recent DM rows with ``peer``, newest first.
+
+        ``before_ts`` is the cursor for paginated scroll-back: pass the
+        oldest already-rendered row's ``ts`` to fetch the next older
+        page. ``None`` (the default) returns the most recent page.
+        """
+        if before_ts is None:
+            cur = self._conn.execute(
+                "SELECT rowid AS lid, * FROM messages WHERE from_call = ? OR to_call = ? "
+                "ORDER BY ts DESC LIMIT ?",
+                (peer, peer, limit),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT rowid AS lid, * FROM messages WHERE (from_call = ? OR to_call = ?) "
+                "AND ts < ? ORDER BY ts DESC LIMIT ?",
+                (peer, peer, int(before_ts), limit),
+            )
+        return [dict(r) for r in cur.fetchall()]
+
+    def lookup_message_by_lid(self, lid: int) -> dict | None:
+        """Return the message row for a local short id (SQLite rowid), or None.
+
+        The rowid is the integer the UI exposes via /editdm and friends so
+        users don't have to type the server's `{ts}-{fc}` ``_id``.
+        """
+        cur = self._conn.execute(
+            "SELECT rowid AS lid, * FROM messages WHERE rowid = ?", (int(lid),)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def lookup_message_by_id(self, msg_id: str) -> dict | None:
+        """Return the message row for a server ``_id`` (`{ts}-{fc}`), or None.
+
+        Used by the verbose render path to recover the lid + receipt
+        columns for a freshly-arrived `m` frame.
+        """
+        cur = self._conn.execute(
+            "SELECT rowid AS lid, * FROM messages WHERE id = ?", (msg_id,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def apply_message_emoji_list(
+        self,
+        msg_id: str,
+        peer_call: str,
+        emojis: list[str],
+        emoji_ts: int,
+    ) -> None:
+        """Replace the full emoji set for ``msg_id``.
+
+        Wire reality: `mem` carries no per-emoji authorship (just a list
+        of emoji strings — DM is 1-to-1, but the server stores set
+        semantics and the protocol doesn't surface "who reacted"). We
+        attribute locally: existing rows keep their callsign (so an
+        emoji we wrote from ``react_message`` stays attributed to us);
+        any newly-arrived emoji that we don't have a row for is
+        attributed to the DM peer.
+
+        Bumps ``meta.last_emoji`` so the connect record's ``le`` field
+        excludes already-seen emoji updates on the next reconnect.
+        """
+        peer = peer_call.upper()
+        existing_by_emoji = {
+            row["emoji"]: row["callsign"]
+            for row in self._conn.execute(
+                "SELECT emoji, callsign FROM message_emojis WHERE msg_id = ?",
+                (msg_id,),
+            )
+        }
+        new_set = set(emojis)
+        with self._conn:
+            if new_set:
+                placeholders = ",".join("?" * len(new_set))
+                self._conn.execute(
+                    f"DELETE FROM message_emojis WHERE msg_id = ?"
+                    f" AND emoji NOT IN ({placeholders})",
+                    [msg_id, *new_set],
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM message_emojis WHERE msg_id = ?", (msg_id,)
+                )
+            for e in emojis:
+                if e in existing_by_emoji:
+                    self._conn.execute(
+                        "UPDATE message_emojis SET emoji_ts = MAX(emoji_ts, ?)"
+                        " WHERE msg_id = ? AND emoji = ?",
+                        (int(emoji_ts), msg_id, e),
+                    )
+                else:
+                    self._conn.execute(
+                        "INSERT INTO message_emojis(msg_id, emoji, callsign, emoji_ts)"
+                        " VALUES (?, ?, ?, ?)",
+                        (msg_id, e, peer, int(emoji_ts)),
+                    )
+        self.bump_meta("last_emoji", int(emoji_ts))
+
+    def upsert_message_emoji(
+        self, msg_id: str, emoji: str, callsign: str, emoji_ts: int
+    ) -> None:
+        """Insert (or refresh ``emoji_ts`` on) one local emoji row.
+
+        Used by the outbound ``react_message`` path so the user's own
+        reaction is visible immediately — the WPS server doesn't echo
+        DM reactions back to the sender.
+        """
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO message_emojis(msg_id, emoji, callsign, emoji_ts)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(msg_id, emoji) DO UPDATE SET"
+                " callsign = excluded.callsign,"
+                " emoji_ts = MAX(message_emojis.emoji_ts, excluded.emoji_ts)",
+                (msg_id, emoji, callsign.upper(), int(emoji_ts)),
+            )
+        self.bump_meta("last_emoji", int(emoji_ts))
+
+    def remove_message_emoji(self, msg_id: str, emoji: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM message_emojis WHERE msg_id = ? AND emoji = ?",
+                (msg_id, emoji),
+            )
+
+    def list_message_emojis(self, msg_id: str) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT emoji, callsign, emoji_ts FROM message_emojis"
+            " WHERE msg_id = ? ORDER BY emoji_ts ASC, emoji ASC",
+            (msg_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_dm_peers(self, my_call: str) -> list[dict]:
+        """Return distinct DM peers ordered by most recent message.
+
+        Each row: ``{"peer": CALLSIGN, "last_ts": <ms>, "count": N}``.
+        """
+        me = my_call.upper()
+        cur = self._conn.execute(
+            "SELECT CASE WHEN from_call = ? THEN to_call ELSE from_call END AS peer, "
+            "       MAX(ts) AS last_ts, COUNT(*) AS count "
+            "FROM messages WHERE from_call = ? OR to_call = ? "
+            "GROUP BY peer ORDER BY last_ts DESC",
+            (me, me, me),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Posts
+    # ------------------------------------------------------------------
+
+    def upsert_post(
+        self,
+        channel_id: int,
+        p: dict,
+        *,
+        realtime: bool | None = None,
+        received_ts: int | None = None,
+        delivered_ts: int | None = None,
+    ) -> None:
+        rt = None if realtime is None else (1 if realtime else 0)
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO posts(channel_id, ts, from_call, body, edit_ts,"
+                " reply_ts, reply_from, received_ts, realtime, delivered_ts)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(channel_id, ts) DO UPDATE SET body=excluded.body,"
+                " edit_ts=COALESCE(excluded.edit_ts, posts.edit_ts),"
+                # Same first-write-wins rule as messages — receipt info
+                # describes the *original* observation, not a later edit.
+                " received_ts=COALESCE(posts.received_ts, excluded.received_ts),"
+                " realtime=COALESCE(posts.realtime, excluded.realtime),"
+                # See `upsert_message` — delivered_ts is preserved across
+                # upserts so a later backfill can't unset an authoritative
+                # ack value, and an authoritative ack via mark_post_delivered
+                # always overwrites the synthetic seed since that path uses
+                # a plain UPDATE.
+                " delivered_ts=COALESCE(posts.delivered_ts, excluded.delivered_ts)",
+                (
+                    channel_id,
+                    p["ts"],
+                    p.get("fc"),
+                    p.get("p"),
+                    p.get("edts"),
+                    p.get("rts"),
+                    p.get("rfc"),
+                    received_ts,
+                    rt,
+                    delivered_ts,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE channels SET last_post = MAX(last_post, ?) WHERE cid = ?",
+                (p["ts"], channel_id),
+            )
+
+    def apply_post_edit(
+        self, channel_id: int, ts: int, body: str, edit_ts: int
+    ) -> int:
+        """UPDATE-only: rewrite the body of an existing post and bump
+        its ``edit_ts``. Returns the rowcount.
+
+        Receipt metadata is preserved (same first-write-wins rule as
+        :meth:`apply_message_edit`). The caller is responsible for
+        bumping the per-channel ``last_edit`` cursor via
+        :meth:`bump_channel_last_edit`.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE posts SET body = ?,"
+                " edit_ts = MAX(COALESCE(edit_ts, 0), ?)"
+                " WHERE channel_id = ? AND ts = ?",
+                (body, int(edit_ts), int(channel_id), int(ts)),
+            )
+        return cur.rowcount
+
+    def bump_channel_last_edit(self, channel_id: int, edit_ts: int) -> None:
+        """Bump the per-channel ``last_edit`` cursor — the value that
+        feeds the ``led`` field of the type-`c` connect record so the
+        server only re-sends post edits we haven't seen yet.
+
+        Creates the ``channels`` row if missing (a `cped` can arrive
+        for a channel we haven't subscribed to from this client yet —
+        the user may have sub'd from the web client and is now reading
+        from whatspyc).
+        """
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO channels(cid, last_edit) VALUES (?, ?)"
+                " ON CONFLICT(cid) DO UPDATE SET"
+                " last_edit = MAX(last_edit, excluded.last_edit)",
+                (int(channel_id), int(edit_ts)),
+            )
+
+    def mark_post_delivered(
+        self, *, from_call: str, ts: int, delivered_ts: int
+    ) -> int:
+        """Record ``delivered_ts`` for the post acked by a `cpr` frame.
+
+        ``cpr`` carries only ``ts``/``dts``, not ``cid`` — but the post is
+        keyed on ``(cid, ts)``, so we locate it by ``(from_call, ts)``
+        instead. The user's outbound posts at the millisecond resolution
+        are unique per author, so this resolves cleanly.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE posts SET delivered_ts = ?"
+                " WHERE from_call = ? AND ts = ?",
+                (int(delivered_ts), from_call.upper(), int(ts)),
+            )
+        return cur.rowcount
+
+    def recent_posts(
+        self, channel_id: int, limit: int = 50, *, before_ts: int | None = None
+    ) -> list[dict]:
+        """Return up to ``limit`` recent posts in ``channel_id``, newest first.
+
+        ``before_ts`` is the cursor for paginated scroll-back: pass the
+        oldest already-rendered post's ``ts`` to fetch the next older
+        page. ``None`` returns the most recent page.
+        """
+        if before_ts is None:
+            cur = self._conn.execute(
+                "SELECT rowid AS lid, * FROM posts WHERE channel_id = ? "
+                "ORDER BY ts DESC LIMIT ?",
+                (channel_id, limit),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT rowid AS lid, * FROM posts WHERE channel_id = ? "
+                "AND ts < ? ORDER BY ts DESC LIMIT ?",
+                (channel_id, int(before_ts), limit),
+            )
+        return [dict(r) for r in cur.fetchall()]
+
+    def lookup_post_by_lid(self, lid: int) -> dict | None:
+        """Return the post row for a local short id (SQLite rowid), or None.
+
+        Posts have no server-side identifier (they're keyed on cid+ts) so
+        the rowid is also what /editpost takes — looking it up here gives
+        the (channel_id, ts) pair the cped frame needs.
+        """
+        cur = self._conn.execute(
+            "SELECT rowid AS lid, * FROM posts WHERE rowid = ?", (int(lid),)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def lookup_post(self, channel_id: int, ts: int) -> dict | None:
+        """Return the post row keyed by ``(channel_id, ts)``, or None.
+
+        Used by the verbose render path to recover the lid + receipt
+        columns for a freshly-arrived `cp` frame.
+        """
+        cur = self._conn.execute(
+            "SELECT rowid AS lid, * FROM posts WHERE channel_id = ? AND ts = ?",
+            (int(channel_id), int(ts)),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def upsert_post_emoji(
+        self,
+        channel_id: int,
+        ts: int,
+        emoji: str,
+        callsign: str,
+        emoji_ts: int,
+    ) -> None:
+        """Add (or refresh ``emoji_ts`` on) one ``(cid, ts, emoji,
+        callsign)`` row. Used by the real-time ``cpem`` add path and
+        by the user's own outbound ``react_post``."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO post_emojis(channel_id, ts, emoji, callsign, emoji_ts)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(channel_id, ts, emoji, callsign) DO UPDATE SET"
+                " emoji_ts = MAX(post_emojis.emoji_ts, excluded.emoji_ts)",
+                (
+                    int(channel_id),
+                    int(ts),
+                    emoji,
+                    callsign.upper(),
+                    int(emoji_ts),
+                ),
+            )
+            self._conn.execute(
+                "INSERT INTO channels(cid, last_emoji) VALUES (?, ?)"
+                " ON CONFLICT(cid) DO UPDATE SET"
+                " last_emoji = MAX(last_emoji, excluded.last_emoji)",
+                (int(channel_id), int(emoji_ts)),
+            )
+
+    def remove_post_emoji(
+        self, channel_id: int, ts: int, emoji: str, callsign: str
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM post_emojis WHERE channel_id = ? AND ts = ?"
+                " AND emoji = ? AND callsign = ?",
+                (int(channel_id), int(ts), emoji, callsign.upper()),
+            )
+
+    def apply_post_emoji_batch(
+        self,
+        channel_id: int,
+        ts: int,
+        entries: list[dict],
+        emoji_ts: int,
+    ) -> None:
+        """Replace all emoji rows for ``(channel_id, ts)`` from a
+        ``cpemb`` group entry.
+
+        ``entries`` is the post's ``e`` array — each item is
+        ``{"e": <emoji>, "c": [<callsign>, ...]}`` per the protocol
+        (see CHANNELS.md, ``cpemb``). The wire form here *does* carry
+        per-callsign attribution, unlike DMs.
+        """
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM post_emojis WHERE channel_id = ? AND ts = ?",
+                (int(channel_id), int(ts)),
+            )
+            for entry in entries:
+                e = entry.get("e")
+                callsigns = entry.get("c") or []
+                if not isinstance(e, str):
+                    continue
+                for c in callsigns:
+                    if not isinstance(c, str) or not c:
+                        continue
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO post_emojis"
+                        "(channel_id, ts, emoji, callsign, emoji_ts)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (
+                            int(channel_id),
+                            int(ts),
+                            e,
+                            c.upper(),
+                            int(emoji_ts),
+                        ),
+                    )
+            self._conn.execute(
+                "INSERT INTO channels(cid, last_emoji) VALUES (?, ?)"
+                " ON CONFLICT(cid) DO UPDATE SET"
+                " last_emoji = MAX(last_emoji, excluded.last_emoji)",
+                (int(channel_id), int(emoji_ts)),
+            )
+
+    def list_post_emojis(self, channel_id: int, ts: int) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT emoji, callsign, emoji_ts FROM post_emojis"
+            " WHERE channel_id = ? AND ts = ?"
+            " ORDER BY emoji_ts ASC, callsign ASC, emoji ASC",
+            (int(channel_id), int(ts)),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def lookup_post_by_from_ts(self, from_call: str, ts: int) -> dict | None:
+        """Return the post row keyed by ``(from_call, ts)``, or None.
+
+        ``cpr`` acks omit ``cid``, so resolving back to the original row
+        from a delivery confirmation has to go through the author. The
+        user's outbound posts at ms resolution are unique per author, so
+        this resolves cleanly for the only case that needs it (rendering
+        the ack against our own outbound row).
+        """
+        cur = self._conn.execute(
+            "SELECT rowid AS lid, * FROM posts WHERE from_call = ? AND ts = ?",
+            (from_call.upper(), int(ts)),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Channels
+    # ------------------------------------------------------------------
+
+    def set_subscription(self, channel_id: int, subscribed: bool) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO channels(cid, subscribed) VALUES (?, ?) "
+                "ON CONFLICT(cid) DO UPDATE SET subscribed = excluded.subscribed",
+                (channel_id, 1 if subscribed else 0),
+            )
+
+    def list_channels(self) -> list[dict]:
+        cur = self._conn.execute("SELECT * FROM channels ORDER BY cid")
+        return [dict(r) for r in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Hams
+    # ------------------------------------------------------------------
+
+    def upsert_ham(self, callsign: str, name: str, ts: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO hams(callsign, name, last_ts) VALUES (?, ?, ?) "
+                "ON CONFLICT(callsign) DO UPDATE SET name=excluded.name, "
+                "last_ts=MAX(last_ts, excluded.last_ts)",
+                (callsign.upper(), name, ts),
+            )
+        self.bump_meta("last_ham_ts", ts)
+
+    def lookup_ham(self, callsign: str) -> dict | None:
+        cur = self._conn.execute("SELECT * FROM hams WHERE callsign = ?", (callsign.upper(),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def _schema_sql() -> str:
+    return resources.files("whatspyc.store").joinpath("schema.sql").read_text(encoding="utf-8")

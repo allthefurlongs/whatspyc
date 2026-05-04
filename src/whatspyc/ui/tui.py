@@ -1,0 +1,2991 @@
+"""Multi-pane Textual TUI for whatspyc.
+
+Layout::
+
+    ┌─Header───────────────────────────────────────────┐
+    ├Tabs───┬─Status pane (Ctrl+S, hidden by default)──┤
+    │Ch DM  ├─Thread header (active channel / DM)──────┤
+    ├───────┼───────────────────────────────────────────┤
+    │ch list│ Per-target message ListView              │
+    │       │  (arrow-key selectable, auto-loads older │
+    │/dm    │   on cursor-at-top, in-place updates on  │
+    │list   │   edit/ack)                              │
+    ├───────┤                                           │
+    │Online │                                           │
+    │users  │                                           │
+    ├───────┴───────────────────────────────────────────┤
+    │ Input                                             │
+    ├Footer─────────────────────────────────────────────┤
+    └───────────────────────────────────────────────────┘
+
+Public shape unchanged: ``TextualUI(client, ...).run()`` and
+``render_event(obj)`` — so ``cli.py`` is untouched.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime
+import re
+import time
+from typing import Any, Awaitable, Callable
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Grid, Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    ContentSwitcher,
+    Footer,
+    Header,
+    Input,
+    ListItem,
+    ListView,
+    RichLog,
+    Static,
+    Tab,
+    Tabs,
+)
+from textual.widgets._footer import FooterKey
+
+from whatspyc import __version__
+from whatspyc.config import ChannelInfo
+from whatspyc.ui import help as help_data
+from whatspyc.ui import ts_to_ms
+from whatspyc.ui.options import SessionOptions
+from whatspyc.wps.client import WpsClient
+
+
+TargetKey = tuple[str, str]  # ("ch", "5") or ("dm", "G7XYZ")
+RowKey = tuple[str, str, str]  # (kind, target_key, natural_key)
+
+
+# ----------------------------------------------------------------------
+# Top-level UI shell — mirrors the LineUI shape so cli.py is unchanged.
+# ----------------------------------------------------------------------
+
+
+class TextualUI:
+    def __init__(
+        self,
+        client: WpsClient,
+        *,
+        my_call: str,
+        channels: list[ChannelInfo] | None = None,
+        history_backfill: int = 3,
+        options: SessionOptions | None = None,
+    ) -> None:
+        self._client = client
+        self._my_call = my_call.upper()
+        self._channels = list(channels or [])
+        self._history_backfill = max(0, int(history_backfill))
+        self._options = options or SessionOptions()
+        self._target: TargetKey | None = None
+        self._pending: list[dict] = []
+        self._app: _WhatspycApp | None = None
+        # Set to "terminal" when the link drops with no auto-reconnect or
+        # after auto-reconnect gives up; the cli reads this after run()
+        # returns to decide whether to offer a reconnect/quit prompt.
+        self.exit_reason: str | None = None
+
+    def render_event(self, obj: dict) -> None:
+        if self._app is None or not self._app.is_mounted:
+            self._pending.append(obj)
+            return
+        self._app.render_event(obj)
+
+    async def run(self) -> None:
+        self._app = _WhatspycApp(self)
+        await self._app.run_async()
+
+
+def launch(
+    client: WpsClient,
+    *,
+    my_call: str,
+    channels: list[ChannelInfo] | None = None,
+    history_backfill: int = 3,
+    options: SessionOptions | None = None,
+) -> TextualUI:
+    return TextualUI(
+        client,
+        my_call=my_call,
+        channels=channels,
+        history_backfill=history_backfill,
+        options=options,
+    )
+
+
+# ----------------------------------------------------------------------
+# Rendering helpers
+# ----------------------------------------------------------------------
+
+
+def _fmt_ts(ts: int | float | None) -> str:
+    ms = ts_to_ms(ts)
+    if ms is None:
+        return "[--]"
+    dt = datetime.datetime.fromtimestamp(ms / 1000)
+    return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')}]"
+
+
+def _fmt_duration_ms(ms: int | float) -> str:
+    s = max(0, round(ms / 1000))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    return f"{m}m{s}s"
+
+
+def _fmt_call(call: str | None, ham_name: Callable[[str | None], str | None]) -> str:
+    if not call:
+        return ""
+    name = ham_name(call)
+    return f"<{name}, {call}>" if name else f"<{call}>"
+
+
+def _fmt_user(call: str | None, ham_name: Callable[[str | None], str | None]) -> str:
+    if not call:
+        return ""
+    name = ham_name(call)
+    return f"{name}, {call}" if name else str(call)
+
+
+def _verbose_status(
+    *,
+    from_call: str,
+    my_call: str,
+    ts: int | float | None,
+    delivered_ts: int | None,
+    received_ts: int | None,
+    realtime: int | None,
+    delivery_timeout_s: int,
+) -> str | None:
+    fc = (from_call or "").upper()
+    ts_ms = ts_to_ms(ts)
+    if fc == my_call:
+        if delivered_ts is not None and ts_ms is not None:
+            return f"Delivered to server in {_fmt_duration_ms(int(delivered_ts) - ts_ms)}"
+        if ts_ms is None:
+            return "Delivering..."
+        age_ms = int(time.time() * 1000) - ts_ms
+        if age_ms >= delivery_timeout_s * 1000:
+            return "NOT DELIVERED"
+        return "Delivering..."
+    if realtime == 1 and received_ts is not None and ts_ms is not None:
+        return f"Received real-time in {_fmt_duration_ms(int(received_ts) - ts_ms)}"
+    return None
+
+
+def _render_reactions(reactions: list[dict]) -> str:
+    """Format the per-row reaction tail.
+
+    User-facing form is ``[CALL EMOJI]`` (per the user's spec; one
+    bracket per reactor+emoji), space-separated, prefixed with a
+    leading space so it appends cleanly after the body or status
+    suffix. Wrapped in cyan so reactions are easy to scan visually.
+    Only the opening ``[`` needs to be escaped for Rich markup —
+    ``]`` is only meaningful as a tag terminator and renders as a
+    literal anywhere else; escaping it (``\\]``) leaks the backslash
+    onto the screen as ``\\]``.
+    """
+    if not reactions:
+        return ""
+    parts: list[str] = []
+    for r in reactions:
+        e = r.get("emoji") or ""
+        c = (r.get("callsign") or "").upper()
+        if not e:
+            continue
+        if c:
+            parts.append(rf"[cyan]\[{c} {e}][/]")
+        else:
+            parts.append(rf"[cyan]\[{e}][/]")
+    if not parts:
+        return ""
+    return " " + " ".join(parts)
+
+
+def _render_row(
+    *,
+    kind: str,
+    from_call: str,
+    body: str,
+    ts: int | float | None,
+    edit_ts: int | None,
+    delivered_ts: int | None,
+    received_ts: int | None,
+    realtime: int | None,
+    lid: int | None,
+    my_call: str,
+    verbose: bool,
+    ham_name: Callable[[str | None], str | None],
+    delivery_timeout_s: int,
+    reactions: list[dict] | None = None,
+) -> str:
+    """Build a Rich-marked-up line for a single message/post.
+
+    Compact: ``[ts] <Name, CALL>: body [EDITED if edited] [CALL EMOJI]...``
+    Verbose: ``ID: lid - [ts] - <status> - <Name, CALL>: body [EDITED] [CALL EMOJI]...``
+
+    Outbound rows we sent but haven't seen an ack for are dimmed; the dim
+    clears once `delivered_ts` is set (live `mr`/`cpr` ack, or already
+    persisted from a previous session). Rows from other people are never
+    dimmed. Reactions render outside the dim wrap so a peer's reaction
+    on a still-pending outbound row stays readable.
+    """
+    actor = _fmt_call(from_call, ham_name)
+    is_mine = (from_call or "").upper() == my_call
+    edit_marker = " [bold][EDITED][/]" if edit_ts else ""
+
+    if verbose:
+        head = f"ID: {lid} - {_fmt_ts(ts)}"
+        status = _verbose_status(
+            from_call=from_call,
+            my_call=my_call,
+            ts=ts,
+            delivered_ts=delivered_ts,
+            received_ts=received_ts,
+            realtime=realtime,
+            delivery_timeout_s=delivery_timeout_s,
+        )
+        if status:
+            head = f"{head} - {status}"
+        line = f"{head} - {actor}: {body}{edit_marker}"
+    else:
+        line = f"{_fmt_ts(ts)} {actor}: {body}{edit_marker}"
+
+    if is_mine and delivered_ts is None:
+        line = f"[dim]{line}[/]"
+    return line + _render_reactions(reactions or [])
+
+
+# ----------------------------------------------------------------------
+# MessageRow widget — holds row state, refreshes its label in place.
+# ----------------------------------------------------------------------
+
+
+class MessageRow(ListItem):
+    """One message/post, mounted in a per-target ListView.
+
+    Domain state (body, ts, edit_ts, delivered_ts, ...) lives here so the
+    TUI can re-render in place when a `med`/`cped` rewrites the body, an
+    `mr`/`cpr` records delivery, or `Ctrl+D` flips the verbose toggle.
+    """
+
+    DEFAULT_CSS = """
+    MessageRow {
+        padding: 0 1;
+        height: auto;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        target_key: str,
+        natural_key: str,
+        from_call: str,
+        body: str,
+        ts: int | float | None,
+        edit_ts: int | None = None,
+        delivered_ts: int | None = None,
+        received_ts: int | None = None,
+        realtime: int | None = None,
+        lid: int | None = None,
+        reactions: list[dict] | None = None,
+    ) -> None:
+        # Keep a direct reference to the Static so refresh_label can
+        # update it without going through query_one — query_one only
+        # works once the row is fully mounted.
+        self._static = Static("", markup=True)
+        super().__init__(self._static)
+        self.kind = kind
+        self.tkey = target_key
+        self.natural_key = natural_key
+        self.from_call = from_call or ""
+        self.body = body or ""
+        self.ts = ts
+        self.edit_ts = edit_ts
+        self.delivered_ts = delivered_ts
+        self.received_ts = received_ts
+        self.realtime = realtime
+        self.lid = lid
+        # `[{emoji, callsign, emoji_ts}, ...]` — populated from the
+        # store on mount and mutated in place by inbound mem/cpem
+        # handlers. The outbound react path writes through to the
+        # store first, then refreshes this from the store.
+        self.reactions: list[dict] = list(reactions or [])
+
+    def refresh_label(
+        self,
+        *,
+        my_call: str,
+        verbose: bool,
+        ham_name: Callable[[str | None], str | None],
+        delivery_timeout_s: int,
+    ) -> None:
+        text = _render_row(
+            kind=self.kind,
+            from_call=self.from_call,
+            body=self.body,
+            ts=self.ts,
+            edit_ts=self.edit_ts,
+            delivered_ts=self.delivered_ts,
+            received_ts=self.received_ts,
+            realtime=self.realtime,
+            lid=self.lid,
+            my_call=my_call,
+            verbose=verbose,
+            ham_name=ham_name,
+            delivery_timeout_s=delivery_timeout_s,
+            reactions=self.reactions,
+        )
+        self._static.update(text)
+
+
+# ----------------------------------------------------------------------
+# Modal screens
+# ----------------------------------------------------------------------
+
+
+class HelpScreen(ModalScreen[None]):
+    """F1 / ``/h`` — show key bindings and the slash-command list.
+
+    With ``focus_command`` set, shows the detailed help for that one
+    command instead of the full listing — used by ``/h <command>``.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss", "Close")]
+
+    DEFAULT_CSS = """
+    HelpScreen {
+        align: center middle;
+    }
+    #help-pane {
+        width: 80%;
+        height: 80%;
+        border: round $accent;
+        background: $surface;
+    }
+    #help-log {
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, focus_command: str | None = None) -> None:
+        super().__init__()
+        self._focus_command = focus_command
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-pane"):
+            yield RichLog(id="help-log", markup=True, wrap=True)
+            yield Static("[dim]Esc to close[/]")
+
+    def on_mount(self) -> None:
+        log = self.query_one("#help-log", RichLog)
+        if self._focus_command is not None:
+            lines = help_data.detail_lines(self._focus_command)
+            if lines is None:
+                log.write(
+                    f"[yellow]/h: unknown command {self._focus_command!r}. "
+                    f"Try /h with no arguments for the full list.[/]"
+                )
+                return
+            for line in lines:
+                log.write(line)
+            return
+        log.write("[bold]Key bindings[/]")
+        for line in _KEYBINDING_HELP_LINES:
+            log.write(line)
+        log.write("")
+        log.write("[bold]Slash commands[/] (use /h <command> for details)")
+        # Hide commands the TUI has replaced with GUI affordances.
+        # /set still works (it opens the settings modal), so it stays.
+        hide = {"/list", "/users"}
+        for line in help_data.list_lines(hide=hide)[1:]:  # drop duplicated header
+            log.write(line)
+
+
+_KEYBINDING_HELP_LINES = [
+    "  Tab / Shift+Tab    Cycle focus between panes",
+    "  Esc                Return focus to the input box",
+    "  ← / →              In tab strip: switch Channels / DMs",
+    "  ↑ / ↓              In a list: navigate items",
+    "  ↑ at top of msgs   Auto-load the next older page from the store",
+    "  Enter (target)     Pin target as the send target, focus input",
+    "  Enter (message)    Open action menu (Edit / Resend / React)",
+    "  F1                 This help screen",
+    "  Ctrl+D             Toggle detailed render (live)",
+    "  Ctrl+S             Toggle the status pane (acks / edits log)",
+    "  Ctrl+U             Unsubscribe highlighted channel (with confirm)",
+    "  Ctrl+O             Open the Options (session settings) modal",
+    "  Ctrl+C / Ctrl+Q    Quit",
+]
+
+
+class ActionMenu(ModalScreen[str | None]):
+    """Enter on a message — Edit / Resend / React.
+
+    Edit and Resend are disabled for rows we didn't send; React is
+    always available. ``dismiss(action)`` returns one of
+    ``"edit" | "resend" | "react" | None``.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    ActionMenu {
+        align: center middle;
+    }
+    #menu-pane {
+        width: 30;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    #menu-list {
+        height: auto;
+    }
+    """
+
+    def __init__(self, *, allow_edit: bool, allow_resend: bool) -> None:
+        super().__init__()
+        self._allow_edit = allow_edit
+        self._allow_resend = allow_resend
+
+    def compose(self) -> ComposeResult:
+        items: list[ListItem] = []
+        if self._allow_edit:
+            items.append(ListItem(Static("Edit"), id="action-edit"))
+        if self._allow_resend:
+            items.append(ListItem(Static("Resend"), id="action-resend"))
+        items.append(ListItem(Static("React"), id="action-react"))
+        with Vertical(id="menu-pane"):
+            yield Static("[bold]Action[/]")
+            yield ListView(*items, id="menu-list")
+            yield Static("[dim]Enter to choose, Esc to cancel[/]")
+
+    def on_mount(self) -> None:
+        self.query_one("#menu-list", ListView).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id or ""
+        if item_id.startswith("action-"):
+            self.dismiss(item_id[len("action-"):])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+QUICK_REACT_EMOJI: tuple[str, ...] = (
+    "👍", "❤️", "😂", "🎉", "😮", "😢",
+    "🔥", "🙏", "👏", "💯", "🤔", "👀",
+    "🚀", "✅", "❌", "💀", "😎", "🤝",
+    "👋", "😇", "😅", "🥳", "😴", "🙄",
+)
+
+
+class _EmojiButton(Button):
+    """Button that carries its emoji string for `Button.Pressed` lookup."""
+
+    def __init__(self, emoji: str, idx: int) -> None:
+        super().__init__(emoji, id=f"emoji-btn-{idx}")
+        self.emoji = emoji
+
+
+class EmojiPrompt(ModalScreen[str | None]):
+    """Pick a quick-react emoji from a grid, or type one in.
+
+    Returns the chosen string verbatim (literal character or hex
+    codepoint like `1f44d`) so the wire layer is unchanged.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    EmojiPrompt {
+        align: center middle;
+    }
+    #emoji-pane {
+        width: 56;
+        height: auto;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #emoji-hint {
+        margin-bottom: 1;
+    }
+    #emoji-grid {
+        grid-size: 6;
+        grid-gutter: 0 1;
+        height: auto;
+        margin-bottom: 1;
+    }
+    #emoji-grid Button {
+        width: 1fr;
+        min-width: 4;
+        height: 1;
+        border: none;
+        background: $boost;
+    }
+    #emoji-grid Button:focus {
+        background: $accent;
+        text-style: bold;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="emoji-pane"):
+            yield Static(
+                "Pick a reaction below, or type one in if your terminal "
+                "can't render emoji. The text box accepts a literal "
+                "character or a hex codepoint like [bold]1f44d[/].",
+                id="emoji-hint",
+            )
+            with Grid(id="emoji-grid"):
+                for i, e in enumerate(QUICK_REACT_EMOJI):
+                    yield _EmojiButton(e, i)
+            yield Input(id="emoji-input", placeholder="emoji or hex codepoint")
+            yield Static(
+                "[dim]Tab/Shift+Tab to move · Enter to send · Esc to cancel[/]"
+            )
+
+    def on_mount(self) -> None:
+        first = self.query("#emoji-grid Button").first()
+        if first is not None:
+            first.focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if isinstance(event.button, _EmojiButton):
+            self.dismiss(event.button.emoji)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        self.dismiss(text or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SubscribeModal(ModalScreen[int | None]):
+    """Two-stage modal: confirm subscribe → ask post count.
+
+    Stage 1 ("confirm"): Y subscribes (advances to stage 2), N/Esc closes
+    without subscribing. Stage 2 ("count"): an `Input` for "how many of
+    the {pc} historic posts to fetch?" — Enter on empty uses the default,
+    Enter with a non-negative integer fetches that many, Esc closes with
+    the default.
+
+    Dismiss values:
+    - ``None``     — user said no at the confirm stage; the caller should
+                     leave the centre pane on its previous target.
+    - ``int >= 0`` — user is now subscribed; the caller should switch
+                     centre to the channel and, if ``> 0``, fire
+                     ``request_post_batch(cid, n)``.
+    """
+
+    BINDINGS = [
+        Binding("y", "yes", "Yes"),
+        Binding("n", "no", "No"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    SubscribeModal {
+        align: center middle;
+    }
+    #sub-pane {
+        width: 60;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        channel_ref: str,
+        on_confirm: Callable[[], Awaitable[int]],
+        default_count_for: Callable[[int], int],
+        skip_confirm: bool = False,
+    ) -> None:
+        super().__init__()
+        self._channel_ref = channel_ref
+        self._on_confirm = on_confirm
+        self._default_count_for = default_count_for
+        self._skip_confirm = skip_confirm
+        self._stage = "confirm"
+        self._pc = 0
+        self._default = 0
+
+    def compose(self) -> ComposeResult:
+        # The count-stage Input is mounted on demand in `_do_subscribe`.
+        # Including it in the initial DOM (even hidden) makes Textual
+        # auto-focus it, which steals the y/n keystrokes from the
+        # screen-level bindings.
+        with Vertical(id="sub-pane"):
+            yield Static(
+                f"Subscribe to [bold]{self._channel_ref}[/]?",
+                id="sub-question",
+            )
+            yield Static(
+                "[dim]Y to subscribe, N or Esc to cancel[/]",
+                id="sub-hint",
+            )
+
+    def on_mount(self) -> None:
+        # `skip_confirm` is set by callers who already obtained explicit
+        # consent (e.g. the user typed `/sub CID`) — go straight to the
+        # subscribe + count flow rather than asking Y/N again.
+        if self._skip_confirm:
+            self.run_worker(self._do_subscribe(), exclusive=False)
+
+    def action_yes(self) -> None:
+        if self._stage != "confirm":
+            return
+        self.run_worker(self._do_subscribe(), exclusive=False)
+
+    def action_no(self) -> None:
+        if self._stage == "confirm":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        # At the count stage the subscribe RPC has already landed; honour
+        # that with the default count rather than throwing it away.
+        if self._stage == "count":
+            self.dismiss(self._default)
+        else:
+            self.dismiss(None)
+
+    async def _do_subscribe(self) -> None:
+        self._stage = "subscribing"
+        self.query_one("#sub-question", Static).update(
+            f"Subscribing to [bold]{self._channel_ref}[/]…"
+        )
+        self.query_one("#sub-hint", Static).update("[dim]Waiting for ack[/]")
+        try:
+            pc = await self._on_confirm()
+        except asyncio.TimeoutError:
+            self.query_one("#sub-question", Static).update(
+                "[red]Timed out waiting for ack from server.[/]"
+            )
+            self.query_one("#sub-hint", Static).update("[dim]Esc to close[/]")
+            self._stage = "error"
+            return
+        except Exception as exc:
+            self.query_one("#sub-question", Static).update(
+                f"[red]Subscribe failed:[/] {exc}"
+            )
+            self.query_one("#sub-hint", Static).update("[dim]Esc to close[/]")
+            self._stage = "error"
+            return
+        self._pc = int(pc) if pc else 0
+        if self._pc <= 0:
+            # No history available — close right away and let the caller
+            # switch the centre pane to the freshly-subscribed channel.
+            self.dismiss(0)
+            return
+        self._default = max(0, self._default_count_for(self._pc))
+        self._stage = "count"
+        self.query_one("#sub-question", Static).update(
+            f"Subscribed to [bold]{self._channel_ref}[/].\n"
+            f"How many of the {self._pc} historic posts to fetch?"
+        )
+        self.query_one("#sub-hint", Static).update(
+            f"[dim]Enter to fetch (default {self._default}); Esc to skip[/]"
+        )
+        pane = self.query_one("#sub-pane", Vertical)
+        inp = Input(id="sub-input", placeholder=f"default {self._default}")
+        await pane.mount(inp, before=self.query_one("#sub-hint", Static))
+        inp.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self._stage != "count":
+            return
+        text = event.value.strip()
+        if not text:
+            n = self._default
+        else:
+            try:
+                n = int(text)
+            except ValueError:
+                self.query_one("#sub-hint", Static).update(
+                    f"[red]Expected integer, got {text!r}[/]"
+                )
+                return
+            if n < 0:
+                self.query_one("#sub-hint", Static).update(
+                    "[red]Post count must be non-negative[/]"
+                )
+                return
+        self.dismiss(min(n, self._pc))
+
+
+class NewDmModal(ModalScreen[str | None]):
+    """Tiny modal asking for a callsign to start (or switch to) a DM thread.
+
+    Dismisses with the upper-cased callsign on Enter, or ``None`` on Esc /
+    empty input. The caller decides whether to create a new thread or
+    switch to an existing one.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    NewDmModal {
+        align: center middle;
+    }
+    #dm-add-pane {
+        width: 60;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dm-add-pane"):
+            yield Static("Enter callsign for new DM:")
+            yield Input(id="dm-add-input")
+            yield Static("[dim]Enter to open, Esc to cancel[/]")
+
+    def on_mount(self) -> None:
+        self.query_one("#dm-add-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip().upper()
+        self.dismiss(text or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class UnsubscribeModal(ModalScreen[bool]):
+    """Y/N confirm for unsubscribing from a channel.
+
+    Dismisses with ``True`` if the user said yes, ``False`` on N / Esc.
+    The caller is responsible for actually issuing the unsubscribe RPC.
+    """
+
+    BINDINGS = [
+        Binding("y", "yes", "Yes"),
+        Binding("n", "no", "No"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    UnsubscribeModal {
+        align: center middle;
+    }
+    #unsub-pane {
+        width: 60;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    """
+
+    def __init__(self, *, channel_ref: str) -> None:
+        super().__init__()
+        self._channel_ref = channel_ref
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="unsub-pane"):
+            yield Static(
+                f"Unsubscribe from [bold]{self._channel_ref}[/]?",
+                id="unsub-question",
+            )
+            yield Static(
+                "[dim]Y to unsubscribe, N or Esc to cancel[/]",
+                id="unsub-hint",
+            )
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class BoolSelectModal(ModalScreen[bool | None]):
+    """On/Off picker for boolean settings.
+
+    Arrow keys move between the two rows, Enter commits the highlighted
+    choice. Numeric shortcuts ``1`` (On) and ``0`` (Off) commit
+    immediately so power users don't need to navigate. Esc cancels.
+
+    ``priority=True`` on the digit bindings stops the focused
+    ``ListView`` from swallowing them.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("1", "pick_on", "On", show=False, priority=True),
+        Binding("0", "pick_off", "Off", show=False, priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    BoolSelectModal {
+        align: center middle;
+    }
+    #boolsel-pane {
+        width: 60;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    """
+
+    def __init__(self, *, name: str, current: bool, description: str) -> None:
+        super().__init__()
+        self._name = name
+        self._current = current
+        self._description = description
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="boolsel-pane"):
+            yield Static(f"[bold]{self._name}[/]")
+            yield Static(f"[dim]{self._description}[/]")
+            yield ListView(
+                ListItem(Static("On"), id="boolsel-on"),
+                ListItem(Static("Off"), id="boolsel-off"),
+                id="boolsel-list",
+            )
+            yield Static("[dim]Enter to save, 1=On, 0=Off, Esc to cancel[/]")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#boolsel-list", ListView)
+        # Highlight the current value by default so Enter == no change.
+        lv.index = 0 if self._current else 1
+        lv.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.item.id == "boolsel-on":
+            self.dismiss(True)
+        elif event.item.id == "boolsel-off":
+            self.dismiss(False)
+
+    def action_pick_on(self) -> None:
+        self.dismiss(True)
+
+    def action_pick_off(self) -> None:
+        self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class EditValueModal(ModalScreen[str | None]):
+    """Inline editor for a single setting's value. Pre-fills the input
+    with the current rendered value; Enter submits, Esc cancels.
+
+    Returns the raw string the user typed (caller parses + validates via
+    ``SessionOptions.set``); ``None`` on cancel.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    EditValueModal {
+        align: center middle;
+    }
+    #setval-pane {
+        width: 60;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    """
+
+    def __init__(self, *, name: str, current: str, description: str) -> None:
+        super().__init__()
+        self._name = name
+        self._current = current
+        self._description = description
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="setval-pane"):
+            yield Static(f"[bold]{self._name}[/]")
+            yield Static(f"[dim]{self._description}[/]")
+            yield Input(value=self._current, id="setval-input")
+            yield Static("[dim]Enter to save, Esc to cancel[/]", id="setval-hint")
+
+    def on_mount(self) -> None:
+        inp = self.query_one("#setval-input", Input)
+        inp.focus()
+        inp.cursor_position = len(self._current)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SettingsModal(ModalScreen[None]):
+    """Settings browser — replaces the inline ``/set`` listing.
+
+    Renders one row per ``SessionOptions`` entry showing
+    ``name = value`` plus its description. Enter on a row pushes
+    ``EditValueModal`` to edit the value; on a successful change the
+    row label is refreshed and the optional ``on_change`` callback
+    fires (used by the TUI to apply side-effects like
+    ``set_delivery_timeout_s`` and the verbose-mode re-render).
+    """
+
+    BINDINGS = [Binding("escape", "dismiss", "Close")]
+
+    DEFAULT_CSS = """
+    SettingsModal {
+        align: center middle;
+    }
+    #settings-pane {
+        width: 80;
+        height: 80%;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    #settings-list {
+        height: 1fr;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        options: Any,
+        on_change: Callable[[str, Any, Any], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self._opts = options
+        self._on_change = on_change
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="settings-pane"):
+            yield Static("[bold]Session settings[/] — Enter to edit, Esc to close")
+            yield ListView(id="settings-list")
+            yield Static("", id="settings-hint")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#settings-list", ListView)
+        for n in self._opts.names():
+            lv.append(self._row_for(n))
+        lv.focus()
+
+    def _row_for(self, name: str) -> ListItem:
+        label = (
+            f"[bold]{name}[/] = [green]{self._opts.format(name)}[/]\n"
+            f"  [dim]{self._opts.describe(name)}[/]"
+        )
+        return ListItem(Static(label, markup=True), id=f"setting-{name}")
+
+    def _refresh_row(self, name: str) -> None:
+        try:
+            item = self.query_one(f"#setting-{name}", ListItem)
+        except Exception:
+            return
+        item.query_one(Static).update(
+            f"[bold]{name}[/] = [green]{self._opts.format(name)}[/]\n"
+            f"  [dim]{self._opts.describe(name)}[/]"
+        )
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id or ""
+        prefix = "setting-"
+        if not item_id.startswith(prefix):
+            return
+        name = item_id[len(prefix):]
+        self.run_worker(self._edit_setting(name), exclusive=False)
+
+    async def _edit_setting(self, name: str) -> None:
+        current_val = self._opts.get(name)
+        if isinstance(current_val, bool):
+            picked = await self.app.push_screen_wait(
+                BoolSelectModal(
+                    name=name,
+                    current=current_val,
+                    description=self._opts.describe(name),
+                )
+            )
+            if picked is None:
+                return
+            # SessionOptions.set parses strings; "on"/"off" matches the
+            # public /set surface and the canonical format for bools.
+            raw = "on" if picked else "off"
+        else:
+            raw = await self.app.push_screen_wait(
+                EditValueModal(
+                    name=name,
+                    current=self._opts.format(name),
+                    description=self._opts.describe(name),
+                )
+            )
+            if raw is None:
+                return
+        try:
+            old, new = self._opts.set(name, raw)
+        except ValueError as exc:
+            self.query_one("#settings-hint", Static).update(
+                f"[yellow]{name}: {exc}[/]"
+            )
+            return
+        self._refresh_row(name)
+        old_fmt = self._opts.format_value(name, old)
+        new_fmt = self._opts.format_value(name, new)
+        if old_fmt == new_fmt:
+            self.query_one("#settings-hint", Static).update(
+                f"[green]{name} = {new_fmt}[/] [dim](unchanged)[/]"
+            )
+        else:
+            self.query_one("#settings-hint", Static).update(
+                f"[green]{name} = {new_fmt}[/] [dim](was {old_fmt})[/]"
+            )
+        if self._on_change is not None:
+            self._on_change(name, old, new)
+
+
+# ----------------------------------------------------------------------
+# Main app
+# ----------------------------------------------------------------------
+
+
+_FOCUS_CYCLE = ["input", "msg-active", "tab-strip", "target-active", "online"]
+
+
+class StaticFooter(Footer):
+    """``Footer`` subclass with a focus-independent binding order.
+
+    The default ``Footer`` rebuilds from ``screen.active_bindings`` on
+    every focus change, which reshuffles the entries because the
+    focused widget's bindings move to the front of the chain. We
+    override ``compose`` to iterate over the App's ``BINDINGS`` list
+    in declaration order — same Textual styling, stable order.
+    """
+
+    def compose(self) -> ComposeResult:
+        if not self._bindings_ready:
+            return
+        # Walk the App's BINDINGS in declaration order. De-dup by
+        # action so two bindings on the same handler (e.g. ctrl+c and
+        # ctrl+q both → quit_app) only render once.
+        app = self.app
+        # Conditional bindings: hide ctrl+u (unsub) unless the active
+        # target is a subscribed channel — keeps the footer honest about
+        # what's actually actionable right now. Recompose is triggered
+        # from `_refresh_footer` whenever target / subscription state
+        # changes.
+        show_unsub = (
+            hasattr(app, "_active_target_is_subscribed_channel")
+            and app._active_target_is_subscribed_channel()
+        )
+        seen: set[str] = set()
+        for binding in app.BINDINGS:
+            if not getattr(binding, "show", False):
+                continue
+            if binding.action in seen:
+                continue
+            if binding.action == "unsub_channel" and not show_unsub:
+                continue
+            seen.add(binding.action)
+            yield FooterKey(
+                binding.key,
+                app.get_key_display(binding),
+                binding.description,
+                binding.action,
+            ).data_bind(compact=Footer.compact)
+
+
+class _WhatspycApp(App):
+    TITLE = f"Whatspyc (v{__version__}) text-only WhatsPac Client - Recommended GUI Client: http://whatspac.oarc.uk/"
+
+    CSS = """
+    Screen { layout: vertical; }
+    #main { layout: horizontal; height: 1fr; }
+    #left { width: 30; border-right: solid $accent; layout: vertical; }
+    #target-switcher { height: 1fr; }
+    #online-header { background: $boost; padding: 0 1; }
+    #online { height: 10; border-top: solid $accent; }
+    #right { layout: vertical; height: 1fr; }
+    #status { height: 8; border: round $accent; display: none; }
+    #thread-header { background: $boost; padding: 0 1; }
+    #message-switcher { height: 1fr; border: round $accent; }
+    #empty-msgs { padding: 1 2; color: $text-muted; }
+    #input { dock: bottom; }
+    """
+
+    # Width budget per channel row: "☑ {cid} #{name} (100)" — that's
+    # 2 (checkbox + space) + len(cid) + 2 (" #") + len(name) + 6 (" (100)").
+    # We pick the widest channel from the directory + store and pin the
+    # left pane so a 3-digit unread count never wraps.
+    _LEFT_PANE_MIN_WIDTH = 22
+    _LEFT_PANE_RESERVED_SUFFIX = 6  # " (100)"
+
+    BINDINGS = [
+        # F1 is the working help key. ctrl+h is kept as an aspirational
+        # alias but won't fire on most terminals: Ctrl+H emits byte 0x08,
+        # the same as Backspace, and Textual's ANSI parser normalises
+        # that to Keys.Backspace — so a "ctrl+h" binding never matches.
+        Binding("f1", "help", "Help", priority=True, key_display="F1"),
+        Binding("ctrl+h", "help", show=False, priority=True),
+        Binding("ctrl+q", "quit_app", "Quit"),
+        Binding("ctrl+c", "quit_app", "Quit"),
+        # priority=True so the focused widget (Input binds ctrl+d as
+        # "delete-forward" by default; ListView swallows arrow/letter
+        # keys) doesn't preempt the global toggle.
+        Binding("ctrl+d", "toggle_verbose", "Detailed View", priority=True),
+        Binding("ctrl+s", "toggle_status", "Status Pane", priority=True),
+        # priority=True so the focused Input (which binds ctrl+u to
+        # "delete to start of line") doesn't preempt the app binding.
+        # Clicking a channel moves focus to the Input, so without
+        # priority the very gesture used to pick a channel would
+        # disable this shortcut for the next keypress.
+        Binding("ctrl+u", "unsub_channel", "Unsub", priority=True),
+        # priority=True so the focused Input doesn't swallow Ctrl+O.
+        Binding("ctrl+o", "options", "Options", priority=True),
+        Binding("escape", "focus_input", "Focus input", show=False),
+        Binding("tab", "focus_next_pane", "Next pane", show=False),
+        Binding("shift+tab", "focus_prev_pane", "Prev pane", show=False),
+    ]
+
+    def __init__(self, ui: TextualUI) -> None:
+        super().__init__()
+        self._ui = ui
+        self.is_mounted = False
+
+        # Lazy per-target message ListView ids.
+        self._views: dict[TargetKey, str] = {}
+        self._next_view_idx = 0
+
+        # MessageRow widgets keyed by (kind, target_key, natural_key) so
+        # `med`/`cped`/`mr`/`cpr` can find the row to update in place.
+        self._rows: dict[RowKey, MessageRow] = {}
+
+        # (kind, key) → unread count, displayed as " (N)" suffix in the
+        # target list. Cleared on activation.
+        self._unread: dict[TargetKey, int] = {}
+
+        # (kind, key) → True once we've confirmed the store has nothing
+        # older. Stops us hammering the store every time the cursor
+        # bumps the top row.
+        self._history_exhausted: dict[TargetKey, bool] = {}
+
+        # When set, the next plain-text submit is interpreted as the new
+        # body for an in-progress edit instead of a fresh send.
+        self._pending_edit: dict | None = None
+
+        # Suppress ListView.Highlighted handling during programmatic
+        # mutation of a list (mounting rows, prepending older history).
+        self._suppress_highlight = False
+
+        # Inbound events from the WpsClient reader task land here and a
+        # single drain worker pulls them in order. Required because
+        # rendering an event may need to mount a new ListView, which is
+        # async — and the reader task can't await directly from a sync
+        # callback.
+        self._event_queue: asyncio.Queue[dict] = asyncio.Queue()
+
+    # ------------------------------------------------------------------
+    # Compose / mount
+    # ------------------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal(id="main"):
+            with Vertical(id="left"):
+                yield Tabs(
+                    Tab("Channels", id="tab-channels"),
+                    Tab("DMs", id="tab-dms"),
+                    id="tab-strip",
+                )
+                with ContentSwitcher(initial="channels", id="target-switcher"):
+                    yield ListView(id="channels")
+                    yield ListView(id="dms")
+                yield Static("Online (0)", id="online-header")
+                yield ListView(id="online")
+            with Vertical(id="right"):
+                yield RichLog(id="status", wrap=True, markup=True, highlight=True)
+                yield Static("", id="thread-header")
+                with ContentSwitcher(initial="empty-msgs", id="message-switcher"):
+                    yield Static(
+                        "[dim]Pick a channel or DM on the left to start. Use the mouse, or tab to change pane focus with the keyboard.[/]",
+                        id="empty-msgs",
+                    )
+        yield Input(
+            placeholder=f"{self._ui._my_call}> ",
+            id="input",
+            select_on_focus=False,
+        )
+        yield StaticFooter()
+
+    async def on_mount(self) -> None:
+        self.is_mounted = True
+        self._apply_left_pane_width()
+        self._populate_initial_target_lists()
+        self._refresh_online_pane(self._ui._client.online_users())
+        self._refresh_thread_header()
+        # Drain worker — processes inbound events in order, async-safe.
+        self.run_worker(self._drain_events(), exclusive=True, name="event-drain")
+        for obj in self._ui._pending:
+            self.render_event(obj)
+        self._ui._pending.clear()
+        self.query_one("#input", Input).focus()
+
+    def render_event(self, obj: dict) -> None:
+        # Called from the WpsClient reader task (sync). Push onto the
+        # queue; the drain worker pulls and awaits the dispatch.
+        self._event_queue.put_nowait(obj)
+
+    async def _drain_events(self) -> None:
+        while True:
+            obj = await self._event_queue.get()
+            try:
+                await self._dispatch_event(obj)
+            except Exception as exc:
+                self._status_error(f"[red][error][/] dispatch: {exc}")
+
+    def _apply_left_pane_width(self) -> None:
+        """Size the left pane to fit the widest channel label plus room
+        for a 3-digit unread suffix, so '#announcements (100)' never wraps."""
+        widest = self._LEFT_PANE_MIN_WIDTH
+        cids: dict[int, str | None] = {}
+        for c in self._ui._channels:
+            cids[c.cid] = c.name
+        try:
+            for r in self._ui._client._store.list_channels():  # type: ignore[attr-defined]
+                cids.setdefault(r["cid"], None)
+        except Exception:
+            pass
+        for cid, name in cids.items():
+            label_len = 2 + len(str(cid))  # "☑ {cid}"
+            if name:
+                label_len += 2 + len(name)  # " #{name}"
+            widest = max(widest, label_len + self._LEFT_PANE_RESERVED_SUFFIX)
+        # +1 for the right border, +2 for breathing room.
+        try:
+            self.query_one("#left").styles.width = widest + 3
+        except Exception:
+            pass
+
+    def _populate_initial_target_lists(self) -> None:
+        # Channels: subscribed first (from the store), then directory
+        # entries the store hasn't seen yet (with a (–) marker).
+        try:
+            channels = self._ui._client._store.list_channels()  # type: ignore[attr-defined]
+        except Exception:
+            channels = []
+        seeded: set[int] = set()
+        for ch in channels:
+            if ch.get("subscribed"):
+                self._add_target(("ch", str(ch["cid"])))
+                seeded.add(ch["cid"])
+        for c in sorted(self._ui._channels, key=lambda c: c.cid):
+            if c.cid in seeded:
+                continue
+            self._add_target(("ch", str(c.cid)), unsubscribed=True)
+
+        # "Add Call to DM" pinned row at the top of the DM list. Stays
+        # in place because every later DM peer is appended below it.
+        try:
+            dms_lv = self.query_one("#dms", ListView)
+            dms_lv.append(
+                ListItem(
+                    Static("[bold]+ Add Call to DM[/]", markup=True),
+                    id="dm-add-call",
+                )
+            )
+        except Exception:
+            pass
+
+        # DM peers from the store.
+        try:
+            peers = self._ui._client._store.list_dm_peers(self._ui._my_call)  # type: ignore[attr-defined]
+        except Exception:
+            peers = []
+        for p in peers:
+            self._add_target(("dm", p["peer"]))
+
+    # ------------------------------------------------------------------
+    # Target list — left pane
+    # ------------------------------------------------------------------
+
+    def _target_id(self, target: TargetKey) -> str:
+        kind, key = target
+        # Sanitize: ListItem ids must be alphanumeric / underscore /
+        # hyphen and start with a letter.
+        safe = re.sub(r"[^A-Za-z0-9]", "_", key)
+        return f"target-{kind}-{safe}"
+
+    def _target_label(self, target: TargetKey, *, unsubscribed: bool = False) -> str:
+        kind, key = target
+        unread = self._unread.get(target, 0)
+        unread_suffix = f" [bold yellow]({unread})[/]" if unread else ""
+        if kind == "ch":
+            try:
+                cid = int(key)
+            except ValueError:
+                return f"ch:{key}{unread_suffix}"
+            subscribed = self._is_subscribed(cid) and not unsubscribed
+            check = "☑" if subscribed else "☐"
+            name = self._channel_name(cid)
+            label = f"{check} {cid} #{name}" if name else f"{check} {cid}"
+            return f"{label}{unread_suffix}"
+        return f"{_fmt_user(key, self._ui._client.ham_name)}{unread_suffix}"
+
+    def _add_target(self, target: TargetKey, *, unsubscribed: bool = False) -> None:
+        kind, _ = target
+        list_id = "channels" if kind == "ch" else "dms"
+        try:
+            lv = self.query_one(f"#{list_id}", ListView)
+        except Exception:
+            return
+        wid = self._target_id(target)
+        for child in lv.children:
+            if child.id == wid:
+                return
+        label = self._target_label(target, unsubscribed=unsubscribed)
+        lv.append(ListItem(Static(label, markup=True), id=wid))
+
+    def _refresh_target_label(self, target: TargetKey) -> None:
+        wid = self._target_id(target)
+        try:
+            item = self.query_one(f"#{wid}", ListItem)
+        except Exception:
+            return
+        item.query_one(Static).update(self._target_label(target))
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        if event.tab is None:
+            return
+        if event.tab.id == "tab-channels":
+            self.query_one("#target-switcher", ContentSwitcher).current = "channels"
+        elif event.tab.id == "tab-dms":
+            self.query_one("#target-switcher", ContentSwitcher).current = "dms"
+
+    async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if self._suppress_highlight:
+            return
+        if event.item is None:
+            return
+        lv = event.list_view
+        # Target list highlight → live-preview the centre pane. Skip for
+        # unsubscribed channels: nothing should change in the centre pane
+        # until the user confirms the subscribe via the modal opened by
+        # `on_list_view_selected`.
+        if lv.id in ("channels", "dms") and event.item.id and event.item.id.startswith("target-"):
+            target = self._target_from_id(event.item.id)
+            if target is None:
+                return
+            if target[0] == "ch":
+                try:
+                    cid = int(target[1])
+                except ValueError:
+                    cid = None
+                if cid is not None and not self._is_subscribed(cid) \
+                        and not self._ui._client.paused_channels().get(cid):
+                    return
+            await self._switch_centre_to(target)
+            return
+        # Active message list, cursor at top → load older.
+        active = self._active_view_id()
+        if active and lv.id == active and lv.index == 0:
+            await self._load_older()
+
+    async def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id or ""
+        # "Add Call to DM" pinned row at the top of the DM list.
+        if item_id == "dm-add-call":
+            self._open_new_dm_modal()
+            return
+        # Target list: Enter pins target and refocuses the input.
+        if item_id.startswith("target-"):
+            target = self._target_from_id(item_id)
+            if target is None:
+                return
+            if target[0] == "ch":
+                try:
+                    cid = int(target[1])
+                except ValueError:
+                    cid = None
+                # Unsubscribed channel: open the subscribe modal and only
+                # commit the target / centre switch on confirm. Paused
+                # implies subscribed, so it falls through to the normal
+                # path below.
+                if cid is not None and not self._is_subscribed(cid) \
+                        and not self._ui._client.paused_channels().get(cid):
+                    self._open_subscribe_modal(cid, target=target)
+                    return
+            self._ui._target = target
+            await self._switch_centre_to(target)
+            self._refresh_prompt()
+            self._refresh_footer()
+            self.query_one("#input", Input).focus()
+            if target[0] == "ch":
+                cid = int(target[1])
+                if self._ui._client.paused_channels().get(cid):
+                    self._maybe_print_paused_hint(cid)
+            return
+        # Active message list: Enter opens the action menu.
+        active = self._active_view_id()
+        if active and event.list_view.id == active:
+            row = event.item
+            if isinstance(row, MessageRow):
+                self._open_action_menu(row)
+
+    def _target_from_id(self, item_id: str) -> TargetKey | None:
+        # "target-{kind}-{safe_key}" — but sanitisation is lossy, so we
+        # round-trip via the existing _add_target keys.
+        for tkey in list(self._views.keys()) + self._all_target_keys():
+            if self._target_id(tkey) == item_id:
+                return tkey
+        return None
+
+    def _all_target_keys(self) -> list[TargetKey]:
+        out: list[TargetKey] = []
+        for c in self._ui._channels:
+            out.append(("ch", str(c.cid)))
+        try:
+            for ch in self._ui._client._store.list_channels():  # type: ignore[attr-defined]
+                out.append(("ch", str(ch["cid"])))
+        except Exception:
+            pass
+        try:
+            for p in self._ui._client._store.list_dm_peers(self._ui._my_call):  # type: ignore[attr-defined]
+                out.append(("dm", p["peer"]))
+        except Exception:
+            pass
+        return out
+
+    # ------------------------------------------------------------------
+    # Centre pane — per-target message ListViews
+    # ------------------------------------------------------------------
+
+    async def _ensure_message_view(self, target: TargetKey) -> ListView:
+        """Get-or-create the per-target message ListView. Async because
+        Textual requires the LV to finish mounting before its children
+        can be appended."""
+        if target in self._views:
+            return self.query_one(f"#{self._views[target]}", ListView)
+        view_id = f"msgs-{self._next_view_idx}"
+        self._next_view_idx += 1
+        self._views[target] = view_id
+        switcher = self.query_one("#message-switcher", ContentSwitcher)
+        new_lv = ListView(id=view_id)
+        await switcher.mount(new_lv)
+        # Seed initial backfill from the store now that the LV is live.
+        self._mount_initial_history(target, new_lv)
+        return new_lv
+
+    async def _switch_centre_to(self, target: TargetKey) -> None:
+        lv = await self._ensure_message_view(target)
+        switcher = self.query_one("#message-switcher", ContentSwitcher)
+        switcher.current = lv.id  # type: ignore[assignment]
+        # Activating clears the unread count.
+        if self._unread.pop(target, 0):
+            self._refresh_target_label(target)
+        self._refresh_thread_header(target)
+
+    def _refresh_thread_header(self, target: TargetKey | None = None) -> None:
+        try:
+            hdr = self.query_one("#thread-header", Static)
+        except Exception:
+            return
+        if target is None:
+            target = self._active_target()
+        if target is None:
+            hdr.update("[dim]No channel or DM selected[/]")
+            return
+        kind, key = target
+        if kind == "ch":
+            try:
+                cid = int(key)
+            except ValueError:
+                hdr.update(f"[b]Channel {key}[/]")
+                return
+            name = self._channel_name(cid)
+            label = f"[b]#{name}[/] (ch {cid})" if name else f"[b]Channel {cid}[/]"
+            hdr.update(label)
+        else:
+            user = _fmt_user(key, self._ui._client.ham_name)
+            hdr.update(f"[b]DM:[/] {user}" if user else f"[b]DM:[/] {key}")
+
+    def _active_view_id(self) -> str | None:
+        try:
+            switcher = self.query_one("#message-switcher", ContentSwitcher)
+        except Exception:
+            return None
+        cur = switcher.current
+        return cur if cur and cur.startswith("msgs-") else None
+
+    def _active_target(self) -> TargetKey | None:
+        active = self._active_view_id()
+        if active is None:
+            return None
+        for tkey, vid in self._views.items():
+            if vid == active:
+                return tkey
+        return None
+
+    def _initial_load_count(self) -> int:
+        """How many rows to seed into a freshly-mounted message ListView.
+
+        Use the centre pane's actual height when known (so the view
+        opens with rows already filling the visible area) and fall back
+        to the configured backfill count otherwise."""
+        base = self._ui._history_backfill or 30
+        try:
+            switcher = self.query_one("#message-switcher", ContentSwitcher)
+            h = switcher.size.height
+        except Exception:
+            return base
+        if h <= 0:
+            return base
+        # Trim a couple of rows for the rounded border + status pane room.
+        return max(base, h - 2)
+
+    def _mount_initial_history(self, target: TargetKey, lv: ListView) -> None:
+        kind, key = target
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        n = self._initial_load_count()
+        if kind == "dm":
+            rows = store.recent_messages(key.upper(), limit=n)
+        else:
+            try:
+                rows = store.recent_posts(int(key), limit=n)
+            except ValueError:
+                rows = []
+        # Mount oldest first, since each `append` puts the row at the bottom.
+        rows = list(reversed(rows))
+        with self._batch_mutate():
+            for r in rows:
+                self._mount_row(target, lv, r, append=True)
+
+    async def _reset_message_view(self, target: TargetKey) -> None:
+        """Drop every mounted item for ``target`` and re-seed from the
+        store. Used on re-subscribe so stale system lines (the prior
+        [unsubscribed] notice, /paused hints, etc.) don't linger on top
+        of the fresh post history."""
+        view_id = self._views.get(target)
+        if not view_id:
+            return
+        try:
+            lv = self.query_one(f"#{view_id}", ListView)
+        except Exception:
+            return
+        with self._batch_mutate():
+            await lv.clear()
+        # `_rows` keys are (kind, target_key, natural_key) — drop every
+        # entry for this target so future inbound mounts don't dedupe
+        # against orphaned references and miss the row.
+        kind, key = target
+        for rk in [k for k in self._rows if k[0] == kind and k[1] == key]:
+            self._rows.pop(rk, None)
+        self._history_exhausted.pop(target, None)
+        self._unread.pop(target, None)
+        self._mount_initial_history(target, lv)
+
+    async def _load_older(self) -> None:
+        target = self._active_target()
+        if target is None:
+            return
+        if self._history_exhausted.get(target):
+            return
+        kind, key = target
+        lv = await self._ensure_message_view(target)
+        if not lv.children:
+            return
+        # Find the oldest MessageRow — a ListView may also contain
+        # plain ListItems for system hints (`_write_to_active`), and
+        # those don't have a ts to anchor on.
+        oldest: MessageRow | None = None
+        for child in lv.children:
+            if isinstance(child, MessageRow):
+                oldest = child
+                break
+        if oldest is None:
+            return
+        anchor_natural_key = oldest.natural_key
+        before_ts = oldest.ts
+        if before_ts is None:
+            return
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        n = self._ui._history_backfill or 30
+        if kind == "dm":
+            rows = store.recent_messages(key.upper(), limit=n, before_ts=int(before_ts))
+        else:
+            try:
+                rows = store.recent_posts(int(key), limit=n, before_ts=int(before_ts))
+            except ValueError:
+                rows = []
+        if not rows:
+            self._history_exhausted[target] = True
+            return
+        if len(rows) < n:
+            self._history_exhausted[target] = True
+        # Prepend in chronological order so the result reads
+        # oldest-first at the top. ``rows`` came back newest-first; we
+        # iterate as-is and mount each at ``before=0`` so each newer
+        # row pushes the previous insertion down, leaving the oldest at
+        # the top.
+        with self._batch_mutate():
+            for r in rows:
+                key_tuple = (kind, key, self._natural_key_for_row(kind, r))
+                if key_tuple in self._rows:
+                    # Defensive: a row we already have mounted shouldn't
+                    # be re-prepended (would happen if the cursor query
+                    # ever returned an overlap).
+                    continue
+                new_row = self._build_row(target, r)
+                lv.mount(new_row, before=0)
+                self._rows[key_tuple] = new_row
+                self._refresh_row_label(new_row)
+        # Keep the visual anchor: highlight the row that was at the top
+        # before we prepended, so cursor-up at top doesn't slide off.
+        for i, child in enumerate(lv.children):
+            if isinstance(child, MessageRow) and child.natural_key == anchor_natural_key:
+                lv.index = i
+                break
+
+    def _natural_key_for_row(self, kind: str, row: dict) -> str:
+        if kind == "dm":
+            return str(row.get("id") or row.get("_id") or "")
+        return str(row.get("ts") or "")
+
+    def _build_row(self, target: TargetKey, row: dict) -> MessageRow:
+        kind, key = target
+        natural_key = self._natural_key_for_row(kind, row)
+        reactions = self._lookup_reactions(kind, key, natural_key)
+        return MessageRow(
+            kind=kind,
+            target_key=key,
+            natural_key=natural_key,
+            from_call=row.get("from_call") or row.get("fc") or "",
+            body=row.get("body") or row.get("m") or row.get("p") or "",
+            ts=row.get("ts"),
+            edit_ts=row.get("edit_ts"),
+            delivered_ts=row.get("delivered_ts"),
+            received_ts=row.get("received_ts"),
+            realtime=row.get("realtime"),
+            lid=row.get("lid"),
+            reactions=reactions,
+        )
+
+    def _lookup_reactions(
+        self, kind: str, target_key: str, natural_key: str
+    ) -> list[dict]:
+        """Pull current reactions from the store keyed by row identity.
+
+        DM rows are keyed by ``msg_id`` (the natural_key); post rows by
+        ``(cid, ts)``. Returns ``[]`` on any lookup error so a transient
+        store hiccup never breaks row mounting.
+        """
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        try:
+            if kind == "dm":
+                return store.list_message_emojis(natural_key)
+            if kind == "ch":
+                return store.list_post_emojis(int(target_key), int(natural_key))
+        except Exception:
+            return []
+        return []
+
+    def _mount_row(
+        self, target: TargetKey, lv: ListView, row: dict, *, append: bool = True
+    ) -> MessageRow:
+        kind, key = target
+        new_row = self._build_row(target, row)
+        existing = self._rows.get((kind, key, new_row.natural_key))
+        if existing is not None:
+            return existing
+        if append:
+            lv.append(new_row)
+        else:
+            lv.mount(new_row, before=0)
+        self._rows[(kind, key, new_row.natural_key)] = new_row
+        self._refresh_row_label(new_row)
+        return new_row
+
+    def _refresh_row_label(self, row: MessageRow) -> None:
+        row.refresh_label(
+            my_call=self._ui._my_call,
+            verbose=self._ui._options.verbose_history,
+            ham_name=self._ui._client.ham_name,
+            delivery_timeout_s=self._ui._options.delivery_timeout_s,
+        )
+
+    def _refresh_all_rows(self) -> None:
+        for row in self._rows.values():
+            self._refresh_row_label(row)
+
+    # ------------------------------------------------------------------
+    # Online users
+    # ------------------------------------------------------------------
+
+    def _refresh_online_pane(self, users: list[str]) -> None:
+        try:
+            lv = self.query_one("#online", ListView)
+            header = self.query_one("#online-header", Static)
+        except Exception:
+            return
+        lv.clear()
+        for call in users:
+            label = _fmt_user(call, self._ui._client.ham_name)
+            lv.append(ListItem(Static(label, markup=True)))
+        header.update(f"Online ({len(users)})")
+
+    # ------------------------------------------------------------------
+    # Status pane (Ctrl+S)
+    # ------------------------------------------------------------------
+
+    def action_toggle_status(self) -> None:
+        try:
+            pane = self.query_one("#status", RichLog)
+        except Exception:
+            return
+        pane.styles.display = "none" if pane.display else "block"
+
+    def _status_visible(self) -> bool:
+        try:
+            return bool(self.query_one("#status", RichLog).display)
+        except Exception:
+            return False
+
+    def _status_write(self, line: str) -> None:
+        try:
+            self.query_one("#status", RichLog).write(line)
+        except Exception:
+            pass
+
+    def _status_error(self, line: str) -> None:
+        """Write a user-facing error / warning to the status pane and
+        force it visible. Slash-command argument validation, async
+        worker exceptions and other error paths funnel through here so
+        the user notices without polluting their conversation thread."""
+        try:
+            pane = self.query_one("#status", RichLog)
+        except Exception:
+            return
+        pane.write(line)
+        if not pane.display:
+            pane.styles.display = "block"
+
+    # ------------------------------------------------------------------
+    # Verbose toggle (Ctrl+D) and help (Ctrl+H)
+    # ------------------------------------------------------------------
+
+    def action_toggle_verbose(self) -> None:
+        opts = self._ui._options
+        opts.verbose_history = not opts.verbose_history
+        self._refresh_all_rows()
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
+
+    def action_options(self) -> None:
+        self._open_settings_modal()
+
+    # ------------------------------------------------------------------
+    # Focus management
+    # ------------------------------------------------------------------
+
+    def action_focus_input(self) -> None:
+        try:
+            self.query_one("#input", Input).focus()
+        except Exception:
+            pass
+
+    def _focus_target_for_step(self, step: str) -> Any | None:
+        if step == "input":
+            return self.query_one("#input", Input)
+        if step == "msg-active":
+            active = self._active_view_id()
+            if active:
+                return self.query_one(f"#{active}", ListView)
+            return None
+        if step == "tab-strip":
+            return self.query_one("#tab-strip", Tabs)
+        if step == "target-active":
+            switcher = self.query_one("#target-switcher", ContentSwitcher)
+            current_id = switcher.current
+            if current_id:
+                return self.query_one(f"#{current_id}", ListView)
+            return None
+        if step == "online":
+            return self.query_one("#online", ListView)
+        return None
+
+    def _focus_step(self, delta: int) -> None:
+        focused = self.focused
+        focused_id = focused.id if focused else None
+        cycle = _FOCUS_CYCLE
+        # Find current position; tab-strip / lists may be matched by id.
+        active_msg = self._active_view_id()
+        active_target = self.query_one("#target-switcher", ContentSwitcher).current
+        try:
+            if focused_id == "input":
+                idx = cycle.index("input")
+            elif focused_id == active_msg:
+                idx = cycle.index("msg-active")
+            elif focused_id == "tab-strip":
+                idx = cycle.index("tab-strip")
+            elif focused_id == active_target:
+                idx = cycle.index("target-active")
+            elif focused_id == "online":
+                idx = cycle.index("online")
+            else:
+                idx = -1
+        except ValueError:
+            idx = -1
+        for offset in range(1, len(cycle) + 1):
+            step = cycle[(idx + delta * offset) % len(cycle)]
+            target = self._focus_target_for_step(step)
+            if target is not None:
+                target.focus()
+                return
+
+    def action_focus_next_pane(self) -> None:
+        self._focus_step(+1)
+
+    def action_focus_prev_pane(self) -> None:
+        self._focus_step(-1)
+
+    # ------------------------------------------------------------------
+    # Quit / link teardown
+    # ------------------------------------------------------------------
+
+    async def action_quit_app(self) -> None:
+        try:
+            await self._ui._client.close()
+        finally:
+            self.exit()
+
+    def _signal_terminal_link_loss(self) -> None:
+        if self._ui.exit_reason is not None:
+            return
+        self._ui.exit_reason = "terminal"
+        try:
+            self.exit()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Helpers — channel name lookup, prompt, paused/subscribe hints
+    # ------------------------------------------------------------------
+
+    def _channel_name(self, cid: int) -> str | None:
+        for c in self._ui._channels:
+            if c.cid == cid and c.name:
+                return c.name
+        return None
+
+    def _channel_ref(self, cid: int) -> str:
+        name = self._channel_name(cid)
+        return f"ch {cid} #{name}" if name else f"ch {cid}"
+
+    def _refresh_prompt(self) -> None:
+        try:
+            inp = self.query_one("#input", Input)
+        except Exception:
+            return
+        if self._pending_edit:
+            kind = self._pending_edit["kind"]
+            inp.placeholder = f"editing {kind}> "
+            return
+        if self._ui._target is None:
+            inp.placeholder = f"{self._ui._my_call}> "
+        else:
+            kind, key = self._ui._target
+            if kind == "ch":
+                try:
+                    cid = int(key)
+                except ValueError:
+                    inp.placeholder = f"{key}> "
+                else:
+                    name = self._channel_name(cid)
+                    inp.placeholder = f"{cid} #{name}> " if name else f"{cid}> "
+            else:
+                inp.placeholder = f"{kind}:{key}> "
+
+    def _is_subscribed(self, cid: int) -> bool:
+        try:
+            for r in self._ui._client._store.list_channels():  # type: ignore[attr-defined]
+                if r["cid"] == cid:
+                    return bool(r["subscribed"])
+        except Exception:
+            return False
+        return False
+
+    def _maybe_print_paused_hint(self, cid: int) -> None:
+        paused = self._ui._client.paused_channels().get(cid)
+        if not paused:
+            return
+        self._write_to_active(self._paused_hint(cid, paused))
+
+    def _paused_hint(self, cid: int, paused: int) -> str:
+        return (
+            f"[yellow]{self._channel_ref(cid)} is paused — {paused} posts "
+            f"waiting on the server. Run /unpause {cid} [N] to download "
+            f"them. Posting is blocked until you unpause.[/]"
+        )
+
+    def _unsubscribed_send_hint(self, cid: int) -> str:
+        return (
+            f"[yellow][{self._channel_ref(cid)}][/] not subscribed — posting "
+            f"is blocked (server only relays new posts to subscribers, so "
+            f"you'd never see replies)."
+        )
+
+    def _open_subscribe_modal(
+        self,
+        cid: int,
+        *,
+        target: TargetKey,
+        skip_confirm: bool = False,
+    ) -> None:
+        """Push the two-stage subscribe modal for an unsubscribed channel.
+
+        On confirm + count answered, switches the centre pane and target
+        to the freshly-subscribed channel. On dismiss-without-subscribe,
+        the centre pane and target stay on whatever was previously
+        active — the caller hasn't switched yet by the time this runs.
+
+        ``skip_confirm`` skips the Y/N stage and goes straight to the
+        subscribe + count flow — used by ``/sub CID`` since the user has
+        already opted in by typing the command."""
+        c = self._ui._client
+
+        async def on_confirm() -> int:
+            return await c.subscribe_and_wait(cid)
+
+        def default_count_for(pc: int) -> int:
+            return min(c.auto_backfill_post_count or 10, pc)
+
+        async def _run() -> None:
+            result = await self.push_screen_wait(
+                SubscribeModal(
+                    channel_ref=self._channel_ref(cid),
+                    on_confirm=on_confirm,
+                    default_count_for=default_count_for,
+                    skip_confirm=skip_confirm,
+                )
+            )
+            if result is None:
+                # User declined — leave centre pane / target untouched.
+                return
+            # Switch the centre pane to the new channel BEFORE requesting
+            # the post batch. The cpb response races with the switch — if
+            # posts arrive while the old target is still active,
+            # `_handle_inbound_post` early-returns (bump unread, no mount)
+            # and the user sees the unread count but no posts in the pane.
+            # Switching first guarantees `active == target` when cpb lands.
+            self._ui._target = target
+            self._add_target(target)
+            await self._switch_centre_to(target)
+            self._refresh_prompt()
+            self._refresh_footer()
+            try:
+                if result > 0:
+                    await c.request_post_batch(cid, result)
+            except Exception as exc:
+                self._status_error(f"[red][error][/] {exc}")
+            try:
+                self.query_one("#input", Input).focus()
+            except Exception:
+                pass
+
+        self.run_worker(_run(), exclusive=False)
+
+    def _open_new_dm_modal(self) -> None:
+        """Prompt for a callsign and open or switch to that DM thread.
+
+        Esc / empty input is a no-op. Existing threads simply get
+        activated; brand-new ones get a fresh (empty) message view so the
+        user can start typing right away."""
+
+        async def _run() -> None:
+            call = await self.push_screen_wait(NewDmModal())
+            if not call:
+                return
+            target: TargetKey = ("dm", call)
+            self._ui._target = target
+            self._add_target(target)
+            await self._switch_centre_to(target)
+            self._refresh_prompt()
+            self._refresh_footer()
+            try:
+                self.query_one("#input", Input).focus()
+            except Exception:
+                pass
+
+        self.run_worker(_run(), exclusive=False)
+
+    def action_unsub_channel(self) -> None:
+        """Ctrl+U — confirm-and-unsubscribe the active channel target.
+
+        Operates on the centre-pane's active target regardless of focus
+        — the only channel the user can plausibly mean is the one they're
+        currently looking at. The footer hides this binding unless the
+        active target is a subscribed channel, so reaching this handler
+        with anything else is a defensive no-op. The server's ``cs`` ack
+        flips the checkbox label back to ☐ via ``_handle_cs``."""
+        cid = self._active_subscribed_channel_cid()
+        if cid is None:
+            return
+        self._open_unsubscribe_modal(cid)
+
+    def _active_subscribed_channel_cid(self) -> int | None:
+        target = self._ui._target
+        if target is None or target[0] != "ch":
+            return None
+        try:
+            cid = int(target[1])
+        except ValueError:
+            return None
+        if not self._is_subscribed(cid):
+            return None
+        return cid
+
+    def _active_target_is_subscribed_channel(self) -> bool:
+        return self._active_subscribed_channel_cid() is not None
+
+    def _refresh_footer(self) -> None:
+        """Recompose the footer so conditional bindings (ctrl+u) update.
+
+        Call after any change that affects whether the active target is
+        a subscribed channel: target switch, subscribe/unsubscribe ack."""
+        try:
+            footer = self.query_one(StaticFooter)
+        except Exception:
+            return
+        footer.refresh(recompose=True)
+
+    def _open_unsubscribe_modal(self, cid: int) -> None:
+        c = self._ui._client
+
+        async def _run() -> None:
+            confirmed = await self.push_screen_wait(
+                UnsubscribeModal(channel_ref=self._channel_ref(cid))
+            )
+            if not confirmed:
+                return
+            try:
+                await c.unsubscribe(cid)
+            except Exception as exc:
+                self._status_error(f"[red][error][/] unsubscribe: {exc}")
+
+        self.run_worker(_run(), exclusive=False)
+
+    # ------------------------------------------------------------------
+    # Status / system messages — go into the active view as ListItems
+    # ------------------------------------------------------------------
+
+    def _write_to_active(self, line: str) -> None:
+        """System / hint line → write into the active centre ListView as
+        a non-message ListItem so it stays in the conversation context."""
+        active = self._active_view_id()
+        if active is None:
+            return
+        try:
+            lv = self.query_one(f"#{active}", ListView)
+        except Exception:
+            return
+        lv.append(ListItem(Static(line, markup=True)))
+
+    # ------------------------------------------------------------------
+    # Event rendering — called from the client's reader task
+    # ------------------------------------------------------------------
+
+    async def _dispatch_event(self, obj: dict) -> None:
+        t = obj.get("t")
+        # DM / batched DM
+        if t == "m":
+            await self._handle_inbound_dm(obj, batched=False)
+        elif t == "mb":
+            for m in obj.get("m", []):
+                await self._handle_inbound_dm(m, batched=True)
+        # Post / batched post
+        elif t == "cp":
+            await self._handle_inbound_post(obj, batched=False)
+        elif t == "cpb":
+            cid = obj.get("cid")
+            if cid is None:
+                return
+            for p in obj.get("p", []):
+                await self._handle_inbound_post({**p, "cid": cid}, batched=True)
+        # Acks
+        elif t == "mr":
+            self._handle_dm_ack(obj)
+        elif t == "cpr":
+            self._handle_post_ack(obj)
+        # Edits
+        elif t == "med":
+            self._handle_dm_edit(obj)
+        elif t == "cped":
+            self._handle_post_edit(obj)
+        # Reactions
+        elif t == "mem":
+            self._handle_dm_reaction(obj)
+        elif t == "memb":
+            for entry in obj.get("mem", []):
+                self._handle_dm_reaction(entry)
+        elif t == "cpem":
+            self._handle_post_reaction(obj)
+        elif t == "cpemb":
+            for group in obj.get("e", []):
+                self._handle_post_reaction_batch(group)
+        # Roster
+        elif t == "uc":
+            self._refresh_online_pane(self._ui._client.online_users())
+            if self._status_visible():
+                self._status_write(
+                    f"[user] {_fmt_user(obj.get('c'), self._ui._client.ham_name)} connected"
+                )
+        elif t == "ud":
+            self._refresh_online_pane(self._ui._client.online_users())
+            if self._status_visible():
+                self._status_write(
+                    f"[user] {_fmt_user(obj.get('c'), self._ui._client.ham_name)} disconnected"
+                )
+        elif t == "o":
+            self._refresh_online_pane(self._ui._client.online_users())
+        # Channel state / paused
+        elif t == "cs":
+            await self._handle_cs(obj)
+        elif t == "pch":
+            for ch in obj.get("ch", []):
+                cid = ch.get("cid")
+                ref = self._channel_ref(int(cid)) if cid is not None else "ch"
+                self._write_to_active(
+                    f"[yellow][paused {ref}][/] {ch.get('pt')} pending posts "
+                    f"— /unpause {cid} [N] to download"
+                )
+        # Connect / disconnect (link state)
+        elif t == "c" and "n" not in obj:
+            self._write_to_active(
+                f"[connect] mc={obj.get('mc', 0)} pc={obj.get('pc', 0)} v={obj.get('v')}"
+            )
+        elif t == "_disconnect":
+            line = f"[red][link][/] disconnected ({obj.get('reason', '')})"
+            self._write_to_active(line)
+            if self._status_visible():
+                self._status_write(line)
+            if not self._ui._client.is_auto_reconnect:
+                self._signal_terminal_link_loss()
+        elif t == "_reconnecting":
+            line = (
+                f"[yellow][link][/] reconnect attempt {obj.get('attempt')} in "
+                f"{obj.get('delay'):.1f}s"
+            )
+            self._write_to_active(line)
+            if self._status_visible():
+                self._status_write(line)
+        elif t == "_reconnect_failed":
+            line = (
+                f"[yellow][link][/] reconnect attempt {obj.get('attempt')} failed: "
+                f"{obj.get('exc')}"
+            )
+            self._write_to_active(line)
+            if self._status_visible():
+                self._status_write(line)
+        elif t == "_reconnected":
+            line = f"[green][link][/] reconnected (attempt {obj.get('attempt')})"
+            self._write_to_active(line)
+            if self._status_visible():
+                self._status_write(line)
+        elif t == "_reconnect_giveup":
+            line = (
+                f"[red][link][/] giving up after {obj.get('attempts')} "
+                "reconnect attempts"
+            )
+            self._write_to_active(line)
+            if self._status_visible():
+                self._status_write(line)
+            self._signal_terminal_link_loss()
+        elif t == "_error":
+            self._status_error(f"[red][error][/] {obj.get('exc')}")
+        elif t == "_delivery_timeout":
+            self._handle_delivery_timeout(obj)
+
+    async def _handle_inbound_dm(self, m: dict, *, batched: bool) -> None:
+        fc = m.get("fc")
+        tc = m.get("tc")
+        peer = tc if fc == self._ui._my_call else fc
+        if not peer:
+            return
+        target: TargetKey = ("dm", peer)
+        self._add_target(target)
+        active = self._active_target()
+        if active != target:
+            # Inactive target → bump unread, do NOT mount the row. The
+            # row will be paged in from the store on activation.
+            self._unread[target] = self._unread.get(target, 0) + 1
+            self._refresh_target_label(target)
+            return
+        # Active target → mount the row. Look up the persisted row from
+        # the store (by id) so we get the same fields the verbose render
+        # path expects.
+        msg_id = m.get("_id") or (
+            f"{m.get('ts')}-{m.get('fc')}" if m.get("ts") and m.get("fc") else None
+        )
+        row = None
+        if msg_id:
+            try:
+                row = self._ui._client._store.lookup_message_by_id(msg_id)  # type: ignore[attr-defined]
+            except Exception:
+                row = None
+        if row is None:
+            row = {
+                "id": msg_id,
+                "from_call": fc,
+                "to_call": tc,
+                "body": m.get("m"),
+                "ts": m.get("ts"),
+                "edit_ts": m.get("edts"),
+                "lid": None,
+            }
+        lv = await self._ensure_message_view(target)
+        with self._batch_mutate():
+            self._mount_row(target, lv, row, append=True)
+
+    async def _handle_inbound_post(self, p: dict, *, batched: bool) -> None:
+        cid = p.get("cid")
+        if cid is None:
+            return
+        target: TargetKey = ("ch", str(cid))
+        self._add_target(target)
+        active = self._active_target()
+        if active != target:
+            self._unread[target] = self._unread.get(target, 0) + 1
+            self._refresh_target_label(target)
+            return
+        ts = p.get("ts")
+        row = None
+        if isinstance(ts, int):
+            try:
+                row = self._ui._client._store.lookup_post(int(cid), int(ts))  # type: ignore[attr-defined]
+            except Exception:
+                row = None
+        if row is None:
+            row = {
+                "channel_id": cid,
+                "from_call": p.get("fc"),
+                "body": p.get("p"),
+                "ts": ts,
+                "edit_ts": p.get("edts"),
+                "lid": None,
+            }
+        lv = await self._ensure_message_view(target)
+        with self._batch_mutate():
+            self._mount_row(target, lv, row, append=True)
+
+    def _handle_dm_ack(self, obj: dict) -> None:
+        msg_id = obj.get("_id")
+        if not isinstance(msg_id, str):
+            return
+        try:
+            row = self._ui._client._store.lookup_message_by_id(msg_id)  # type: ignore[attr-defined]
+        except Exception:
+            row = None
+        if row is None:
+            return
+        peer = row.get("to_call") or row.get("from_call") or ""
+        target = ("dm", str(peer))
+        rk = (target[0], target[1], msg_id)
+        msg_row = self._rows.get(rk)
+        if msg_row is not None:
+            msg_row.delivered_ts = row.get("delivered_ts") or int(time.time() * 1000)
+            self._refresh_row_label(msg_row)
+        if self._status_visible():
+            ts_ms = ts_to_ms(row.get("ts"))
+            now = int(time.time() * 1000)
+            duration = _fmt_duration_ms(now - ts_ms) if ts_ms else "?"
+            label = self._fmt_target_label(target)
+            self._status_write(
+                f"[green][ack][/] {label} msg {row.get('lid')} delivered in {duration}"
+            )
+
+    def _handle_post_ack(self, obj: dict) -> None:
+        ts = obj.get("ts")
+        dts = obj.get("dts")
+        if not isinstance(ts, int):
+            return
+        try:
+            row = self._ui._client._store.lookup_post_by_from_ts(  # type: ignore[attr-defined]
+                self._ui._my_call, ts
+            )
+        except Exception:
+            row = None
+        if row is None:
+            return
+        cid = row.get("channel_id")
+        target = ("ch", str(cid))
+        rk = (target[0], target[1], str(ts))
+        msg_row = self._rows.get(rk)
+        if msg_row is not None:
+            msg_row.delivered_ts = (
+                int(dts) if isinstance(dts, int) else int(time.time() * 1000)
+            )
+            self._refresh_row_label(msg_row)
+        if self._status_visible():
+            ts_ms = ts_to_ms(ts)
+            end = ts_to_ms(dts) if isinstance(dts, int) else int(time.time() * 1000)
+            duration = _fmt_duration_ms(end - ts_ms) if ts_ms else "?"
+            label = self._fmt_target_label(target)
+            self._status_write(
+                f"[green][ack][/] {label} post {row.get('lid')} delivered in {duration}"
+            )
+
+    def _handle_dm_edit(self, obj: dict, *, clear_delivered: bool = False) -> None:
+        msg_id = obj.get("_id")
+        if not isinstance(msg_id, str):
+            return
+        try:
+            row = self._ui._client._store.lookup_message_by_id(msg_id)  # type: ignore[attr-defined]
+        except Exception:
+            row = None
+        if row is None:
+            return
+        peer = row.get("to_call") or row.get("from_call") or ""
+        target = ("dm", str(peer))
+        rk = (target[0], target[1], msg_id)
+        msg_row = self._rows.get(rk)
+        body = obj.get("m", row.get("body"))
+        edts = obj.get("edts") or row.get("edit_ts")
+        if msg_row is not None:
+            msg_row.body = body or ""
+            msg_row.edit_ts = edts
+            # When *we* edit our own DM, dim the row until `mr` re-acks
+            # the edit (the original send's delivered_ts was already
+            # set, so clear it so `_render_row` re-applies the [dim]).
+            if clear_delivered:
+                msg_row.delivered_ts = None
+            self._refresh_row_label(msg_row)
+        if self._status_visible():
+            self._status_write(
+                f"[blue][edit][/] {self._fmt_target_label(target)} msg "
+                f"{row.get('lid')} edited"
+            )
+
+    def _handle_post_edit(self, obj: dict, *, clear_delivered: bool = False) -> None:
+        cid = obj.get("cid")
+        ts = obj.get("ts")
+        if not isinstance(cid, int) or not isinstance(ts, int):
+            return
+        try:
+            row = self._ui._client._store.lookup_post(int(cid), int(ts))  # type: ignore[attr-defined]
+        except Exception:
+            row = None
+        if row is None:
+            return
+        target = ("ch", str(cid))
+        rk = (target[0], target[1], str(ts))
+        msg_row = self._rows.get(rk)
+        body = obj.get("p", row.get("body"))
+        edts = obj.get("edts") or row.get("edit_ts")
+        if msg_row is not None:
+            msg_row.body = body or ""
+            msg_row.edit_ts = edts
+            # See comment in `_handle_dm_edit`: clear delivered_ts on
+            # our own edits so the row dims until `cpr` re-acks.
+            if clear_delivered:
+                msg_row.delivered_ts = None
+            self._refresh_row_label(msg_row)
+        if self._status_visible():
+            self._status_write(
+                f"[blue][edit][/] {self._fmt_target_label(target)} post "
+                f"{row.get('lid')} edited"
+            )
+
+    def _handle_dm_reaction(self, obj: dict) -> None:
+        """Refresh the reaction tail on the matching DM row.
+
+        The client-layer handler has already persisted the new state;
+        this just re-pulls the per-row list and re-renders. ``mem``
+        events for messages we don't have rendered (different active
+        target, not yet paged in from the store) are no-ops — the
+        reactions will be picked up when that row is mounted later.
+        """
+        msg_id = obj.get("_id")
+        if not isinstance(msg_id, str):
+            return
+        try:
+            row = self._ui._client._store.lookup_message_by_id(msg_id)  # type: ignore[attr-defined]
+        except Exception:
+            row = None
+        if row is None:
+            return
+        peer = row.get("to_call") or row.get("from_call") or ""
+        rk = ("dm", str(peer), msg_id)
+        msg_row = self._rows.get(rk)
+        if msg_row is None:
+            return
+        msg_row.reactions = self._lookup_reactions("dm", str(peer), msg_id)
+        self._refresh_row_label(msg_row)
+
+    def _handle_post_reaction(self, obj: dict) -> None:
+        """Refresh the reaction tail on the matching post row."""
+        cid = obj.get("cid")
+        ts = obj.get("ts")
+        if not isinstance(cid, int) or not isinstance(ts, int):
+            return
+        rk = ("ch", str(cid), str(ts))
+        msg_row = self._rows.get(rk)
+        if msg_row is None:
+            return
+        msg_row.reactions = self._lookup_reactions("ch", str(cid), str(ts))
+        self._refresh_row_label(msg_row)
+
+    def _handle_post_reaction_batch(self, group: dict) -> None:
+        cid = group.get("cid")
+        ts = group.get("ts")
+        if not isinstance(cid, int) or not isinstance(ts, int):
+            return
+        rk = ("ch", str(cid), str(ts))
+        msg_row = self._rows.get(rk)
+        if msg_row is None:
+            return
+        msg_row.reactions = self._lookup_reactions("ch", str(cid), str(ts))
+        self._refresh_row_label(msg_row)
+
+    async def _handle_cs(self, obj: dict) -> None:
+        cid = obj.get("cid")
+        subscribed = bool(obj.get("s"))
+        pc = obj.get("pc")
+        if cid is not None:
+            name = self._channel_name(int(cid))
+            label = f"{cid} #{name}" if name else f"{cid}"
+        else:
+            label = "channel"
+        verb = "Subscribed to" if subscribed else "Unsubscribed from"
+        if cid is not None and subscribed:
+            # Re-subscribe: drop any stale per-target system lines
+            # (paused hints, send errors, etc.) and re-seed from the
+            # store so the user lands on fresh history.
+            await self._reset_message_view(("ch", str(cid)))
+        if subscribed and isinstance(pc, int) and pc > 0:
+            self._status_write(f"{verb} {label} ({pc} historic posts on server)")
+        else:
+            self._status_write(f"{verb} {label}")
+        if cid is not None:
+            target = ("ch", str(cid))
+            if obj.get("s"):
+                self._add_target(target)
+            self._refresh_target_label(target)
+            # Subscription state of this channel just changed — if it's
+            # the active target, the ctrl+u footer entry needs to flip.
+            if self._ui._target == target:
+                self._refresh_footer()
+
+    def _handle_delivery_timeout(self, obj: dict) -> None:
+        kind = obj.get("kind")
+        lid = obj.get("lid")
+        ts = _fmt_ts(obj.get("ts")) if obj.get("ts") is not None else "[--]"
+        edit_tag = " (edit)" if obj.get("is_edit") else ""
+        if kind == "post":
+            cid = obj.get("cid")
+            ref = self._channel_ref(int(cid)) if isinstance(cid, int) else f"ch:{cid}"
+            line = (
+                f"[red][timeout][/] [{ref}] post {lid}{edit_tag} at {ts}. "
+                f"To resend: /retrypost {lid}"
+            )
+        else:
+            peer = obj.get("peer")
+            line = (
+                f"[red][timeout][/] [dm:{peer}] msg {lid}{edit_tag} at {ts}. "
+                f"To resend: /retrydm {lid}"
+            )
+        self._status_error(line)
+
+    def _fmt_target_label(self, target: TargetKey) -> str:
+        kind, key = target
+        if kind == "ch":
+            try:
+                cid = int(key)
+            except ValueError:
+                return f"ch:{key}"
+            name = self._channel_name(cid)
+            return f"ch:{cid} #{name}" if name else f"ch:{cid}"
+        return f"dm:{key}"
+
+    # ------------------------------------------------------------------
+    # Action menu (Enter on a message row)
+    # ------------------------------------------------------------------
+
+    def _open_action_menu(self, row: MessageRow) -> None:
+        is_mine = (row.from_call or "").upper() == self._ui._my_call
+
+        async def _run() -> None:
+            action = await self.push_screen_wait(
+                ActionMenu(allow_edit=is_mine, allow_resend=is_mine)
+            )
+            if action is None:
+                return
+            if action == "edit":
+                await self._begin_edit(row)
+            elif action == "resend":
+                await self._do_resend(row)
+            elif action == "react":
+                await self._do_react(row)
+
+        self.run_worker(_run(), exclusive=False)
+
+    async def _begin_edit(self, row: MessageRow) -> None:
+        self._pending_edit = {
+            "kind": row.kind,
+            "target_key": row.tkey,
+            "natural_key": row.natural_key,
+        }
+        try:
+            inp = self.query_one("#input", Input)
+            inp.value = row.body
+            inp.focus()
+            inp.cursor_position = len(row.body)
+            self._refresh_prompt()
+        except Exception:
+            pass
+
+    async def _do_resend(self, row: MessageRow) -> None:
+        c = self._ui._client
+        try:
+            if row.kind == "dm":
+                await c.resend_message(row.natural_key)
+            else:
+                cid = int(row.tkey)
+                ts = int(row.natural_key)
+                await c.resend_post(cid, ts)
+        except ValueError as exc:
+            self._status_error(f"[yellow][{exc}][/]")
+            return
+
+    async def _do_react(self, row: MessageRow) -> None:
+        emoji = await self.push_screen_wait(EmojiPrompt())
+        if not emoji:
+            return
+        c = self._ui._client
+        try:
+            if row.kind == "dm":
+                await c.react_message(row.natural_key, emoji)
+            else:
+                cid = int(row.tkey)
+                ts = int(row.natural_key)
+                await c.react_post(cid, ts, emoji)
+        except Exception as exc:
+            self._status_error(f"[red][error][/] {exc}")
+            return
+        # `react_message` / `react_post` write the reactor row to the
+        # local store before returning — pull the fresh list so our
+        # own reaction appears inline immediately, the same way it
+        # would for an inbound peer reaction.
+        row.reactions = self._lookup_reactions(row.kind, row.tkey, row.natural_key)
+        self._refresh_row_label(row)
+
+    # ------------------------------------------------------------------
+    # Input submission — slash commands, plain text, pending-question
+    # answers, in-progress edits.
+    # ------------------------------------------------------------------
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        inp = self.query_one("#input", Input)
+        inp.value = ""
+        if self._pending_edit is not None:
+            await self._consume_pending_edit(text)
+            return
+        if not text:
+            return
+        try:
+            if text.startswith("/"):
+                await self._handle_command(text)
+            elif self._ui._target is None:
+                self._status_error(
+                    "[yellow]hint:[/] no target — /dm CALL or /ch N|#NAME"
+                )
+            else:
+                kind, key = self._ui._target
+                c = self._ui._client
+                if kind == "dm":
+                    msg_id = await c.send_message(key, text)
+                    # Server only sends back an `mr` ack — never echoes the
+                    # `m` frame to the sender — so mount the row locally.
+                    try:
+                        ts_seconds = int(msg_id.split("-", 1)[0]) // 1000
+                    except (ValueError, AttributeError):
+                        ts_seconds = int(time.time())
+                    await self._handle_inbound_dm(
+                        {
+                            "_id": msg_id,
+                            "fc": self._ui._my_call,
+                            "tc": key.upper(),
+                            "m": text,
+                            "ts": ts_seconds,
+                        },
+                        batched=False,
+                    )
+                else:
+                    cid = int(key)
+                    name = self._channel_name(cid)
+                    if name and name.lower() == "announcements":
+                        self._write_to_active("[Users cannot post to #announcements]")
+                        return
+                    if not self._is_subscribed(cid):
+                        self._write_to_active(self._unsubscribed_send_hint(cid))
+                        return
+                    paused = c.paused_channels().get(cid)
+                    if paused:
+                        self._write_to_active(self._paused_hint(cid, paused))
+                        return
+                    ts = await c.post(cid, text)
+                    # Server only sends back a `cpr` ack — never echoes the
+                    # `cp` frame to the sender — so mount the row locally.
+                    await self._handle_inbound_post(
+                        {
+                            "cid": cid,
+                            "fc": self._ui._my_call,
+                            "ts": ts,
+                            "p": text,
+                        },
+                        batched=False,
+                    )
+        except Exception as exc:
+            self._status_error(f"[red][error][/] {exc}")
+
+    async def _consume_pending_edit(self, text: str) -> None:
+        edit = self._pending_edit
+        self._pending_edit = None
+        self._refresh_prompt()
+        if edit is None or not text:
+            return
+        c = self._ui._client
+        edts = int(time.time() * 1000)
+        try:
+            if edit["kind"] == "dm":
+                await c.edit_message(edit["natural_key"], text)
+                # Server only acks via `mr` — the `med` edit frame goes to
+                # the recipient, never echoed to us — so refresh the row
+                # locally and dim it until the `mr` ack arrives.
+                self._handle_dm_edit(
+                    {"_id": edit["natural_key"], "m": text, "edts": edts},
+                    clear_delivered=True,
+                )
+            else:
+                cid = int(edit["target_key"])
+                ts = int(edit["natural_key"])
+                await c.edit_post(cid, ts, text)
+                self._handle_post_edit(
+                    {"cid": cid, "ts": ts, "p": text, "edts": edts},
+                    clear_delivered=True,
+                )
+        except ValueError as exc:
+            self._status_error(f"[yellow][{exc}][/]")
+
+    # ------------------------------------------------------------------
+    # Slash-command dispatch — full LineUI parity
+    # ------------------------------------------------------------------
+
+    def _known_cids(self) -> set[int]:
+        cids = {c.cid for c in self._ui._channels}
+        try:
+            cids.update(
+                r["cid"] for r in self._ui._client._store.list_channels()  # type: ignore[attr-defined]
+            )
+        except Exception:
+            pass
+        return cids
+
+    def _resolve_channel(self, arg: str, *, allow_unknown_cid: bool = False) -> int | None:
+        if arg.startswith("#"):
+            wanted = arg[1:].lower()
+        else:
+            try:
+                cid = int(arg)
+            except ValueError:
+                wanted = arg.lower()
+            else:
+                if allow_unknown_cid or cid in self._known_cids():
+                    return cid
+                return None
+        for c in self._ui._channels:
+            if c.name and c.name.lower() == wanted:
+                return c.cid
+        return None
+
+    async def _handle_command(self, line: str) -> None:
+        parts = line.split()
+        cmd, args = parts[0], parts[1:]
+        c = self._ui._client
+        if cmd == "/quit":
+            await self.action_quit_app()
+        elif cmd == "/h" and len(args) <= 1:
+            self._handle_help(args)
+        elif cmd == "/sub" and 1 <= len(args) <= 2:
+            await self._handle_sub(args)
+        elif cmd == "/unsub" and len(args) == 1:
+            cid = self._resolve_channel(args[0], allow_unknown_cid=True)
+            if cid is None:
+                self._status_error(
+                    f"[yellow]/unsub: unknown channel {args[0]!r} (use cid or #name)[/]"
+                )
+                return
+            await c.unsubscribe(cid)
+        elif cmd == "/unpause" and 1 <= len(args) <= 2:
+            await self._handle_unpause(args)
+        elif cmd == "/editdm" and len(args) >= 2:
+            try:
+                lid = int(args[0])
+            except ValueError:
+                self._status_error(f"[yellow]/editdm: LID must be an integer (got {args[0]!r})[/]")
+                return
+            row = c._store.lookup_message_by_lid(lid)  # type: ignore[attr-defined]
+            if row is None:
+                self._status_error(f"[yellow]/editdm: no local message with lid {lid}[/]")
+                return
+            new_body = " ".join(args[1:])
+            edts = int(time.time() * 1000)
+            try:
+                await c.edit_message(row["id"], new_body)
+            except ValueError as exc:
+                self._status_error(f"[yellow][{exc}][/]")
+                return
+            self._handle_dm_edit(
+                {"_id": row["id"], "m": new_body, "edts": edts},
+                clear_delivered=True,
+            )
+        elif cmd == "/editpost" and len(args) >= 2:
+            try:
+                lid = int(args[0])
+            except ValueError:
+                self._status_error(f"[yellow]/editpost: LID must be an integer (got {args[0]!r})[/]")
+                return
+            row = c._store.lookup_post_by_lid(lid)  # type: ignore[attr-defined]
+            if row is None:
+                self._status_error(f"[yellow]/editpost: no local post with lid {lid}[/]")
+                return
+            new_body = " ".join(args[1:])
+            edts = int(time.time() * 1000)
+            try:
+                await c.edit_post(row["channel_id"], row["ts"], new_body)
+            except ValueError as exc:
+                self._status_error(f"[yellow][{exc}][/]")
+                return
+            self._handle_post_edit(
+                {
+                    "cid": int(row["channel_id"]),
+                    "ts": int(row["ts"]),
+                    "p": new_body,
+                    "edts": edts,
+                },
+                clear_delivered=True,
+            )
+        elif cmd == "/retrydm" and len(args) == 1:
+            try:
+                lid = int(args[0])
+            except ValueError:
+                self._status_error(f"[yellow]/retrydm: LID must be an integer (got {args[0]!r})[/]")
+                return
+            row = c._store.lookup_message_by_lid(lid)  # type: ignore[attr-defined]
+            if row is None:
+                self._status_error(f"[yellow]/retrydm: no local message with lid {lid}[/]")
+                return
+            try:
+                await c.resend_message(row["id"])
+            except ValueError as exc:
+                self._status_error(f"[yellow][{exc}][/]")
+                return
+            self._write_to_active(f"[green][retrydm][/] resent lid {lid}")
+        elif cmd == "/retrypost" and len(args) == 1:
+            try:
+                lid = int(args[0])
+            except ValueError:
+                self._status_error(f"[yellow]/retrypost: LID must be an integer (got {args[0]!r})[/]")
+                return
+            row = c._store.lookup_post_by_lid(lid)  # type: ignore[attr-defined]
+            if row is None:
+                self._status_error(f"[yellow]/retrypost: no local post with lid {lid}[/]")
+                return
+            try:
+                await c.resend_post(row["channel_id"], row["ts"])
+            except ValueError as exc:
+                self._status_error(f"[yellow][{exc}][/]")
+                return
+            self._write_to_active(f"[green][retrypost][/] resent lid {lid}")
+        elif cmd == "/react" and len(args) == 2:
+            target = self._ui._target
+            if target is None:
+                self._status_error(
+                    "[yellow]/react: no current target. /dm CALL or /ch N|#NAME first[/]"
+                )
+                return
+            try:
+                lid = int(args[0])
+            except ValueError:
+                self._status_error(f"[yellow]/react: ID must be an integer (got {args[0]!r})[/]")
+                return
+            kind, _ = target
+            if kind == "dm":
+                row = c._store.lookup_message_by_lid(lid)  # type: ignore[attr-defined]
+                if row is None:
+                    self._status_error(f"[yellow]/react: no local message with lid {lid}[/]")
+                    return
+                await c.react_message(row["id"], args[1])
+            else:
+                row = c._store.lookup_post_by_lid(lid)  # type: ignore[attr-defined]
+                if row is None:
+                    self._status_error(f"[yellow]/react: no local post with lid {lid}[/]")
+                    return
+                await c.react_post(row["channel_id"], row["ts"], args[1])
+        elif cmd == "/dm" and len(args) == 1:
+            call = args[0].upper()
+            target = ("dm", call)
+            self._ui._target = target
+            self._add_target(target)
+            await self._switch_centre_to(target)
+            self._refresh_prompt()
+            self._refresh_footer()
+        elif cmd == "/ch" and len(args) == 1:
+            cid = self._resolve_channel(args[0])
+            if cid is None:
+                self._status_error(f"[yellow]/ch: unknown channel {args[0]!r} (use cid or #name)[/]")
+                return
+            target = ("ch", str(cid))
+            if not self._is_subscribed(cid) \
+                    and not self._ui._client.paused_channels().get(cid):
+                self._open_subscribe_modal(cid, target=target)
+                return
+            self._ui._target = target
+            self._add_target(target)
+            await self._switch_centre_to(target)
+            self._refresh_prompt()
+            self._refresh_footer()
+            if self._ui._client.paused_channels().get(cid):
+                self._maybe_print_paused_hint(cid)
+        elif cmd == "/set":
+            # The TUI replaces the inline /set listing with a modal;
+            # any extra args are ignored — the modal is the editor.
+            self._open_settings_modal()
+        elif cmd == "/history":
+            self._handle_history_toggle(args, verbose=False)
+        elif cmd == "/vhistory":
+            self._handle_history_toggle(args, verbose=True)
+        else:
+            self._status_error(f"[yellow]unknown or malformed:[/] {line}")
+
+    def _handle_history_toggle(self, args: list[str], *, verbose: bool) -> None:
+        # The TUI centre pane already shows mounted MessageRows; older
+        # pages auto-load on cursor-up. So /history and /vhistory don't
+        # *replay* — they just set the verbose mode and re-render every
+        # mounted row in place. This matches Ctrl+D (which toggles).
+        # Any [N] arg is silently ignored — the line-UI semantics
+        # don't apply here.
+        del args
+        self._ui._options.verbose_history = verbose
+        self._refresh_all_rows()
+
+    def _handle_help(self, args: list[str]) -> None:
+        focus = args[0] if args else None
+        self.push_screen(HelpScreen(focus_command=focus))
+
+    def _open_settings_modal(self) -> None:
+        """Push the SettingsModal — the GUI replacement for ``/set``.
+        ``on_change`` carries the side-effects the inline ``/set``
+        handler used to do directly (live timer update, in-place row
+        re-render on verbose-mode flip)."""
+        def on_change(name: str, old: Any, new: Any) -> None:
+            if name == "delivery_timeout_s":
+                self._ui._client.set_delivery_timeout_s(new)
+            if name == "verbose_history":
+                self._refresh_all_rows()
+        self.push_screen(SettingsModal(options=self._ui._options, on_change=on_change))
+
+    async def _handle_sub(self, args: list[str]) -> None:
+        cid = self._resolve_channel(args[0], allow_unknown_cid=True)
+        if cid is None:
+            self._status_error(
+                f"[yellow]/sub: unknown channel {args[0]!r} (use cid or #name)[/]"
+            )
+            return
+        # Explicit count: skip the modal entirely, just subscribe and
+        # pull. The modal is for the interactive "how many?" prompt.
+        if len(args) == 2:
+            try:
+                explicit_n = int(args[1])
+            except ValueError:
+                self._status_error(
+                    f"[yellow]/sub: post count must be an integer, got {args[1]!r}[/]"
+                )
+                return
+            if explicit_n < 0:
+                self._status_error("[yellow]/sub: post count must be non-negative[/]")
+                return
+            try:
+                pc = await self._ui._client.subscribe_and_wait(cid)
+            except asyncio.TimeoutError:
+                self._status_error(
+                    f"[yellow]/sub: timed out waiting for ack for "
+                    f"{self._channel_ref(cid)}[/]"
+                )
+                return
+            if pc > 0 and explicit_n > 0:
+                await self._ui._client.request_post_batch(cid, min(explicit_n, pc))
+            return
+        # No explicit count → reuse the SubscribeModal with skip_confirm
+        # (the user already opted in by typing /sub).
+        target: TargetKey = ("ch", str(cid))
+        self._open_subscribe_modal(cid, target=target, skip_confirm=True)
+
+    async def _handle_unpause(self, args: list[str]) -> None:
+        cid = self._resolve_channel(args[0])
+        if cid is None:
+            self._status_error(
+                f"[yellow]/unpause: unknown channel {args[0]!r} (use cid or #name)[/]"
+            )
+            return
+        if len(args) == 2:
+            try:
+                n = int(args[1])
+            except ValueError:
+                self._status_error(
+                    f"[yellow]/unpause: post count must be an integer, got {args[1]!r}[/]"
+                )
+                return
+            if n <= 0:
+                self._status_error("[yellow]/unpause: post count must be positive[/]")
+                return
+        else:
+            n = self._ui._client.paused_channels().get(cid, 0)
+            if n <= 0:
+                self._status_error(
+                    f"[yellow]/unpause cid={cid}: no pending count from pch "
+                    f"headers; pass /unpause {cid} N[/]"
+                )
+                return
+        await self._ui._client.unpause_channel(cid, post_count=n)
+        self._write_to_active(
+            f"[green][unpause][/] requested {n} post(s) for "
+            f"{self._channel_ref(cid)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Misc utilities
+    # ------------------------------------------------------------------
+
+    def _batch_mutate(self):
+        """Context manager that suppresses ListView.Highlighted handling
+        during programmatic mutation (mounting/prepending rows)."""
+        app = self
+
+        class _Ctx:
+            def __enter__(self_inner):
+                app._suppress_highlight = True
+            def __exit__(self_inner, exc_type, exc, tb):
+                app._suppress_highlight = False
+                return False
+
+        return _Ctx()

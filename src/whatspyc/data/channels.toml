@@ -1,0 +1,80 @@
+# whatspyc channel directory.
+#
+# The WPS application protocol has no "list available channels" RPC — the
+# server only sends per-channel data for channels you're already
+# subscribed to. The web client hardcodes its directory in the JS bundle
+# (`reference/web-client/index.js`, the `eh = [...]` array). whatspyc
+# mirrors that idea here: the channel list is just a config file you can
+# edit, with the same starting set as the production web client at the
+# time this file was generated.
+#
+# `whatspyc` writes this file to ~/.config/whatspyc/channels.toml on
+# first run if it isn't there yet, then never touches it again — so any
+# edits you make are preserved across upgrades. Add, remove, or rename
+# entries freely. Each entry needs a `cid` (integer); `name` and
+# `description` are optional but make `/list` easier to read.
+
+[[channels]]
+cid = 0
+name = "packet-network"
+description = "All things packet network related - links, routing, NETROM, QUALITY, INP3 etc."
+
+[[channels]]
+cid = 1
+name = "packet-general"
+description = "Anything Packet Radio goes here!"
+
+[[channels]]
+cid = 2
+name = "ham-radio-general"
+description = "Anything Ham Radio"
+
+[[channels]]
+cid = 3
+name = "ask-devs"
+description = "Found a bug or got a feature request? Ask here!"
+
+[[channels]]
+cid = 4
+name = "bath-and-district-arc"
+description = "Bath and District ARC Club Chat"
+
+[[channels]]
+cid = 5
+name = "lounge"
+description = "Anything and everything in here!"
+
+[[channels]]
+cid = 6
+name = "test-channel-ignore"
+description = "Used for anything that needs testing - generally best ignored!"
+
+[[channels]]
+cid = 7
+name = "new-packet-radio"
+description = "Everything related to New Packet Radio"
+
+[[channels]]
+cid = 9
+name = "bracknell-arc"
+description = "Bracknell Amateur Radio Club Chat"
+
+[[channels]]
+cid = 10
+name = "small-victories"
+description = "Achieved something good? Whether radio related or not, share it here!"
+
+[[channels]]
+cid = 11
+name = "wps-development"
+description = "Channel for everything related to the development of the WPS, the backend service powering WhatsPac. See https://github.com/k-ahn2/wps"
+
+[[channels]]
+cid = 12
+name = "network-monitoring"
+description = "Channel for everything related to the new packet network monitoring capability"
+
+[[channels]]
+cid = 100
+name = "announcements"
+description = "General news and announcements relevant to the community"

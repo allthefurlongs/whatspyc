@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whatspyc"
+version = "0.0.1"
+description = "Command-line client for the WhatsPac packet-radio chat service"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "matt" }]
+dependencies = [
+    "click>=8.1",
+    "websockets>=12.0",
+    "pyserial-asyncio>=0.6",
+    "prompt_toolkit>=3.0.43",
+    "textual>=0.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+whatspyc = "whatspyc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+whatspyc = ["store/schema.sql", "data/channels.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
