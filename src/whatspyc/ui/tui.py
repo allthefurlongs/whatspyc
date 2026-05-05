@@ -828,6 +828,66 @@ class UnsubscribeModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class QuitConfirmModal(ModalScreen[bool]):
+    """Y/N confirm before quitting the app.
+
+    Dismisses with ``True`` to proceed with quit, ``False`` on N / Esc.
+    Defaults the selection to ``No`` so an accidental Enter cancels.
+    """
+
+    BINDINGS = [
+        Binding("y", "yes", "Yes"),
+        Binding("n", "no", "No"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    QuitConfirmModal {
+        align: center middle;
+    }
+    #quit-pane {
+        width: 50;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quit-pane"):
+            yield Static(
+                "[bold]Are you sure you want to quit?[/]",
+                id="quit-question",
+            )
+            yield ListView(
+                ListItem(Static("No"), id="quit-no"),
+                ListItem(Static("Yes"), id="quit-yes"),
+                id="quit-list",
+            )
+            yield Static(
+                "[dim]Y to quit, N or Esc to cancel[/]",
+                id="quit-hint",
+            )
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#quit-list", ListView)
+        lv.index = 0
+        lv.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        event.stop()
+        self.dismiss(event.item.id == "quit-yes")
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class BoolSelectModal(ModalScreen[bool | None]):
     """On/Off picker for boolean settings.
 
@@ -1204,6 +1264,10 @@ class _WhatspycApp(App):
         # When set, the next plain-text submit is interpreted as the new
         # body for an in-progress edit instead of a fresh send.
         self._pending_edit: dict | None = None
+
+        # Re-entrancy guard for the quit-confirm modal so a second Ctrl+Q
+        # while the prompt is already up is a no-op.
+        self._quit_confirm_open = False
 
         # Suppress ListView.Highlighted handling during programmatic
         # mutation of a list (mounting rows, prepending older history).
@@ -1917,11 +1981,24 @@ class _WhatspycApp(App):
     # Quit / link teardown
     # ------------------------------------------------------------------
 
-    async def action_quit_app(self) -> None:
-        try:
-            await self._ui._client.close()
-        finally:
-            self.exit()
+    def action_quit_app(self) -> None:
+        if self._quit_confirm_open:
+            return
+        self._quit_confirm_open = True
+
+        async def _run() -> None:
+            try:
+                confirmed = await self.push_screen_wait(QuitConfirmModal())
+            finally:
+                self._quit_confirm_open = False
+            if not confirmed:
+                return
+            try:
+                await self._ui._client.close()
+            finally:
+                self.exit()
+
+        self.run_worker(_run(), exclusive=False)
 
     def _signal_terminal_link_loss(self) -> None:
         if self._ui.exit_reason is not None:
@@ -2778,7 +2855,7 @@ class _WhatspycApp(App):
         cmd, args = parts[0], parts[1:]
         c = self._ui._client
         if cmd == "/quit":
-            await self.action_quit_app()
+            self.action_quit_app()
         elif cmd == "/h" and len(args) <= 1:
             self._handle_help(args)
         elif cmd == "/sub" and 1 <= len(args) <= 2:
