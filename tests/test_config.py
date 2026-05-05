@@ -186,7 +186,111 @@ def test_engine_xrouter_defaults_applied() -> None:
     p = cfg_mod.parse(raw).resolve_profile("x")
     assert p.radio_port == 1
     assert p.port == 8086
-    assert p.remote == "WPS"  # dataclass default, untouched
+    # No connect_sequence → no first-hop-cmd to consume; `remote` stays
+    # at the dataclass default. (A direct AX.25 SABM to a station literally
+    # called "WPS" is unusual but the user can override `remote` if they
+    # have a different real target.)
+    assert p.remote == "WPS"
+
+
+def test_engine_xrouter_first_hop_cmd_becomes_remote() -> None:
+    """Web-client convention: for XRouter the first hop's `cmd` is the
+    OPEN's `remote` (the AX.25 destination callsign on the radio port).
+    The first hop is consumed by the OPEN's SABM and replaced with a
+    wait-only step that just waits for its `val` (the node banner)."""
+    raw = tomllib.loads(
+        """
+        [[connect_profiles]]
+        name = "xr"
+        transport = "rhp-ws"
+        host = "h"
+        engine = "xrouter"
+        radio_port = 3
+        connect_sequence = [
+          { cmd = "GB7BSK-9", val = "Connected" },
+          { cmd = "WPS", val = "*** Connected" },
+        ]
+        """
+    )
+    p = cfg_mod.parse(raw).resolve_profile("xr")
+    assert p.remote == "GB7BSK-9"
+    assert len(p.connect_script) == 2
+    # First hop is now wait-only — its cmd was consumed by the OPEN.
+    assert p.connect_script[0].cmd == ""
+    assert p.connect_script[0].val == "Connected"
+    # Second hop is unchanged: typed at the remote node's prompt.
+    assert p.connect_script[1].cmd == "WPS"
+    assert p.connect_script[1].val == "*** Connected"
+
+
+def test_engine_xrouter_rejects_switch_command_at_hop_zero() -> None:
+    """First hop must be a bare callsign for XRouter — `C GB7BSK-9` is
+    a switch-prompt command, which makes no sense at the OPEN level
+    because XRouter does the SABM itself. Reject with a clear error
+    rather than silently passing `remote: "C GB7BSK-9"` to XRouter and
+    timing out with `flags: 0`."""
+    raw = tomllib.loads(
+        """
+        [[connect_profiles]]
+        name = "xr-bad"
+        transport = "rhp-ws"
+        host = "h"
+        engine = "xrouter"
+        connect_sequence = [
+          { cmd = "C GB7BSK-9", val = "Connected" },
+          { cmd = "WPS", val = "*** Connected" },
+        ]
+        """
+    )
+    with pytest.raises(ValueError, match="destination AX.25 callsign"):
+        cfg_mod.parse(raw)
+
+
+def test_engine_xrouter_user_remote_preserves_script() -> None:
+    """If the user pins `remote` explicitly, leave the connect_sequence
+    alone — they're driving the chain themselves (advanced mode)."""
+    raw = tomllib.loads(
+        """
+        [[connect_profiles]]
+        name = "xr-custom"
+        transport = "rhp-ws"
+        host = "h"
+        engine = "xrouter"
+        remote = "GB7XYZ-1"
+        connect_sequence = [
+          { cmd = "C GB7BSK-9", val = "Connected" },
+          { cmd = "WPS", val = "*** Connected" },
+        ]
+        """
+    )
+    p = cfg_mod.parse(raw).resolve_profile("xr-custom")
+    assert p.remote == "GB7XYZ-1"
+    assert len(p.connect_script) == 2
+    assert p.connect_script[0].cmd == "C GB7BSK-9"
+    assert p.connect_script[1].cmd == "WPS"
+
+
+def test_engine_xrouter_wait_only_first_hop_left_alone() -> None:
+    """If the user already wrote a wait-only first hop (cmd=""), don't
+    touch `remote` — they've taken responsibility for the OPEN target
+    or are using the dataclass default deliberately."""
+    raw = tomllib.loads(
+        """
+        [[connect_profiles]]
+        name = "xr-wait"
+        transport = "rhp-ws"
+        host = "h"
+        engine = "xrouter"
+        connect_sequence = [
+          { cmd = "", val = "node-banner" },
+          { cmd = "WPS", val = "*** Connected" },
+        ]
+        """
+    )
+    p = cfg_mod.parse(raw).resolve_profile("xr-wait")
+    assert p.remote == "WPS"  # untouched
+    assert p.connect_script[0].cmd == ""
+    assert p.connect_script[0].val == "node-banner"
 
 
 def test_engine_bpq_defaults_applied_and_banner_preamble_prepended() -> None:

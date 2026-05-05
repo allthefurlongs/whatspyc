@@ -483,6 +483,20 @@ def resolve_engine_defaults(p: ConnectProfile, user_supplied: set[str]) -> None:
     if engine == "xrouter":
         if "radio_port" not in user_supplied:
             p.radio_port = 1
+        # Web-client convention (`reference/web-client/index.js` line 611:
+        # `pe.remote = ce[0].cmd`): on XRouter the OPEN's `remote` is the
+        # AX.25 destination callsign on the radio port — there's no local
+        # "switch interpreter" remote (BPQ has SWITCH; XRouter doesn't).
+        # The first hop is *consumed* by the SABM, not sent over the
+        # link; subsequent hops are commands typed at the resulting node
+        # prompt. So if the user didn't pin `remote` themselves, take the
+        # first hop's `cmd` as the OPEN remote and replace that step
+        # with a wait-only step that just waits for its `val` (the
+        # node's "Connected" banner). With the default `remote = "WPS"`,
+        # XRouter would otherwise try to AX.25-SABM a station literally
+        # called "WPS" on the radio port and time out with `flags: 0`.
+        if "remote" not in user_supplied and p.connect_script:
+            p.connect_script = _normalize_xrouter_first_hop(p.name, p.connect_script, p)
     elif engine == "bpq":
         if "remote" not in user_supplied:
             p.remote = "SWITCH"
@@ -498,6 +512,38 @@ def resolve_engine_defaults(p: ConnectProfile, user_supplied: set[str]) -> None:
         port = default_port(engine, transport)
         if port is not None:
             p.port = port
+
+
+def _normalize_xrouter_first_hop(
+    profile_name: str, script: list[HopStep], p: ConnectProfile
+) -> list[HopStep]:
+    """Take the first hop's ``cmd`` as the OPEN's ``remote`` and replace
+    that step with a wait-only ``HopStep(cmd="", val=first.val)``.
+
+    Mirrors the production web client (`pe.remote = ce[0].cmd` for L2
+    sockets). The first hop's ``cmd`` must be a bare AX.25 callsign —
+    XRouter's RHP OPEN does the SABM itself, so node-prompt syntax
+    (``C GB7BSK-9``, ``C 1 GB7XYZ``, etc.) must NOT appear at hop 0.
+    Such commands belong at hop 1+ (sent over the link to the remote
+    node's prompt). We reject hop-0 cmds containing whitespace with a
+    clear hint rather than letting XRouter fail with `flags: 0` after a
+    long SABM timeout.
+    """
+    first = script[0]
+    if first.cmd == "":
+        return script  # already wait-only — caller didn't intend a callsign-from-cmd
+    if any(ch.isspace() for ch in first.cmd):
+        raise ValueError(
+            f"profile {profile_name!r}: first connect_sequence hop's `cmd` "
+            f"must be the destination AX.25 callsign for XRouter "
+            f"(e.g. 'GB7BSK-9'), not a switch command — got "
+            f"{first.cmd!r}. XRouter's RHP AX.25 OPEN does the SABM "
+            f"itself, so the first hop is consumed by the OPEN; "
+            f"node-prompt commands like 'C GB7BSK-9' belong on later "
+            f"hops, sent over the link to the remote node."
+        )
+    p.remote = first.cmd
+    return [HopStep(cmd="", val=first.val, timeout=first.timeout)] + script[1:]
 
 
 def _normalize_bpq_preamble(script: list[HopStep]) -> list[HopStep]:

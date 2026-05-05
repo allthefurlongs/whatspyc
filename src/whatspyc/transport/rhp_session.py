@@ -65,7 +65,6 @@ class RhpSession:
         self._id_iter = itertools.count(1)
         self._inbox: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._reader_task: asyncio.Task | None = None
-        self._connected = asyncio.Event()
         self._open_reply: asyncio.Future | None = None
 
     async def open(self) -> None:
@@ -107,11 +106,11 @@ class RhpSession:
         if err != 0:
             raise RuntimeError(f"RHP open failed: {reply}")
         self._handle = reply["handle"]
-        # Wait for STATUS connected. No timeout — packet networks can be
-        # very slow, and the web client doesn't bound this either. The
-        # application-level silence guard in WpsClient will eventually
-        # tear the link down if it's truly stuck.
-        await self._connected.wait()
+        # Don't wait for a STATUS connected — the web client doesn't, and
+        # XRouter doesn't reliably emit one for ax25/stream sessions to a
+        # local service like WPS (an `openReply` with `errcode=0` is the
+        # readiness signal). Inbound STATUS frames, when they do arrive,
+        # are still observed by the reader loop for diagnostics.
 
     async def send(self, data: bytes) -> None:
         if self._handle is None or self._closed:
@@ -173,9 +172,12 @@ class RhpSession:
                     if self._open_reply is not None and not self._open_reply.done():
                         self._open_reply.set_result(msg)
                 elif t == "status":
-                    flags = msg.get("flags", 0)
-                    if flags & 2:
-                        self._connected.set()
+                    # Observed for diagnostics only — the web client
+                    # routes STATUS frames on the WPS handle to the
+                    # inbox and proceeds without gating readiness on
+                    # them. flags & 2 means CONNECTED, flags & 4 means
+                    # BUSY (not implemented here).
+                    logger.debug("RHP status: %s", msg)
                 elif t == "sendReply":
                     err = msg.get("errcode", msg.get("errCode", 0))
                     if err != 0:

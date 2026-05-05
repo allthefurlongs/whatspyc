@@ -181,3 +181,32 @@ async def test_open_failure_raises() -> None:
     asyncio.create_task(fake_server())
     with pytest.raises(RuntimeError, match="Invalid remote"):
         await session.open()
+
+
+@pytest.mark.asyncio
+async def test_open_returns_without_status_connected() -> None:
+    """`openReply` with `errcode=0` is the readiness signal — match the
+    web client and don't block on a follow-up STATUS connected. XRouter's
+    ax25/stream socket to a local service (WPS) reliably delivers the
+    `openReply` but doesn't always emit a STATUS afterwards; waiting
+    for one hangs the connect indefinitely."""
+    out_q: asyncio.Queue = asyncio.Queue()
+    in_q: asyncio.Queue = asyncio.Queue()
+
+    async def send_message(obj):
+        await out_q.put(obj)
+
+    async def recv_message():
+        return await in_q.get()
+
+    cfg = RhpConfig(pfam="ax25", port=1, local="M0ABC", remote="WPS")
+    session = RhpSession(cfg, send_message, recv_message)
+
+    async def fake_server() -> None:
+        opened = await out_q.get()
+        await in_q.put({"type": "openReply", "id": opened["id"], "handle": 4, "errcode": 0})
+        # Deliberately no `status` frame.
+
+    asyncio.create_task(fake_server())
+    await asyncio.wait_for(session.open(), timeout=1.0)
+    await session.close()
