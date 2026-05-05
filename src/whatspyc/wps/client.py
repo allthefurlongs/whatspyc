@@ -208,6 +208,13 @@ class WpsClient:
         # Pending timeout timers would otherwise outlive the client and
         # try to emit on a torn-down on_event; drop them up front.
         self._cancel_all_delivery_timers()
+        # Pending subscribe waiters would block their callers forever
+        # if quit fires mid-`subscribe_and_wait`; cancel them so the
+        # caller's `await` raises CancelledError cleanly.
+        for fut in self._cs_ack_waiters.values():
+            if not fut.done():
+                fut.cancel()
+        self._cs_ack_waiters.clear()
         for task in (self._keepalive_task, self._reader_task, self._reconnect_task):
             if task is not None:
                 task.cancel()

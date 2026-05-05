@@ -608,6 +608,37 @@ async def test_subscribe_and_wait_times_out_without_ack(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_cancels_pending_subscribe_waiters(tmp_path: Path) -> None:
+    """A Ctrl+Q during a hung `subscribe_and_wait` must let the caller's
+    await unblock — close() cancels every pending cs waiter so the
+    `await asyncio.wait_for(fut, ...)` raises CancelledError instead of
+    sitting on an orphaned future."""
+    store = SqliteStore(tmp_path / "state.sqlite3")
+    stream = _FakeStream()
+    client = WpsClient(
+        lambda: stream,
+        store,
+        my_call="M0ABC",
+        name="Tester",
+        keepalive_interval=None,
+        auto_reconnect=False,
+    )
+    await client.open()
+
+    sub_task = asyncio.create_task(client.subscribe_and_wait(3))
+    # Let the task install its waiter before we tear the client down.
+    await asyncio.sleep(0.01)
+    assert 3 in client._cs_ack_waiters
+
+    await client.close()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sub_task
+    assert client._cs_ack_waiters == {}
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_auto_backfill_no_longer_fires_on_subscribe_ack(tmp_path: Path) -> None:
     """The /sub UI flow is now responsible for the cs→cpb hop. The
     client-side auto-fire on cs has been removed; auto_backfill_post_count
