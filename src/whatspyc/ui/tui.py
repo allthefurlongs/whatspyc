@@ -52,6 +52,7 @@ from textual.widgets._footer import FooterKey
 from whatspyc import __version__
 from whatspyc import log as log_mod
 from whatspyc.config import ChannelInfo
+from whatspyc.ui import emoji_for_display
 from whatspyc.ui import help as help_data
 from whatspyc.ui import ts_to_ms
 from whatspyc.ui.options import SessionOptions
@@ -201,6 +202,9 @@ def _render_reactions(reactions: list[dict]) -> str:
         c = (r.get("callsign") or "").upper()
         if not e:
             continue
+        # Wire form is a hex codepoint string (`"1f622"`); render as
+        # the literal character so the user sees 😢 instead of `1f622`.
+        e = emoji_for_display(e)
         if c:
             parts.append(rf"[cyan]\[{c} {e}][/]")
         else:
@@ -2319,6 +2323,14 @@ class _WhatspycApp(App):
                 )
         elif t == "o":
             self._refresh_online_pane(self._ui._client.online_users())
+        elif t == "he":
+            self._refresh_online_pane(self._ui._client.online_users())
+            seen: set[TargetKey] = set()
+            for tkey in list(self._unread.keys()) + list(self._views.keys()):
+                if tkey[0] == "dm" and tkey not in seen:
+                    seen.add(tkey)
+                    self._refresh_target_label(tkey)
+            self._refresh_thread_header()
         # Channel state / paused
         elif t == "cs":
             await self._handle_cs(obj)

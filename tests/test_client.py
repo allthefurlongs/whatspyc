@@ -1915,6 +1915,27 @@ async def test_react_message_remove_clears_local_row(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_react_message_normalises_literal_to_hex_codepoint(tmp_path: Path) -> None:
+    """Literal-character pickers (the TUI emoji grid, OS emoji
+    keyboards) feed `react_message` a single Unicode char. The wire
+    form per MESSAGES.md is the hex codepoint string, and that's what
+    the web client and other peers expect — so the client must
+    normalise before sending and storing."""
+    client, store, stream = await _make_connected_client(tmp_path)
+    store.upsert_message(
+        {"_id": "100-M0FOO", "fc": "M0FOO", "tc": "M0ABC", "m": "hi", "ts": 100}
+    )
+    await client.react_message("100-M0FOO", "👍")
+    sent = [s for s in stream.sent if b'"t":"mem"' in s]
+    assert len(sent) == 1
+    assert b'"e":"1f44d"' in sent[0]
+    rows = store.list_message_emojis("100-M0FOO")
+    assert [r["emoji"] for r in rows] == ["1f44d"]
+    await client.close()
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_inbound_mem_attributes_peer_and_keeps_ours(tmp_path: Path) -> None:
     """Real-time `mem` carries the *full* current emoji list. New
     emojis we don't have a row for are attributed to the DM peer;

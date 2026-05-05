@@ -55,6 +55,7 @@ from typing import Awaitable, Callable
 
 from whatspyc.store.store import SqliteStore
 from whatspyc.transport.base import AsyncByteStream
+from whatspyc.ui import emoji_to_wire
 from whatspyc.wps import codec
 from whatspyc.wps.hop_script import HopStep, ProgressFn, run_connect_script
 
@@ -571,6 +572,12 @@ class WpsClient:
         self._schedule_post_edit_timeout(int(ts), edts)
 
     async def react_message(self, msg_id: str, emoji: str, *, add: bool = True) -> None:
+        # Normalise to the protocol's hex-codepoint form (e.g. literal
+        # `👍` from the picker grid → `"1f44d"`). The wire and the
+        # local store both hold the hex form, matching what inbound
+        # `mem` / `memb` carry — so a peer's reaction we just received
+        # and our own freshly-sent reaction render identically.
+        emoji = emoji_to_wire(emoji)
         ets = int(time.time())
         await self._send(
             {"t": "mem", "a": 1 if add else 0, "_id": msg_id, "e": emoji, "ets": ets}
@@ -586,6 +593,7 @@ class WpsClient:
             self._store.bump_meta("last_emoji", ets)
 
     async def react_post(self, channel_id: int, ts: int, emoji: str, *, add: bool = True) -> None:
+        emoji = emoji_to_wire(emoji)
         ets = int(time.time())
         await self._send(
             {
