@@ -307,6 +307,8 @@ def list_lines(hide: set[str] | None = None) -> list[str]:
     out = ["Slash commands (use /h <command> for details):"]
     for c in visible:
         out.append(f"  {c.usage:<{width}}   {c.summary}")
+    out.append("")
+    out.append("Source code: https://github.com/allthefurlongs/whatspyc")
     return out
 
 
