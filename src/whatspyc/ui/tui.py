@@ -423,6 +423,7 @@ _KEYBINDING_HELP_LINES = [
     "  Ctrl+S             Toggle the status pane (acks / edits log)",
     "  Ctrl+U             Unsubscribe highlighted channel (with confirm)",
     "  Ctrl+O             Open the Options (session settings) modal",
+    "  Ctrl+E             Insert an emoji at the cursor in the input box",
     "  Ctrl+C / Ctrl+Q    Quit",
 ]
 
@@ -1166,6 +1167,9 @@ class _WhatspycApp(App):
         Binding("ctrl+u", "unsub_channel", "Unsub", priority=True),
         # priority=True so the focused Input doesn't swallow Ctrl+O.
         Binding("ctrl+o", "options", "Options", priority=True),
+        # priority=True so the focused Input doesn't claim Ctrl+E for
+        # its built-in "cursor to end of line" action.
+        Binding("ctrl+e", "insert_emoji", "Emoji", priority=True),
         Binding("escape", "focus_input", "Focus input", show=False),
         Binding("tab", "focus_next_pane", "Next pane", show=False),
         Binding("shift+tab", "focus_prev_pane", "Prev pane", show=False),
@@ -1819,6 +1823,30 @@ class _WhatspycApp(App):
 
     def action_options(self) -> None:
         self._open_settings_modal()
+
+    def action_insert_emoji(self) -> None:
+        async def _run() -> None:
+            picked = await self.push_screen_wait(EmojiPrompt())
+            if not picked:
+                return
+            # Hex codepoint fallback (for terminals that can't render
+            # the picker grid) — convert `1f44d` → 👍 before inserting
+            # so the body carries a literal emoji, not the hex digits.
+            if re.fullmatch(r"[0-9a-fA-F]{4,6}", picked):
+                try:
+                    picked = chr(int(picked, 16))
+                except (ValueError, OverflowError):
+                    pass
+            try:
+                inp = self.query_one("#input", Input)
+            except Exception:
+                return
+            pos = inp.cursor_position
+            inp.value = inp.value[:pos] + picked + inp.value[pos:]
+            inp.cursor_position = pos + len(picked)
+            inp.focus()
+
+        self.run_worker(_run(), exclusive=False)
 
     # ------------------------------------------------------------------
     # Focus management

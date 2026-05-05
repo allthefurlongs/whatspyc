@@ -401,6 +401,7 @@ Layout:
 | `Ctrl+H` | Modal help screen — key bindings + slash commands |
 | `Ctrl+D` | Toggle detailed (verbose) render — live re-renders every mounted row. Note: `Ctrl+V` is reserved by most terminals for paste, so this is `Ctrl+D`. |
 | `Ctrl+S` | Toggle the status pane — chronological log of acks, edits, and link events |
+| `Ctrl+E` | Emoji picker — opens the same grid used for reactions and inserts the chosen emoji at the cursor in the input box |
 | `Ctrl+C` / `Ctrl+Q` | Quit |
 
 Behaviour:
