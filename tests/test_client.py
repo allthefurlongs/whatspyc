@@ -2059,3 +2059,58 @@ async def test_inbound_cpemb_replaces_full_state(tmp_path: Path) -> None:
     }
     await client.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_cpb_persists_embedded_reactions(tmp_path: Path) -> None:
+    """Mid-session `/sub` flow (cs → cpb) doesn't trigger a follow-up
+    `cpemb` from the server — historic reactions ride inline on each
+    post as `e: [{e, c[]}, ...]` plus an `ets` cursor (see
+    `dbGetPostsBatch` in `wps/db.py` — only `dts`/`t`/`cid` are
+    stripped). Without applying that embedded state, reactions on
+    historic posts stay invisible until the next reconnect, when the
+    connect handler's `cpemb` finally delivers them."""
+    client, store, stream = await _make_connected_client(tmp_path)
+    store.set_subscription(7, True)
+    stream.push(codec.encode({
+        "t": "cpb",
+        "cid": 7,
+        "p": [
+            {
+                "ts": 1_700_000_001_000,
+                "fc": "M0FOO",
+                "p": "first",
+                "ets": 1_700_000_500_000,
+                "e": [
+                    {"e": "1f44d", "c": ["M1ABC", "M2DEF"]},
+                    {"e": "2764", "c": ["M3GHI"]},
+                ],
+            },
+            {
+                # Post with no reactions: no `e`/`ets` — handler must
+                # leave its (empty) emoji table untouched.
+                "ts": 1_700_000_002_000,
+                "fc": "M0FOO",
+                "p": "second",
+            },
+        ],
+    }))
+    ok = await _wait_for(
+        lambda: bool(store.list_post_emojis(7, 1_700_000_001_000))
+        and store.lookup_post(7, 1_700_000_002_000) is not None
+    )
+    assert ok
+    rows = store.list_post_emojis(7, 1_700_000_001_000)
+    assert {(r["emoji"], r["callsign"]) for r in rows} == {
+        ("1f44d", "M1ABC"),
+        ("1f44d", "M2DEF"),
+        ("2764", "M3GHI"),
+    }
+    assert store.list_post_emojis(7, 1_700_000_002_000) == []
+    # `last_emoji` cursor advanced so the next reconnect's connect
+    # record won't ask for these again via `cpemb`.
+    record = store.connect_record(name="T", callsign="M0ABC", version=0.1)
+    cc = {entry["cid"]: entry for entry in record.get("cc", [])}
+    assert cc[7]["le"] == 1_700_000_500_000
+    await client.close()
+    store.close()

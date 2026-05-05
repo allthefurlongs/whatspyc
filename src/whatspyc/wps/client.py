@@ -1174,6 +1174,22 @@ class WpsClient:
                     self._store.upsert_post(
                         cid, p, delivered_ts=_self_delivered_ts(p)
                     )
+                # `cpb` posts carry their current per-post reaction
+                # state inline as `e: [{e, c[]}, ...]` with an `ets`
+                # cursor — same shape as a `cpemb` group entry. The
+                # connect handler emits a separate `cpemb` for posts
+                # in already-subscribed channels (`wps/wps.py`'s
+                # `channels_connect_handler`), but a mid-session `cs`
+                # + `cpb` flow does not — so without applying the
+                # embedded state here, reactions on historic posts
+                # only appear after the next reconnect.
+                ts = p.get("ts")
+                ets = p.get("ets")
+                e = p.get("e")
+                if isinstance(ts, int) and isinstance(ets, int):
+                    self._store.apply_post_emoji_batch(
+                        int(cid), int(ts), e if isinstance(e, list) else [], int(ets)
+                    )
 
         async def _on_mem(o: dict) -> None:
             """Real-time DM emoji update. Wire form is the *full* current
