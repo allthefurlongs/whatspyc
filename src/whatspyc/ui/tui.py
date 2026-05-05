@@ -1678,6 +1678,11 @@ class _WhatspycApp(App):
         with self._batch_mutate():
             for r in rows:
                 self._mount_row(target, lv, r, append=True)
+        # The newest row should be visible on first activation. Layout
+        # hasn't measured yet during the loop (max_scroll_y is still 0),
+        # so schedule the scroll for after the next refresh.
+        if rows:
+            self.call_after_refresh(lv.scroll_end, animate=False)
 
     async def _reset_message_view(self, target: TargetKey) -> None:
         """Drop every mounted item for ``target`` and re-seed from the
@@ -1817,7 +1822,12 @@ class _WhatspycApp(App):
         if existing is not None:
             return existing
         if append:
+            # Capture stickiness BEFORE the append so a fresh row doesn't
+            # itself push us off the bottom and break the check.
+            was_at_bottom = lv.is_vertical_scroll_end
             lv.append(new_row)
+            if was_at_bottom:
+                self.call_after_refresh(lv.scroll_end, animate=False)
         else:
             lv.mount(new_row, before=0)
         self._rows[(kind, key, new_row.natural_key)] = new_row
@@ -2264,7 +2274,10 @@ class _WhatspycApp(App):
             lv = self.query_one(f"#{active}", ListView)
         except Exception:
             return
+        was_at_bottom = lv.is_vertical_scroll_end
         lv.append(ListItem(Static(line, markup=True)))
+        if was_at_bottom:
+            self.call_after_refresh(lv.scroll_end, animate=False)
 
     # ------------------------------------------------------------------
     # Event rendering — called from the client's reader task
