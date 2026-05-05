@@ -50,6 +50,7 @@ from textual.widgets import (
 from textual.widgets._footer import FooterKey
 
 from whatspyc import __version__
+from whatspyc import log as log_mod
 from whatspyc.config import ChannelInfo
 from whatspyc.ui import help as help_data
 from whatspyc.ui import ts_to_ms
@@ -1175,6 +1176,10 @@ class _WhatspycApp(App):
         self._ui = ui
         self.is_mounted = False
 
+        # Set on mount when the configured log_console mode is "pane".
+        # Removed on unmount so reconnect cycles don't accumulate handlers.
+        self._log_handler: Any = None
+
         # Lazy per-target message ListView ids.
         self._views: dict[TargetKey, str] = {}
         self._next_view_idx = 0
@@ -1246,12 +1251,21 @@ class _WhatspycApp(App):
         self._populate_initial_target_lists()
         self._refresh_online_pane(self._ui._client.online_users())
         self._refresh_thread_header()
+        # Hook the root logger if log_console resolved to "pane" — otherwise
+        # this is a no-op and returns None.
+        self._log_handler = log_mod.install_pane_handler(
+            self._status_write, self._status_error
+        )
         # Drain worker — processes inbound events in order, async-safe.
         self.run_worker(self._drain_events(), exclusive=True, name="event-drain")
         for obj in self._ui._pending:
             self.render_event(obj)
         self._ui._pending.clear()
         self.query_one("#input", Input).focus()
+
+    def on_unmount(self) -> None:
+        log_mod.remove_pane_handler(self._log_handler)
+        self._log_handler = None
 
     def render_event(self, obj: dict) -> None:
         # Called from the WpsClient reader task (sync). Push onto the

@@ -584,6 +584,60 @@ def test_delivery_timeout_s_default_and_override() -> None:
         cfg_mod.parse({"delivery_timeout_s": "60"})
 
 
+def test_log_file_default_and_override(tmp_path) -> None:
+    """Default is None (basicConfig stderr); strings expand to a Path."""
+    c = cfg_mod.parse({})
+    assert c.log_file is None
+
+    target = tmp_path / "whatspyc.log"
+    c2 = cfg_mod.parse({"log_file": str(target)})
+    assert c2.log_file == target
+
+    # ``~`` expansion
+    c3 = cfg_mod.parse({"log_file": "~/whatspyc.log"})
+    from pathlib import Path as _P
+    assert c3.log_file == _P("~/whatspyc.log").expanduser()
+
+    with pytest.raises(ValueError, match="log_file"):
+        cfg_mod.parse({"log_file": ""})
+    with pytest.raises(ValueError, match="log_file"):
+        cfg_mod.parse({"log_file": 5})
+
+
+def test_log_console_default_and_override() -> None:
+    """Default is "auto" (resolved upstream); known values pass through;
+    unknown values rejected at parse time."""
+    c = cfg_mod.parse({})
+    assert c.log_console == "auto"
+
+    for v in ("auto", "stderr", "pane", "off"):
+        c2 = cfg_mod.parse({"log_console": v})
+        assert c2.log_console == v
+
+    with pytest.raises(ValueError, match="log_console"):
+        cfg_mod.parse({"log_console": "screen"})
+    with pytest.raises(ValueError, match="log_console"):
+        cfg_mod.parse({"log_console": 0})
+
+
+def test_log_level_default_and_override() -> None:
+    """Default is None (defer to env var / hardcoded WARNING); known
+    level strings normalise to upper-case; unknown rejected."""
+    c = cfg_mod.parse({})
+    assert c.log_level is None
+
+    c2 = cfg_mod.parse({"log_level": "info"})
+    assert c2.log_level == "INFO"
+
+    c3 = cfg_mod.parse({"log_level": "DEBUG"})
+    assert c3.log_level == "DEBUG"
+
+    with pytest.raises(ValueError, match="log_level"):
+        cfg_mod.parse({"log_level": "verbose"})
+    with pytest.raises(ValueError, match="log_level"):
+        cfg_mod.parse({"log_level": 10})
+
+
 def test_non_rhp_transport_does_not_require_engine() -> None:
     raw = tomllib.loads(
         """

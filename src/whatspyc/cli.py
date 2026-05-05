@@ -317,20 +317,54 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
     help="Enable AX.25 PID 0x08 segmentation/reassembly. Off by default.",
 )
 @click.option("--ui", "ui_mode", type=click.Choice(["line", "tui"]), default=None)
-@click.option("--log-level", default=None)
+@click.option(
+    "--log-level",
+    default=None,
+    help="Python logging level. Wins over config / WHATSPYC_LOG env var.",
+)
+@click.option(
+    "--log-file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Route log records to a file in addition to (not instead of) the "
+    "console sink. Wins over the `log_file` config key.",
+)
+@click.option(
+    "--log-console",
+    type=click.Choice(["auto", "stderr", "pane", "off"]),
+    default=None,
+    help="Console log sink. 'auto' (default): TUI → status pane, line UI "
+    "→ stderr. 'pane' is rejected with --ui line.",
+)
 def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_port, ax_level,
          my_call, name, remote, state_dir, kiss_device, kiss_baud, kiss_port, kiss_ackmode,
-         digipeaters, ax25_modulo, ax25_segmentation, ui_mode, log_level) -> None:
+         digipeaters, ax25_modulo, ax25_segmentation, ui_mode, log_level, log_file,
+         log_console) -> None:
     """Connect to a WhatsPac service and drop into an interactive prompt."""
     click.echo(
         f"\nwhatspyc (v{__version__}) text-only WhatsPac client - WhatsPac is designed for "
         "GUI experience, try it at http://whatspac.oarc.uk/\n"
     )
-    log.setup(log_level)
     try:
         c = cfg_mod.load()
     except ValueError as exc:
         raise click.UsageError(str(exc)) from None
+    # Precedence: CLI flag > config key > env var (WHATSPYC_LOG, handled in
+    # log.setup) > hardcoded WARNING. log_file has no env var.
+    effective_ui = ui_mode or c.ui
+    effective_console = log_console or c.log_console
+    if effective_console == "auto":
+        effective_console = "pane" if effective_ui == "tui" else "stderr"
+    elif effective_console == "pane" and effective_ui != "tui":
+        raise click.UsageError(
+            "log_console = 'pane' requires --ui tui (the line UI has no "
+            "status pane to write to)."
+        )
+    log.setup(
+        level=log_level or c.log_level,
+        file=log_file if log_file is not None else c.log_file,
+        console=effective_console,
+    )
 
     # Apply global (non-connection) overrides.
     if my_call is not None:

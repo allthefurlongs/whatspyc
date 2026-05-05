@@ -61,6 +61,10 @@ _PROFILE_KEYS = frozenset(
 
 VALID_ENGINES = ("xrouter", "bpq", "custom")
 
+VALID_LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET")
+
+VALID_LOG_CONSOLES = ("auto", "stderr", "pane", "off")
+
 
 @dataclass
 class ChannelInfo:
@@ -156,6 +160,21 @@ class Config:
     # The web client has no equivalent automatic timeout (its "resend"
     # is a manual button); this is a whatspyc-specific knob.
     delivery_timeout_s: int = 60
+    # Where Python logging writes. ``None`` keeps the default basicConfig
+    # destination (stderr); a path routes records to a file (and creates
+    # the parent dir if missing). Useful with ``--ui tui`` where any
+    # stderr write would corrupt the full-screen surface.
+    log_file: Path | None = None
+    # Default log level. ``None`` defers to the ``WHATSPYC_LOG`` env var
+    # and ultimately the hardcoded ``WARNING`` default in ``log.setup``,
+    # so a config-less user keeps the historic behaviour.
+    log_level: str | None = None
+    # Where the console-shaped log sink writes:
+    # ``"auto"`` (default) → status pane in TUI, stderr in line UI;
+    # ``"stderr"`` / ``"pane"`` / ``"off"`` force the choice. Independent
+    # of ``log_file`` — both can be active. ``"pane"`` with a line UI is
+    # incoherent and the CLI refuses to start.
+    log_console: str = "auto"
     connect_profiles: list[ConnectProfile] = field(default_factory=list)
     channels: list[ChannelInfo] = field(default_factory=list)
 
@@ -330,6 +349,34 @@ def parse(raw: dict) -> Config:
                 f"got {v!r}"
             )
         cfg.delivery_timeout_s = v
+    if "log_file" in raw:
+        v = raw["log_file"]
+        if not isinstance(v, str) or not v:
+            raise ValueError(
+                f"config: log_file must be a non-empty string path, got {v!r}"
+            )
+        cfg.log_file = Path(v).expanduser()
+    if "log_level" in raw:
+        v = raw["log_level"]
+        if not isinstance(v, str):
+            raise ValueError(
+                f"config: log_level must be a string, got {v!r}"
+            )
+        upper = v.upper()
+        if upper not in VALID_LOG_LEVELS:
+            raise ValueError(
+                f"config: log_level {v!r} is not one of "
+                f"{', '.join(VALID_LOG_LEVELS)}"
+            )
+        cfg.log_level = upper
+    if "log_console" in raw:
+        v = raw["log_console"]
+        if not isinstance(v, str) or v not in VALID_LOG_CONSOLES:
+            raise ValueError(
+                f"config: log_console {v!r} is not one of "
+                f"{', '.join(VALID_LOG_CONSOLES)}"
+            )
+        cfg.log_console = v
 
     if "channels" in raw:
         raise ValueError(

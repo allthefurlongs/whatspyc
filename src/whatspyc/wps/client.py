@@ -48,6 +48,8 @@ entirely (timers are never scheduled).
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from typing import Awaitable, Callable
 
@@ -55,6 +57,8 @@ from whatspyc.store.store import SqliteStore
 from whatspyc.transport.base import AsyncByteStream
 from whatspyc.wps import codec
 from whatspyc.wps.hop_script import HopStep, ProgressFn, run_connect_script
+
+logger = logging.getLogger(__name__)
 
 CLIENT_VERSION = 0.92
 HandlerFn = Callable[[dict], Awaitable[None]]
@@ -190,6 +194,10 @@ class WpsClient:
             # this — the upstream node has already pre-sent it.
             await self._stream.send(f"{self._my_call}\r\n".encode("utf-8"))
         record = self._store.connect_record(self._name, self._my_call, CLIENT_VERSION)
+        # _send is not yet usable (connected event isn't set), so log
+        # directly here to keep the trace symmetric with post-handshake
+        # outbound traffic.
+        logger.debug("WPS> %s", json.dumps(record, separators=(",", ":")))
         await self._stream.send(codec.encode(record))
         self._connected.set()
 
@@ -320,7 +328,7 @@ class WpsClient:
         }
         if reply_id:
             body["r"] = reply_id
-        await self._send(codec.encode(body))
+        await self._send(body)
         # Persist immediately so a crash mid-flight still records what we tried.
         self._store.upsert_message(body)
         self._schedule_dm_timeout(msg_id)
@@ -340,15 +348,13 @@ class WpsClient:
             body["rts"] = reply_ts
         if reply_from:
             body["rfc"] = reply_from.upper()
-        await self._send(codec.encode(body))
+        await self._send(body)
         self._store.upsert_post(channel_id, body)
         self._schedule_post_timeout(channel_id, ts)
         return ts
 
     async def subscribe(self, channel_id: int, *, last_post: int = 0) -> None:
-        await self._send(
-            codec.encode({"t": "cs", "s": 1, "cid": channel_id, "lcp": last_post})
-        )
+        await self._send({"t": "cs", "s": 1, "cid": channel_id, "lcp": last_post})
 
     async def subscribe_and_wait(
         self,
@@ -386,7 +392,7 @@ class WpsClient:
             self._cs_ack_waiters.pop(channel_id, None)
 
     async def unsubscribe(self, channel_id: int) -> None:
-        await self._send(codec.encode({"t": "cs", "s": 0, "cid": channel_id, "lcp": 0}))
+        await self._send({"t": "cs", "s": 0, "cid": channel_id, "lcp": 0})
 
     async def unpause_channel(
         self,
@@ -414,7 +420,7 @@ class WpsClient:
             body["pc"] = int(post_count)
         else:
             body["lts"] = int(logged_ts)  # type: ignore[arg-type]
-        await self._send(codec.encode(body))
+        await self._send(body)
         # Server clears its paused_channels record on receipt; track the
         # same locally so the UI doesn't keep prompting.
         self._paused_channels.pop(channel_id, None)
@@ -430,9 +436,7 @@ class WpsClient:
         """
         if post_count <= 0:
             raise ValueError(f"post_count must be positive, got {post_count!r}")
-        await self._send(
-            codec.encode({"t": "cpb", "cid": channel_id, "pc": int(post_count)})
-        )
+        await self._send({"t": "cpb", "cid": channel_id, "pc": int(post_count)})
 
     async def resend_message(self, msg_id: str) -> None:
         """Re-send a previously-sent DM identified by its server ``_id``.
@@ -459,9 +463,7 @@ class WpsClient:
         edts = row.get("edit_ts")
         if edts is not None:
             await self._send(
-                codec.encode(
-                    {"t": "med", "_id": row["id"], "m": row["body"], "edts": int(edts)}
-                )
+                {"t": "med", "_id": row["id"], "m": row["body"], "edts": int(edts)}
             )
             self._schedule_dm_edit_timeout(msg_id, int(edts))
             return
@@ -476,7 +478,7 @@ class WpsClient:
         }
         if row.get("reply_id"):
             body["r"] = row["reply_id"]
-        await self._send(codec.encode(body))
+        await self._send(body)
         self._schedule_dm_timeout(msg_id)
 
     async def resend_post(self, channel_id: int, ts: int) -> None:
@@ -496,15 +498,13 @@ class WpsClient:
         edts = row.get("edit_ts")
         if edts is not None:
             await self._send(
-                codec.encode(
-                    {
-                        "t": "cped",
-                        "cid": int(channel_id),
-                        "ts": int(ts),
-                        "p": row["body"],
-                        "edts": int(edts),
-                    }
-                )
+                {
+                    "t": "cped",
+                    "cid": int(channel_id),
+                    "ts": int(ts),
+                    "p": row["body"],
+                    "edts": int(edts),
+                }
             )
             self._schedule_post_edit_timeout(int(ts), int(edts))
             return
@@ -519,7 +519,7 @@ class WpsClient:
             body["rts"] = row["reply_ts"]
         if row.get("reply_from"):
             body["rfc"] = row["reply_from"]
-        await self._send(codec.encode(body))
+        await self._send(body)
         self._schedule_post_timeout(int(channel_id), int(ts))
 
     async def edit_message(self, msg_id: str, new_text: str) -> None:
@@ -538,9 +538,7 @@ class WpsClient:
         if (row.get("from_call") or "").upper() != self._my_call:
             raise ValueError("Cannot edit other users DMs")
         edts = int(time.time() * 1000)
-        await self._send(
-            codec.encode({"t": "med", "_id": msg_id, "m": new_text, "edts": edts})
-        )
+        await self._send({"t": "med", "_id": msg_id, "m": new_text, "edts": edts})
         self._store.apply_message_edit(msg_id, new_text, edts)
         self._store.bump_meta("last_edit", edts)
         self._schedule_dm_edit_timeout(msg_id, edts)
@@ -560,15 +558,13 @@ class WpsClient:
             raise ValueError("Cannot edit other users posts")
         edts = int(time.time() * 1000)
         await self._send(
-            codec.encode(
-                {
-                    "t": "cped",
-                    "cid": int(channel_id),
-                    "ts": int(ts),
-                    "p": new_text,
-                    "edts": edts,
-                }
-            )
+            {
+                "t": "cped",
+                "cid": int(channel_id),
+                "ts": int(ts),
+                "p": new_text,
+                "edts": edts,
+            }
         )
         self._store.apply_post_edit(int(channel_id), int(ts), new_text, edts)
         self._store.bump_channel_last_edit(int(channel_id), edts)
@@ -577,9 +573,7 @@ class WpsClient:
     async def react_message(self, msg_id: str, emoji: str, *, add: bool = True) -> None:
         ets = int(time.time())
         await self._send(
-            codec.encode(
-                {"t": "mem", "a": 1 if add else 0, "_id": msg_id, "e": emoji, "ets": ets}
-            )
+            {"t": "mem", "a": 1 if add else 0, "_id": msg_id, "e": emoji, "ets": ets}
         )
         # WPS doesn't echo DM reactions back to the sender (see
         # `message_emoji_handler` in `wps.py` — it relays to
@@ -594,16 +588,14 @@ class WpsClient:
     async def react_post(self, channel_id: int, ts: int, emoji: str, *, add: bool = True) -> None:
         ets = int(time.time())
         await self._send(
-            codec.encode(
-                {
-                    "t": "cpem",
-                    "a": 1 if add else 0,
-                    "ts": ts,
-                    "cid": channel_id,
-                    "ets": ets,
-                    "e": emoji,
-                }
-            )
+            {
+                "t": "cpem",
+                "a": 1 if add else 0,
+                "ts": ts,
+                "cid": channel_id,
+                "ets": ets,
+                "e": emoji,
+            }
         )
         # `post_emoji_handler` in `wps.py` skips the sender too — the
         # reaction is broadcast to other subscribers but not back to us.
@@ -620,7 +612,7 @@ class WpsClient:
         # _silence_reset=False: keepalives don't push the silence-guard
         # clock forward, mirroring the web client (only `Se` calls
         # `ne("RESET")`; the keepalive tick sends directly).
-        await self._send(codec.encode({"t": "k"}), _silence_reset=False)
+        await self._send({"t": "k"}, _silence_reset=False)
 
     # ------------------------------------------------------------------
     # Per-row delivery-timeout tracking
@@ -852,8 +844,17 @@ class WpsClient:
         self._pending_dm_edits.clear()
         self._pending_post_edits.clear()
 
-    async def _send(self, data: bytes, *, _silence_reset: bool = True) -> None:
-        """Single point of egress; serialised, raises if disconnected."""
+    async def _send(self, obj: dict, *, _silence_reset: bool = True) -> None:
+        """Single point of egress; serialised, raises if disconnected.
+
+        Takes the wire dict (not bytes) so the application-protocol layer
+        can be traced at DEBUG before compression — wire-level dumps
+        (websockets, RHP, KISS) only show the framed/compressed bytes,
+        which are unreadable for any frame that crosses the compression
+        threshold.
+        """
+        logger.debug("WPS> %s", json.dumps(obj, separators=(",", ":")))
+        data = codec.encode(obj)
         async with self._send_lock:
             if self._stream is None or not self._connected.is_set():
                 raise ConnectionError("not connected")
@@ -883,6 +884,7 @@ class WpsClient:
                     raise self._wrap_decode_error(exc) from exc
                 for obj in objs:
                     self._first_frame_seen = True
+                    logger.debug("WPS< %s", json.dumps(obj, separators=(",", ":")))
                     await self._dispatch(obj)
         except asyncio.CancelledError:
             raise
