@@ -30,9 +30,10 @@ import re
 import time
 from typing import Any, Awaitable, Callable
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Grid, Horizontal, Vertical
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -55,6 +56,14 @@ from whatspyc.config import ChannelInfo
 from whatspyc.ui import emoji_for_display
 from whatspyc.ui import help as help_data
 from whatspyc.ui import ts_to_ms
+from whatspyc.ui.emoji_catalog import (
+    EmojiEntry,
+    build_catalog,
+    by_char,
+    entries_in,
+    groups as catalog_groups,
+    search,
+)
 from whatspyc.ui.options import SessionOptions
 from whatspyc.wps.client import WpsClient
 
@@ -430,7 +439,7 @@ _KEYBINDING_HELP_LINES = [
     "  Ctrl+S             Toggle the status pane (acks / edits log)",
     "  Ctrl+U             Unsubscribe highlighted channel (with confirm)",
     "  Ctrl+O             Open the Options (session settings) modal",
-    "  Ctrl+E             Insert an emoji at the cursor in the input box",
+    "  Ctrl+E             Open searchable emoji picker, insert at cursor",
     "  Ctrl+C / Ctrl+Q    Quit",
 ]
 
@@ -501,19 +510,64 @@ QUICK_REACT_EMOJI: tuple[str, ...] = (
 )
 
 
+# Tab id (kept short for stable Textual ids) → display label + group
+# name. The group name is "" for the synthetic "quick" tab.
+_GROUP_TABS: tuple[tuple[str, str, str], ...] = (
+    ("quick", "★ Quick", ""),
+    ("smileys", "Smileys", "Smileys & Emotion"),
+    ("people", "People", "People & Body"),
+    ("animals", "Animals", "Animals & Nature"),
+    ("food", "Food", "Food & Drink"),
+    ("travel", "Travel", "Travel & Places"),
+    ("activities", "Activity", "Activities"),
+    ("objects", "Objects", "Objects"),
+    ("symbols", "Symbols", "Symbols"),
+    ("flags", "Flags", "Flags"),
+)
+_GROUP_BY_TAB_ID: dict[str, str] = {tid: grp for tid, _, grp in _GROUP_TABS}
+_TAB_ID_BY_GROUP: dict[str, str] = {grp: tid for tid, _, grp in _GROUP_TABS if grp}
+
+# Group whose entries get a second-level subgroup tab strip — only
+# People & Body is large enough (~386 entries spread over 16 subgroups)
+# to need it. All other groups stay flat in a single scrollable grid.
+_SUBGROUPED_GROUP = "People & Body"
+
+_GRID_COLS = 8
+
+
 class _EmojiButton(Button):
     """Button that carries its emoji string for `Button.Pressed` lookup."""
 
-    def __init__(self, emoji: str, idx: int) -> None:
-        super().__init__(emoji, id=f"emoji-btn-{idx}")
-        self.emoji = emoji
+    def __init__(self, char: str, idx: int) -> None:
+        super().__init__(char, id=f"emoji-btn-{idx}")
+        self.emoji: str = char
+
+
+def _slug(s: str) -> str:
+    """Stable Textual id from a CLDR subgroup name (alnum + dashes)."""
+    out = []
+    for ch in s.lower():
+        if ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != "-":
+            out.append("-")
+    return "".join(out).strip("-")
 
 
 class EmojiPrompt(ModalScreen[str | None]):
-    """Pick a quick-react emoji from a grid, or type one in.
+    """Searchable, tabbed emoji picker.
 
-    Returns the chosen string verbatim (literal character or hex
-    codepoint like `1f44d`) so the wire layer is unchanged.
+    Top-level Tabs strip selects the active CLDR group (or the curated
+    "Quick" tab); for People & Body a second-level Tabs strip selects
+    the subgroup. The grid lives inside a `VerticalScroll` so larger
+    categories (Flags, Objects, Symbols) browse smoothly. The search
+    Input at the top overrides the active tab when it has text — typing
+    a query shows ranked matches across the whole catalogue, clearing
+    the search reverts to the previously-active tab.
+
+    Returns the chosen string verbatim (literal char or hex codepoint
+    like ``1f44d``); both call sites and the wire helpers in
+    ``whatspyc.ui`` accept either form, so no normalisation happens here.
     """
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
@@ -523,8 +577,8 @@ class EmojiPrompt(ModalScreen[str | None]):
         align: center middle;
     }
     #emoji-pane {
-        width: 56;
-        height: auto;
+        width: 100;
+        max-height: 90%;
         border: round $accent;
         background: $surface;
         padding: 1 2;
@@ -532,11 +586,24 @@ class EmojiPrompt(ModalScreen[str | None]):
     #emoji-hint {
         margin-bottom: 1;
     }
+    #emoji-search {
+        margin-bottom: 1;
+    }
+    #emoji-group-tabs {
+        margin-bottom: 1;
+    }
+    #emoji-subgroup-tabs {
+        margin-bottom: 1;
+    }
+    #emoji-scroll {
+        height: 12;
+        border: tall $boost;
+        margin-bottom: 1;
+    }
     #emoji-grid {
-        grid-size: 6;
+        grid-size: 8;
         grid-gutter: 0 1;
         height: auto;
-        margin-bottom: 1;
     }
     #emoji-grid Button {
         width: 1fr;
@@ -549,38 +616,294 @@ class EmojiPrompt(ModalScreen[str | None]):
         background: $accent;
         text-style: bold;
     }
+    #emoji-focused-name {
+        color: $text-muted;
+        height: 1;
+        margin-bottom: 1;
+    }
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Active "view" — what the grid currently shows. Drives _render.
+        # The subgroup tab id (when in People & Body), else "" for the
+        # whole group.
+        self._active_tab: str = "quick"
+        self._active_subgroup: str = ""
+        self._search_active: bool = False
+        # Cache the buttons currently mounted, in DOM order.
+        self._grid_buttons: list[_EmojiButton] = []
+
+    # ------------------------------------------------------------------
+    # Compose / mount
+    # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         with Vertical(id="emoji-pane"):
             yield Static(
-                "Pick a reaction below, or type one in if your terminal "
-                "can't render emoji. The text box accepts a literal "
-                "character or a hex codepoint like [bold]1f44d[/].",
+                "Tabs select a CLDR group (or the curated quick-reacts). "
+                "Type to search the full catalogue across every group. "
+                "The bottom box accepts a literal character or a hex "
+                "codepoint like [bold]1f44d[/].",
                 id="emoji-hint",
             )
-            with Grid(id="emoji-grid"):
-                for i, e in enumerate(QUICK_REACT_EMOJI):
-                    yield _EmojiButton(e, i)
+            yield Input(id="emoji-search", placeholder="search emoji…")
+            yield Tabs(
+                *(Tab(label, id=f"gtab-{tid}") for tid, label, _ in _GROUP_TABS),
+                active="gtab-quick",
+                id="emoji-group-tabs",
+            )
+            # Subgroup tab strip — populated lazily; hidden unless the
+            # active group is People & Body.
+            yield Tabs(id="emoji-subgroup-tabs")
+            with VerticalScroll(id="emoji-scroll"):
+                yield Grid(id="emoji-grid")
+            yield Static("", id="emoji-focused-name")
             yield Input(id="emoji-input", placeholder="emoji or hex codepoint")
             yield Static(
-                "[dim]Tab/Shift+Tab to move · Enter to send · Esc to cancel[/]"
+                "[dim]Type to search · ←→ tabs · ↑↓←→ grid · Tab cycles · Enter to send · Esc to cancel[/]"
             )
 
-    def on_mount(self) -> None:
-        first = self.query("#emoji-grid Button").first()
-        if first is not None:
-            first.focus()
+    async def on_mount(self) -> None:
+        # Hide subgroup tabs until People & Body is selected.
+        self.query_one("#emoji-subgroup-tabs", Tabs).display = False
+        await self._render_view()
+        self.query_one("#emoji-search", Input).focus()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    # ------------------------------------------------------------------
+    # Render — pick the entry list based on (search_active, active_tab,
+    # active_subgroup) and remount the grid.
+    # ------------------------------------------------------------------
+
+    def _entries_for_view(self) -> list[str]:
+        """Return the literal-char list to render in the grid."""
+        if self._search_active:
+            inp = self.query_one("#emoji-search", Input)
+            return [e.char for e in search(inp.value, limit=200)]
+        if self._active_tab == "quick":
+            return list(QUICK_REACT_EMOJI)
+        group = _GROUP_BY_TAB_ID.get(self._active_tab, "")
+        if not group:
+            return []
+        if group == _SUBGROUPED_GROUP and self._active_subgroup:
+            return [e.char for e in entries_in(group, self._active_subgroup)]
+        if group == _SUBGROUPED_GROUP:
+            # Defensive — should always have an active subgroup once
+            # the People tab is selected.
+            return [e.char for e in entries_in(group)]
+        return [e.char for e in entries_in(group)]
+
+    async def _render_view(self) -> None:
+        chars = self._entries_for_view()
+        grid = self.query_one("#emoji-grid", Grid)
+        # Drop existing buttons and mount a fresh batch in CLDR order.
+        await grid.remove_children()
+        new_buttons = [_EmojiButton(c, i) for i, c in enumerate(chars)]
+        if new_buttons:
+            await grid.mount(*new_buttons)
+        self._grid_buttons = new_buttons
+        # Reset scroll to top and clear focused-name caption.
+        try:
+            self.query_one("#emoji-scroll", VerticalScroll).scroll_home(animate=False)
+        except Exception:
+            pass
+        self._update_focused_name(None)
+
+    # ------------------------------------------------------------------
+    # Tab handling
+    # ------------------------------------------------------------------
+
+    async def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         event.stop()
-        if isinstance(event.button, _EmojiButton):
-            self.dismiss(event.button.emoji)
+        tabs_id = event.tabs.id or ""
+        tab_id = event.tab.id or ""
+        if tabs_id == "emoji-group-tabs":
+            tid = tab_id.removeprefix("gtab-")
+            if tid == self._active_tab and not self._search_active:
+                return
+            self._active_tab = tid
+            # Clearing search if the user explicitly picked a tab.
+            if self._search_active:
+                self._search_active = False
+                inp = self.query_one("#emoji-search", Input)
+                if inp.value:
+                    # Avoid re-firing on_input_changed.
+                    with inp.prevent(Input.Changed):
+                        inp.value = ""
+            group = _GROUP_BY_TAB_ID.get(tid, "")
+            sub_tabs = self.query_one("#emoji-subgroup-tabs", Tabs)
+            if group == _SUBGROUPED_GROUP:
+                await self._populate_subgroup_tabs(group)
+                sub_tabs.display = True
+            else:
+                self._active_subgroup = ""
+                sub_tabs.display = False
+            await self._render_view()
+        elif tabs_id == "emoji-subgroup-tabs":
+            sub = tab_id.removeprefix("stab-")
+            if sub == _slug(self._active_subgroup):
+                return
+            # Resolve the slug back to its real subgroup name.
+            for grp_name, subs in catalog_groups():
+                if grp_name == _SUBGROUPED_GROUP:
+                    for s in subs:
+                        if _slug(s) == sub:
+                            self._active_subgroup = s
+                            break
+                    break
+            await self._render_view()
+
+    async def _populate_subgroup_tabs(self, group: str) -> None:
+        """Rebuild the subgroup Tabs strip for ``group``."""
+        sub_tabs = self.query_one("#emoji-subgroup-tabs", Tabs)
+        # Find the subgroups for this group.
+        subs: list[str] = []
+        for grp_name, sgs in catalog_groups():
+            if grp_name == group:
+                subs = sgs
+                break
+        await sub_tabs.clear()
+        if not subs:
+            return
+        for s in subs:
+            await sub_tabs.add_tab(Tab(s, id=f"stab-{_slug(s)}"))
+        # Pick first by default if not already a valid sub.
+        if self._active_subgroup not in subs:
+            self._active_subgroup = subs[0]
+        sub_tabs.active = f"stab-{_slug(self._active_subgroup)}"
+
+    # ------------------------------------------------------------------
+    # Search wiring
+    # ------------------------------------------------------------------
+
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "emoji-search":
+            return
+        event.stop()
+        q = event.value
+        self._search_active = bool(q.strip())
+        # Re-render either way; tab strip stays where it was so clearing
+        # the search box reverts to the active tab.
+        await self._render_view()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
+        if event.input.id == "emoji-search":
+            for btn in self._grid_buttons:
+                if btn.emoji:
+                    self.dismiss(btn.emoji)
+                    return
+            text = event.value.strip()
+            self.dismiss(text or None)
+            return
         text = event.value.strip()
         self.dismiss(text or None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if isinstance(event.button, _EmojiButton) and event.button.emoji:
+            self.dismiss(event.button.emoji)
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        widget = event.widget
+        if isinstance(widget, _EmojiButton):
+            self._update_focused_name(widget.emoji)
+            try:
+                widget.scroll_visible(animate=False)
+            except Exception:
+                pass
+        else:
+            self._update_focused_name(None)
+
+    # ------------------------------------------------------------------
+    # Caption
+    # ------------------------------------------------------------------
+
+    def _update_focused_name(self, char: str | None) -> None:
+        try:
+            label = self.query_one("#emoji-focused-name", Static)
+        except Exception:
+            return
+        if not char:
+            label.update("")
+            return
+        entry = by_char(char)
+        wire = format(ord(char), "x") if len(char) == 1 else "—"
+        if entry is not None:
+            shortcode = ":" + entry.name.replace(" ", "_") + ":"
+            tail = f"  ({entry.group} · {entry.subgroup})" if entry.group else ""
+            label.update(
+                f"[bold]{char}[/]  {entry.name} · {shortcode} · {wire}{tail}"
+            )
+        else:
+            label.update(f"[bold]{char}[/]  · {wire}")
+
+    # ------------------------------------------------------------------
+    # Arrow-key navigation + printable-key forwarding
+    # ------------------------------------------------------------------
+
+    def on_key(self, event: events.Key) -> None:
+        focused = self.focused
+
+        if isinstance(focused, _EmojiButton):
+            buttons = self._grid_buttons
+            if focused not in buttons:
+                return
+            idx = buttons.index(focused)
+            target: int | None = None
+            if event.key == "right" and idx + 1 < len(buttons):
+                target = idx + 1
+            elif event.key == "left" and idx - 1 >= 0:
+                target = idx - 1
+            elif event.key == "down" and idx + _GRID_COLS < len(buttons):
+                target = idx + _GRID_COLS
+            elif event.key == "up":
+                if idx - _GRID_COLS >= 0:
+                    target = idx - _GRID_COLS
+                else:
+                    event.stop()
+                    event.prevent_default()
+                    self.query_one("#emoji-search", Input).focus()
+                    return
+            elif event.key == "pagedown":
+                target = min(idx + _GRID_COLS * 4, len(buttons) - 1)
+            elif event.key == "pageup":
+                target = max(idx - _GRID_COLS * 4, 0)
+            elif event.key == "home":
+                target = 0
+            elif event.key == "end":
+                target = len(buttons) - 1
+            if target is not None and target != idx:
+                event.stop()
+                event.prevent_default()
+                buttons[target].focus()
+                return
+            # Forward a plain printable keystroke into the search box.
+            ch = event.character
+            if ch and ch.isprintable() and len(ch) == 1 and not event.key.startswith("ctrl"):
+                event.stop()
+                event.prevent_default()
+                inp = self.query_one("#emoji-search", Input)
+                inp.value = inp.value + ch
+                inp.cursor_position = len(inp.value)
+                inp.focus()
+                return
+
+        if isinstance(focused, Input) and focused.id == "emoji-search":
+            if event.key == "down":
+                if self._grid_buttons:
+                    event.stop()
+                    event.prevent_default()
+                    self._grid_buttons[0].focus()
+            return
+
+        if isinstance(focused, Input) and focused.id == "emoji-input":
+            if event.key == "up":
+                if self._grid_buttons:
+                    event.stop()
+                    event.prevent_default()
+                    self._grid_buttons[-1].focus()
+            return
 
     def action_cancel(self) -> None:
         self.dismiss(None)

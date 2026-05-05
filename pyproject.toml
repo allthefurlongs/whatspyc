@@ -16,6 +16,7 @@ dependencies = [
     "pyserial-asyncio>=0.6",
     "prompt_toolkit>=3.0.43",
     "textual>=0.60",
+    "emoji>=2.10",
 ]
 
 [project.optional-dependencies]
@@ -31,7 +32,7 @@ whatspyc = "whatspyc.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-whatspyc = ["store/schema.sql", "data/channels.toml"]
+whatspyc = ["store/schema.sql", "data/channels.toml", "data/emoji_groups.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

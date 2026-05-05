@@ -411,7 +411,7 @@ Layout:
 | `Ctrl+H` | Modal help screen — key bindings + slash commands |
 | `Ctrl+D` | Toggle detailed (verbose) render — live re-renders every mounted row. Note: `Ctrl+V` is reserved by most terminals for paste, so this is `Ctrl+D`. |
 | `Ctrl+S` | Toggle the status pane — chronological log of acks, edits, and link events |
-| `Ctrl+E` | Emoji picker — opens the same grid used for reactions and inserts the chosen emoji at the cursor in the input box |
+| `Ctrl+E` | Searchable, tabbed emoji picker — opens the same modal used for reactions. Tabs select a CLDR group (`★ Quick`, Smileys, People, Animals, Food, Travel, Activity, Objects, Symbols, Flags); People has a second tab strip for subgroups. Type into the search box to filter the full catalogue across every group, ↑↓←→ inside the grid, PgUp/PgDn to page, Home/End for ends, Enter to insert |
 | `Ctrl+C` / `Ctrl+Q` | Quit |
 
 Behaviour:
@@ -435,8 +435,12 @@ Behaviour:
 - **Action menu.** Enter on a message you sent → Edit / Resend /
   React. Edit reuses the input box (it loads with the current body;
   submit fires `med` / `cped`). Resend re-emits the original frame
-  (or the latest edit if the row has been edited). React prompts for
-  an emoji.
+  (or the latest edit if the row has been edited). React opens the
+  searchable, tabbed emoji picker — `★ Quick` lands on the curated
+  quick-reacts; the other tabs browse CLDR groups (Smileys, People,
+  Animals, …); typing in the search box filters across the whole
+  catalogue. Skin-tone variants are excluded from the picker to keep
+  browsing manageable.
 - **Slash-command parity.** Every command available in the line UI
   (`/sub`, `/ch`, `/editdm`, `/retrydm`, `/react`, `/set`, `/history`,
   `/vhistory`, ...) works in the TUI too. `/h` lists them all.
