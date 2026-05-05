@@ -405,6 +405,14 @@ def _parse_profile(entry: dict) -> ConnectProfile:
         raise ValueError(
             "config: every [[connect_profiles]] entry must have a `name` key"
         )
+    if entry["name"] == "<offline>":
+        # The CLI hardcodes a "<offline>" sentinel profile (picker entry 0
+        # for browsing the local store with no connection). Allowing user
+        # profiles to share that exact name would shadow the sentinel.
+        raise ValueError(
+            "config: profile name '<offline>' is reserved for the built-in "
+            "offline (local-store-browse) mode — pick a different name."
+        )
     p = ConnectProfile(name=entry["name"])
     user_supplied: set[str] = set()
     for k in (

@@ -35,6 +35,19 @@ from whatspyc.wps.connect_seq import ConnectSequence
 from whatspyc.wps.hop_script import HopScriptError, HopStep
 
 
+# Sentinel profile that means "don't connect, just browse the local store".
+# Surfaced as picker entry 0 and recognised throughout the run path. Angle
+# brackets keep the name from colliding with anything a user might write
+# in their config; `config._parse_profile` rejects user profiles with this
+# exact name as a belt-and-braces guard.
+OFFLINE_PROFILE_NAME = "<offline>"
+_OFFLINE_PROFILE = ConnectProfile(name=OFFLINE_PROFILE_NAME)
+
+
+def _is_offline_profile(p: ConnectProfile) -> bool:
+    return p.name == OFFLINE_PROFILE_NAME
+
+
 def _build_stream_for(profile: ConnectProfile, my_call: str) -> AsyncByteStream:
     rhp_cfg = RhpConfig(
         pfam="ax25" if profile.ax_level.upper() == "L2" else "netrom",
@@ -191,6 +204,8 @@ def _pick_profile(
             "--host / --remote etc."
         )
     if profile_name:
+        if profile_name == OFFLINE_PROFILE_NAME:
+            return _OFFLINE_PROFILE
         try:
             return c.resolve_profile(profile_name)
         except KeyError as exc:
@@ -218,6 +233,7 @@ def _pick_profile(
 
 def _list_profiles(c: cfg_mod.Config, *, verbose: bool) -> None:
     click.echo("Available connect profiles:")
+    click.echo(f"  0. {OFFLINE_PROFILE_NAME}  browse local database (no connection)")
     for i, p in enumerate(c.connect_profiles, start=1):
         marker = " (default)" if p.name == c.default_profile else ""
         user_hops = [s for s in p.connect_script if s.cmd]
@@ -247,6 +263,8 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
         if s.lower() == "v":
             _list_profiles(c, verbose=True)
             continue
+        if s == "0" or s == OFFLINE_PROFILE_NAME:
+            return _OFFLINE_PROFILE
         if s.isdigit():
             idx = int(s) - 1
             if 0 <= idx < len(c.connect_profiles):
@@ -532,6 +550,11 @@ async def _run(
 ) -> None:
     store = SqliteStore(Path(c.state_dir) / "state.sqlite3")
     try:
+        # Offline mode never produces a terminal link-loss event and has
+        # no profile to "reconnect" to — `/quit` ends the session.
+        if _is_offline_profile(profile):
+            await _run_offline(c, store)
+            return
         current_profile = profile
         while True:
             exit_reason = await _connect_and_run_ui(c, current_profile, store)
@@ -546,6 +569,66 @@ async def _run(
             current_profile = next_profile
     finally:
         store.close()
+
+
+async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
+    """Run the UI against the local store with no WPS connection.
+
+    Builds a ``WpsClient`` but never opens it — the read paths the UIs
+    use (``_store.*``, ``ham_name``, ``paused_channels``,
+    ``online_users``) all work without a live link, and the
+    ``offline=True`` flag tells the UI to refuse the send / network
+    paths up front rather than letting them fail with
+    ``ConnectionError`` deeper in the stack.
+    """
+    def _no_stream() -> AsyncByteStream:
+        # Offline mode never opens the link, so this factory should never
+        # be invoked. If we ever land here it means a code path tried to
+        # send through a not-opened client; the message names the cause.
+        raise RuntimeError(
+            "offline mode: WpsClient stream factory called — a UI guard "
+            "is missing for some send / network path"
+        )
+
+    client = WpsClient(
+        _no_stream,
+        store,
+        my_call=c.my_call,  # type: ignore[arg-type]
+        name=c.name,
+        on_event=None,
+        connect_script=[],
+        auto_backfill_post_count=c.auto_backfill_post_count,
+        auto_reconnect=False,
+        reconnect_max_retries=0,
+        delivery_timeout_s=c.delivery_timeout_s,
+    )
+    options = SessionOptions(
+        show_acks=c.show_acks,
+        show_edits=c.show_edits,
+        verbose_history=c.verbose_history,
+        delivery_timeout_s=c.delivery_timeout_s,
+    )
+    if c.ui == "tui":
+        ui = TextualUI(  # type: ignore[arg-type]
+            client,
+            my_call=c.my_call,
+            channels=c.channels,
+            history_backfill=c.history_backfill,
+            options=options,
+            offline=True,
+        )
+    else:
+        ui = LineUI(  # type: ignore[arg-type]
+            client,
+            my_call=c.my_call,
+            channels=c.channels,
+            history_backfill=c.history_backfill,
+            options=options,
+            offline=True,
+        )
+    click.echo()
+    click.echo(f"[{OFFLINE_PROFILE_NAME}] browsing local store, no connection.")
+    await ui.run()
 
 
 async def _connect_and_run_ui(

@@ -81,7 +81,17 @@ you're not subscribed to, then any saved DM threads. `/list ch` or
 whatspyc                      # picker — default starred
 whatspyc --profile via-mb7npw # specific profile, no picker
 whatspyc --no-prompt          # default profile, unattended
+whatspyc --profile '<offline>' # offline mode, no connection (read-only)
 ```
+
+The picker also lists a built-in `<offline>` entry at position `0` —
+pick it (or pass `--profile '<offline>'`) to browse whatever is in your
+local SQLite store without opening a connection. Read-only: `/list`,
+`/ch`, `/dm`, `/history`, `/vhistory`, `/users`, `/h`, `/set`, and `/quit`
+all work; sending text and the network-touching commands (`/sub`,
+`/unsub`, `/unpause`, `/editdm`, `/editpost`, `/retrydm`, `/retrypost`,
+`/react`) print an `[offline]` hint instead of dispatching. The prompt
+shows `(offline)` while in this mode.
 
 Or skip the config file and build a one-shot ad-hoc connection from CLI
 flags:

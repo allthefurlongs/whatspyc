@@ -76,12 +76,14 @@ class TextualUI:
         channels: list[ChannelInfo] | None = None,
         history_backfill: int = 3,
         options: SessionOptions | None = None,
+        offline: bool = False,
     ) -> None:
         self._client = client
         self._my_call = my_call.upper()
         self._channels = list(channels or [])
         self._history_backfill = max(0, int(history_backfill))
         self._options = options or SessionOptions()
+        self._offline = offline
         self._target: TargetKey | None = None
         self._pending: list[dict] = []
         self._app: _WhatspycApp | None = None
@@ -1319,6 +1321,14 @@ class _WhatspycApp(App):
         self._populate_initial_target_lists()
         self._refresh_online_pane(self._ui._client.online_users())
         self._refresh_thread_header()
+        if self._ui._offline:
+            # Force the status pane visible and announce the mode so the
+            # user always sees the read-only banner — `_status_error`
+            # auto-shows the pane on first write.
+            self._status_error(
+                "[yellow][offline][/] read-only mode — browsing local "
+                "store, no connection"
+            )
         # Hook the root logger if log_console resolved to "pane" — otherwise
         # this is a no-op and returns None.
         self._log_handler = log_mod.install_pane_handler(
@@ -1480,7 +1490,7 @@ class _WhatspycApp(App):
             target = self._target_from_id(event.item.id)
             if target is None:
                 return
-            if target[0] == "ch":
+            if target[0] == "ch" and not self._ui._offline:
                 try:
                     cid = int(target[1])
                 except ValueError:
@@ -1506,7 +1516,7 @@ class _WhatspycApp(App):
             target = self._target_from_id(item_id)
             if target is None:
                 return
-            if target[0] == "ch":
+            if target[0] == "ch" and not self._ui._offline:
                 try:
                     cid = int(target[1])
                 except ValueError:
@@ -1514,7 +1524,8 @@ class _WhatspycApp(App):
                 # Unsubscribed channel: open the subscribe modal and only
                 # commit the target / centre switch on confirm. Paused
                 # implies subscribed, so it falls through to the normal
-                # path below.
+                # path below. Offline mode skips this whole flow — there's
+                # no subscribe to be done; just preview the local store.
                 if cid is not None and not self._is_subscribed(cid) \
                         and not self._ui._client.paused_channels().get(cid):
                     self._open_subscribe_modal(cid, target=target)
@@ -1873,6 +1884,21 @@ class _WhatspycApp(App):
         if not pane.display:
             pane.styles.display = "block"
 
+    def _refuse_offline(self, what: str) -> bool:
+        """If running offline, surface a one-line warning and return ``True``.
+
+        Used as an early-out guard in send paths and any slash command
+        that needs the wire link. Read-only paths (history, listings,
+        target switching) skip this check entirely.
+        """
+        if not self._ui._offline:
+            return False
+        self._status_error(
+            f"[yellow][offline][/] {what} unavailable — read-only mode "
+            f"(no connection)"
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Verbose toggle (Ctrl+D) and help (Ctrl+H)
     # ------------------------------------------------------------------
@@ -2093,6 +2119,8 @@ class _WhatspycApp(App):
         ``skip_confirm`` skips the Y/N stage and goes straight to the
         subscribe + count flow — used by ``/sub CID`` since the user has
         already opted in by typing the command."""
+        if self._refuse_offline("subscribing"):
+            return
         c = self._ui._client
 
         async def on_confirm() -> int:
@@ -2201,6 +2229,8 @@ class _WhatspycApp(App):
         footer.refresh(recompose=True)
 
     def _open_unsubscribe_modal(self, cid: int) -> None:
+        if self._refuse_offline("unsubscribing"):
+            return
         c = self._ui._client
 
         async def _run() -> None:
@@ -2671,6 +2701,8 @@ class _WhatspycApp(App):
         self.run_worker(_run(), exclusive=False)
 
     async def _begin_edit(self, row: MessageRow) -> None:
+        if self._refuse_offline("editing"):
+            return
         self._pending_edit = {
             "kind": row.kind,
             "target_key": row.tkey,
@@ -2686,6 +2718,8 @@ class _WhatspycApp(App):
             pass
 
     async def _do_resend(self, row: MessageRow) -> None:
+        if self._refuse_offline("resending"):
+            return
         c = self._ui._client
         try:
             if row.kind == "dm":
@@ -2699,6 +2733,8 @@ class _WhatspycApp(App):
             return
 
     async def _do_react(self, row: MessageRow) -> None:
+        if self._refuse_offline("reacting"):
+            return
         emoji = await self.push_screen_wait(EmojiPrompt())
         if not emoji:
             return
@@ -2737,6 +2773,8 @@ class _WhatspycApp(App):
         try:
             if text.startswith("/"):
                 await self._handle_command(text)
+            elif self._refuse_offline("sending"):
+                return
             elif self._ui._target is None:
                 self._status_error(
                     "[yellow]hint:[/] no target — /dm CALL or /ch N|#NAME"
@@ -2795,6 +2833,8 @@ class _WhatspycApp(App):
         self._pending_edit = None
         self._refresh_prompt()
         if edit is None or not text:
+            return
+        if self._refuse_offline("editing"):
             return
         c = self._ui._client
         edts = int(time.time() * 1000)
@@ -2861,6 +2901,8 @@ class _WhatspycApp(App):
         elif cmd == "/sub" and 1 <= len(args) <= 2:
             await self._handle_sub(args)
         elif cmd == "/unsub" and len(args) == 1:
+            if self._refuse_offline("/unsub"):
+                return
             cid = self._resolve_channel(args[0], allow_unknown_cid=True)
             if cid is None:
                 self._status_error(
@@ -2871,6 +2913,8 @@ class _WhatspycApp(App):
         elif cmd == "/unpause" and 1 <= len(args) <= 2:
             await self._handle_unpause(args)
         elif cmd == "/editdm" and len(args) >= 2:
+            if self._refuse_offline("/editdm"):
+                return
             try:
                 lid = int(args[0])
             except ValueError:
@@ -2892,6 +2936,8 @@ class _WhatspycApp(App):
                 clear_delivered=True,
             )
         elif cmd == "/editpost" and len(args) >= 2:
+            if self._refuse_offline("/editpost"):
+                return
             try:
                 lid = int(args[0])
             except ValueError:
@@ -2918,6 +2964,8 @@ class _WhatspycApp(App):
                 clear_delivered=True,
             )
         elif cmd == "/retrydm" and len(args) == 1:
+            if self._refuse_offline("/retrydm"):
+                return
             try:
                 lid = int(args[0])
             except ValueError:
@@ -2934,6 +2982,8 @@ class _WhatspycApp(App):
                 return
             self._write_to_active(f"[green][retrydm][/] resent lid {lid}")
         elif cmd == "/retrypost" and len(args) == 1:
+            if self._refuse_offline("/retrypost"):
+                return
             try:
                 lid = int(args[0])
             except ValueError:
@@ -2950,6 +3000,8 @@ class _WhatspycApp(App):
                 return
             self._write_to_active(f"[green][retrypost][/] resent lid {lid}")
         elif cmd == "/react" and len(args) == 2:
+            if self._refuse_offline("/react"):
+                return
             target = self._ui._target
             if target is None:
                 self._status_error(
@@ -2988,7 +3040,11 @@ class _WhatspycApp(App):
                 self._status_error(f"[yellow]/ch: unknown channel {args[0]!r} (use cid or #name)[/]")
                 return
             target = ("ch", str(cid))
-            if not self._is_subscribed(cid) \
+            # Offline mode skips the subscribe prompt entirely — switching
+            # to an unsubscribed channel just shows whatever local history
+            # we have for it, with no opportunity to subscribe.
+            if not self._ui._offline \
+                    and not self._is_subscribed(cid) \
                     and not self._ui._client.paused_channels().get(cid):
                 self._open_subscribe_modal(cid, target=target)
                 return
@@ -3038,6 +3094,8 @@ class _WhatspycApp(App):
         self.push_screen(SettingsModal(options=self._ui._options, on_change=on_change))
 
     async def _handle_sub(self, args: list[str]) -> None:
+        if self._refuse_offline("/sub"):
+            return
         cid = self._resolve_channel(args[0], allow_unknown_cid=True)
         if cid is None:
             self._status_error(
@@ -3074,6 +3132,8 @@ class _WhatspycApp(App):
         self._open_subscribe_modal(cid, target=target, skip_confirm=True)
 
     async def _handle_unpause(self, args: list[str]) -> None:
+        if self._refuse_offline("/unpause"):
+            return
         cid = self._resolve_channel(args[0])
         if cid is None:
             self._status_error(

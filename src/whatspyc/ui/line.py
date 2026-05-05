@@ -32,12 +32,14 @@ class LineUI:
         channels: list[ChannelInfo] | None = None,
         history_backfill: int = 3,
         options: SessionOptions | None = None,
+        offline: bool = False,
     ) -> None:
         self._client = client
         self._my_call = my_call
         self._channels = list(channels or [])
         self._history_backfill = max(0, int(history_backfill))
         self._options = options or SessionOptions()
+        self._offline = offline
         self._target: tuple[str, str] | None = None  # ("dm", call) or ("ch", str(cid))
         self._session: PromptSession = PromptSession()
         self._stop = asyncio.Event()
@@ -148,8 +150,15 @@ class LineUI:
         """Run until the user types ``/quit`` or the link drops."""
         with patch_stdout():
             print()
-            print("Connected to WPS")
-            print("/h for help, /quit to quit, /list to view channels")
+            if self._offline:
+                print("Offline mode — browsing local store, no connection")
+                print(
+                    "/h for help, /quit to quit, /list to view stored "
+                    "channels and DM threads"
+                )
+            else:
+                print("Connected to WPS")
+                print("/h for help, /quit to quit, /list to view channels")
             print()
             while not self._stop.is_set():
                 try:
@@ -486,16 +495,29 @@ class LineUI:
         return f"{name}, {call}" if name else str(call)
 
     def _prompt_label(self) -> str:
+        offline = "(offline) " if self._offline else ""
         if self._target is None:
-            return "whatspyc> "
+            return f"{offline}whatspyc> "
         kind, key = self._target
         if kind == "dm":
-            return f"dm {key}> "
+            return f"{offline}dm {key}> "
         if kind == "ch":
             cid = int(key)
             name = self._channel_name(cid)
-            return f"{cid} #{name}> " if name else f"{cid}> "
-        return f"{kind}:{key}> "
+            return f"{offline}{cid} #{name}> " if name else f"{offline}{cid}> "
+        return f"{offline}{kind}:{key}> "
+
+    def _refuse_offline(self, what: str) -> bool:
+        """If running offline, print a one-line hint and return ``True``.
+
+        Used as an early-out guard in send paths and any slash command
+        that needs the wire link. Read-only paths (history, listings,
+        target switching) skip this check entirely.
+        """
+        if not self._offline:
+            return False
+        print(f"[offline] {what} unavailable — read-only mode (no connection)")
+        return True
 
     def _channel_name(self, cid: int) -> str | None:
         for c in self._channels:
@@ -594,6 +616,8 @@ class LineUI:
         )
 
     async def _send_to_target(self, text: str) -> None:
+        if self._refuse_offline("sending"):
+            return
         if self._target is None:
             print("[hint] no current target. use /dm CALL or /ch N|#NAME")
             return
@@ -684,6 +708,8 @@ class LineUI:
         and download the last ``N`` historic posts. Without ``N``, falls
         back to the pending count from the most recent ``pch`` header.
         """
+        if self._refuse_offline("/unpause"):
+            return
         cid = self._resolve_channel(args[0])
         if cid is None:
             print(f"[hint] /unpause: unknown channel {args[0]!r} (use cid or #name)")
@@ -723,6 +749,8 @@ class LineUI:
         With ``N``, skip the prompt entirely. ``N=0`` subscribes without
         fetching anything (realtime-only from now on).
         """
+        if self._refuse_offline("/sub"):
+            return
         cid = self._resolve_channel(args[0], allow_unknown_cid=True)
         if cid is None:
             print(f"[hint] /sub: unknown channel {args[0]!r} (use cid or #name)")
@@ -853,6 +881,8 @@ class LineUI:
         elif cmd == "/sub" and 1 <= len(args) <= 2:
             await self._handle_sub(args)
         elif cmd == "/unsub" and len(args) == 1:
+            if self._refuse_offline("/unsub"):
+                return
             cid = self._resolve_channel(args[0], allow_unknown_cid=True)
             if cid is None:
                 print(f"[hint] /unsub: unknown channel {args[0]!r} (use cid or #name)")
@@ -880,6 +910,8 @@ class LineUI:
                 for call in users:
                     print(f"  {self._fmt_user(call)}")
         elif cmd == "/editdm" and len(args) >= 2:
+            if self._refuse_offline("/editdm"):
+                return
             try:
                 lid = int(args[0])
             except ValueError:
@@ -895,6 +927,8 @@ class LineUI:
                 print(f"[{exc}]")
                 return
         elif cmd == "/editpost" and len(args) >= 2:
+            if self._refuse_offline("/editpost"):
+                return
             try:
                 lid = int(args[0])
             except ValueError:
@@ -912,6 +946,8 @@ class LineUI:
                 print(f"[{exc}]")
                 return
         elif cmd == "/retrydm" and len(args) == 1:
+            if self._refuse_offline("/retrydm"):
+                return
             try:
                 lid = int(args[0])
             except ValueError:
@@ -928,6 +964,8 @@ class LineUI:
                 return
             print(f"[retrydm] resent lid {lid}")
         elif cmd == "/retrypost" and len(args) == 1:
+            if self._refuse_offline("/retrypost"):
+                return
             try:
                 lid = int(args[0])
             except ValueError:
@@ -944,6 +982,8 @@ class LineUI:
                 return
             print(f"[retrypost] resent lid {lid}")
         elif cmd == "/react" and len(args) == 2:
+            if self._refuse_offline("/react"):
+                return
             if self._target is None:
                 print("[hint] /react: no current target. /dm CALL or /ch N|#NAME first")
                 return
@@ -986,7 +1026,7 @@ class LineUI:
                 # you're already subscribed to via pch), so the subscribe
                 # prompt below is unreachable from here.
                 print(self._paused_hint(cid, paused))
-            elif not self._is_subscribed(cid):
+            elif not self._is_subscribed(cid) and not self._offline:
                 if await self._prompt_yes_no(
                     f"[{self._channel_ref(cid)}] Not subscribed. "
                     f"Subscribe now? [y/N]: ",
