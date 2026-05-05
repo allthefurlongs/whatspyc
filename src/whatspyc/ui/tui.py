@@ -129,9 +129,9 @@ def launch(
 def _fmt_ts(ts: int | float | None) -> str:
     ms = ts_to_ms(ts)
     if ms is None:
-        return "[--]"
+        return "[gray]\\[--][/]"
     dt = datetime.datetime.fromtimestamp(ms / 1000)
-    return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')}]"
+    return f"[gray]\\[{dt.strftime('%Y-%m-%d %H:%M:%S')}][/]"
 
 
 def _fmt_duration_ms(ms: int | float) -> str:
@@ -146,7 +146,8 @@ def _fmt_call(call: str | None, ham_name: Callable[[str | None], str | None]) ->
     if not call:
         return ""
     name = ham_name(call)
-    return f"<{name}, {call}>" if name else f"<{call}>"
+    inner = f"{name}, {call}" if name else call
+    return f"[cornflowerblue]<{inner}>[/]"
 
 
 def _fmt_user(call: str | None, ham_name: Callable[[str | None], str | None]) -> str:
@@ -258,7 +259,7 @@ def _render_row(
             delivery_timeout_s=delivery_timeout_s,
         )
         if status:
-            head = f"{head} - {status}"
+            head = f"{head} - [gray]{status}[/]"
         line = f"{head} - {actor}: {body}{edit_marker}"
     else:
         line = f"{_fmt_ts(ts)} {actor}: {body}{edit_marker}"
