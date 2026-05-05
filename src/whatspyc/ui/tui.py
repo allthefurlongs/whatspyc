@@ -472,6 +472,10 @@ class ActionMenu(ModalScreen[str | None]):
         self.query_one("#menu-list", ListView).focus()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        # Stop bubbling so the App-level on_list_view_selected can't react
+        # to a modal item even if a future modal item id collides with one
+        # of the App's prefixes (`target-`, `dm-add-call`, …).
+        event.stop()
         item_id = event.item.id or ""
         if item_id.startswith("action-"):
             self.dismiss(item_id[len("action-"):])
@@ -560,10 +564,12 @@ class EmojiPrompt(ModalScreen[str | None]):
             first.focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
         if isinstance(event.button, _EmojiButton):
             self.dismiss(event.button.emoji)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
         text = event.value.strip()
         self.dismiss(text or None)
 
@@ -705,6 +711,10 @@ class SubscribeModal(ModalScreen[int | None]):
         inp.focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Stop bubbling — otherwise the App-level on_input_submitted fires
+        # next and sends the typed count as a chat message to whatever
+        # target was active before the modal opened.
+        event.stop()
         if self._stage != "count":
             return
         text = event.value.strip()
@@ -758,6 +768,7 @@ class NewDmModal(ModalScreen[str | None]):
         self.query_one("#dm-add-input", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
         text = event.value.strip().upper()
         self.dismiss(text or None)
 
@@ -868,6 +879,7 @@ class BoolSelectModal(ModalScreen[bool | None]):
         lv.focus()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        event.stop()
         if event.item.id == "boolsel-on":
             self.dismiss(True)
         elif event.item.id == "boolsel-off":
@@ -924,6 +936,7 @@ class EditValueModal(ModalScreen[str | None]):
         inp.cursor_position = len(self._current)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
         self.dismiss(event.value)
 
     def action_cancel(self) -> None:
@@ -999,6 +1012,7 @@ class SettingsModal(ModalScreen[None]):
         )
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        event.stop()
         item_id = event.item.id or ""
         prefix = "setting-"
         if not item_id.startswith(prefix):
