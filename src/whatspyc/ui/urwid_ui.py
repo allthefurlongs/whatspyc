@@ -1750,7 +1750,18 @@ class _UrwidApp:
         # Kept on ``self`` so ``_set_focus_step`` can find it by identity
         # in ``_centre_pane.contents`` (the Pile holds the LineBox, not
         # the placeholder, after wrapping).
-        self._messages_box = urwid.LineBox(self._centre_placeholder)
+        # Bottom border is suppressed (``bline``/corners empty) so the
+        # box's left and right sides extend all the way down to the
+        # full-width divider below the body Columns — the divider then
+        # visually closes the messages frame *and* caps the vertical
+        # separator on the same row, instead of the LineBox bottom
+        # ending one row above it.
+        self._messages_box = urwid.LineBox(
+            self._centre_placeholder,
+            bline="",
+            blcorner="",
+            brcorner="",
+        )
 
         centre_pane = urwid.Pile(
             [
