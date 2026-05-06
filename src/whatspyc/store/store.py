@@ -48,6 +48,8 @@ class SqliteStore:
             ("posts", "received_ts", "INTEGER"),
             ("posts", "realtime", "INTEGER"),
             ("posts", "delivered_ts", "INTEGER"),
+            ("posts", "ets", "INTEGER"),
+            ("posts", "is_gap", "INTEGER NOT NULL DEFAULT 0"),
             ("message_emojis", "callsign", "TEXT NOT NULL DEFAULT ''"),
         ):
             cols = {
@@ -111,26 +113,54 @@ class SqliteStore:
         ``ets <= max(ts)`` is already baked into the bodies we hold;
         flooring suppresses the firehose without risking a missed
         update.
+
+        Per-channel floor is gap-aware. When a channel was paged-
+        subscribed (``pc`` rather than full-history), the server marks
+        the first delivered post with ``g=1`` (``wps/wps.py``,
+        ``unpause_channel_handler``). Posts older than that marker
+        sit in a gap that will never be filled — but pre-gap posts
+        from earlier sessions may still be in our store, and edits or
+        reactions to *those* pre-gap posts can occur during the gap
+        window. Flooring at ``max(post.ts)`` (latest post-gap ts)
+        would suppress the replay of those legitimate edits to
+        pre-gap posts. So in the gap case we floor at
+        ``max(g.ts)`` — the gap-marker's ts — which is < any
+        post-gap edit-ts that isn't already baked into the cpb
+        bodies, and >= any edit-ts in the gap window (which we
+        couldn't apply anyway since the target posts are missing).
+        Without a gap we keep the existing ``max(post.ts)`` floor
+        which is tight against the firehose.
         """
         cur = self._conn.execute("SELECT key, value FROM meta")
         meta = {row["key"]: row["value"] for row in cur.fetchall()}
         cur = self._conn.execute(
             "SELECT c.cid, c.last_post, c.last_emoji, c.last_edit,"
-            "       COALESCE(MAX(p.ts), 0) AS max_post_ts"
+            "       COALESCE(MAX(p.ts), 0) AS max_post_ts,"
+            "       COALESCE(MAX(p.edit_ts), 0) AS max_post_edts,"
+            "       COALESCE(MAX(p.ets), 0) AS max_post_ets,"
+            "       COALESCE(MAX(CASE WHEN p.is_gap = 1 THEN p.ts END), 0)"
+            "         AS max_gap_ts"
             "  FROM channels c"
             "  LEFT JOIN posts p ON p.channel_id = c.cid"
             " WHERE c.subscribed = 1"
             " GROUP BY c.cid, c.last_post, c.last_emoji, c.last_edit"
         )
-        channels = [
-            {
-                "cid": r["cid"],
-                "lp": r["last_post"],
-                "le": max(r["last_emoji"], r["max_post_ts"]),
-                "led": max(r["last_edit"], r["max_post_ts"]),
-            }
-            for r in cur.fetchall()
-        ]
+        channels = []
+        for r in cur.fetchall():
+            if r["max_gap_ts"] > 0:
+                led = max(r["last_edit"], r["max_post_edts"], r["max_gap_ts"])
+                le = max(r["last_emoji"], r["max_post_ets"], r["max_gap_ts"])
+            else:
+                led = max(r["last_edit"], r["max_post_ts"])
+                le = max(r["last_emoji"], r["max_post_ts"])
+            channels.append(
+                {
+                    "cid": r["cid"],
+                    "lp": r["last_post"],
+                    "le": le,
+                    "led": led,
+                }
+            )
         max_msg_ts = self._conn.execute(
             "SELECT COALESCE(MAX(ts), 0) AS m FROM messages"
         ).fetchone()["m"]
@@ -448,13 +478,18 @@ class SqliteStore:
         delivered_ts: int | None = None,
     ) -> None:
         rt = None if realtime is None else (1 if realtime else 0)
+        is_gap = 1 if p.get("g") else 0
         with self._conn:
             self._conn.execute(
-                "INSERT INTO posts(channel_id, ts, from_call, body, edit_ts,"
-                " reply_ts, reply_from, received_ts, realtime, delivered_ts)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO posts(channel_id, ts, from_call, body, edit_ts, ets,"
+                " reply_ts, reply_from, received_ts, realtime, delivered_ts, is_gap)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(channel_id, ts) DO UPDATE SET body=excluded.body,"
                 " edit_ts=COALESCE(excluded.edit_ts, posts.edit_ts),"
+                # ets is server-monotonic; bump rather than overwrite so a
+                # later cpb that omits the field can't unset an observed
+                # reaction-timestamp baseline.
+                " ets=MAX(COALESCE(posts.ets, 0), COALESCE(excluded.ets, 0)),"
                 # Same first-write-wins rule as messages — receipt info
                 # describes the *original* observation, not a later edit.
                 " received_ts=COALESCE(posts.received_ts, excluded.received_ts),"
@@ -464,18 +499,23 @@ class SqliteStore:
                 # ack value, and an authoritative ack via mark_post_delivered
                 # always overwrites the synthetic seed since that path uses
                 # a plain UPDATE.
-                " delivered_ts=COALESCE(posts.delivered_ts, excluded.delivered_ts)",
+                " delivered_ts=COALESCE(posts.delivered_ts, excluded.delivered_ts),"
+                # Gap flag is sticky — once a post has been observed as a
+                # gap-marker on any code path, leave it set.
+                " is_gap=MAX(posts.is_gap, excluded.is_gap)",
                 (
                     channel_id,
                     p["ts"],
                     p.get("fc"),
                     p.get("p"),
                     p.get("edts"),
+                    p.get("ets"),
                     p.get("rts"),
                     p.get("rfc"),
                     received_ts,
                     rt,
                     delivered_ts,
+                    is_gap,
                 ),
             )
             self._conn.execute(
@@ -614,6 +654,11 @@ class SqliteStore:
                 ),
             )
             self._conn.execute(
+                "UPDATE posts SET ets = MAX(COALESCE(ets, 0), ?)"
+                " WHERE channel_id = ? AND ts = ?",
+                (int(emoji_ts), int(channel_id), int(ts)),
+            )
+            self._conn.execute(
                 "INSERT INTO channels(cid, last_emoji) VALUES (?, ?)"
                 " ON CONFLICT(cid) DO UPDATE SET"
                 " last_emoji = MAX(last_emoji, excluded.last_emoji)",
@@ -670,6 +715,11 @@ class SqliteStore:
                             int(emoji_ts),
                         ),
                     )
+            self._conn.execute(
+                "UPDATE posts SET ets = MAX(COALESCE(ets, 0), ?)"
+                " WHERE channel_id = ? AND ts = ?",
+                (int(emoji_ts), int(channel_id), int(ts)),
+            )
             self._conn.execute(
                 "INSERT INTO channels(cid, last_emoji) VALUES (?, ?)"
                 " ON CONFLICT(cid) DO UPDATE SET"

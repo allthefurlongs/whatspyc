@@ -516,3 +516,184 @@ def test_schema_migration_adds_new_columns_to_pre_existing_db(tmp_path: Path) ->
     assert row["realtime"] is None
     assert row["delivered_ts"] is None
     s.close()
+
+
+def test_connect_record_no_gap_uses_max_post_ts_floor(tmp_path: Path) -> None:
+    """Without any gap-marked posts, the per-channel `led`/`le` floor
+    stays at MAX(post.ts) — the original fix for the led/le=0 firehose
+    when subscribing to a long-lived channel for the first time.
+    """
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(11, True)
+    s.upsert_post(11, {"ts": 1_000, "fc": "M0FOO", "p": "first"})
+    s.upsert_post(11, {"ts": 2_000, "fc": "M0FOO", "p": "second"})
+    record = s.connect_record(name="T", callsign="M0ME", version=0.1)
+    chan = next(c for c in record["cc"] if c["cid"] == 11)
+    assert chan["led"] == 2_000
+    assert chan["le"] == 2_000
+    s.close()
+
+
+def test_connect_record_with_gap_floors_at_gap_ts_not_max_ts(tmp_path: Path) -> None:
+    """Gap-overlay scenario: a paged subscribe leaves a gap between
+    pre-gap posts (from an earlier session) and the post-gap batch.
+    The floor must drop from MAX(post.ts) to MAX(gap.ts) so the server
+    re-sends edits/reactions to pre-gap posts that landed during the
+    gap window. Otherwise those updates are silently lost.
+    """
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(12, True)
+    # Pre-gap session: posts 900-1000.
+    s.upsert_post(12, {"ts": 900, "fc": "M0FOO", "p": "old"})
+    s.upsert_post(12, {"ts": 1_000, "fc": "M0FOO", "p": "old2"})
+    # Reconnect with `pc` limit: server marks the first post with g=1
+    # and seeds edts/ets to ts (see wps.py:1588-1591). Post-gap batch
+    # 1051-1100 with the gap marker on 1051.
+    s.upsert_post(
+        12,
+        {"ts": 1_051, "fc": "M0FOO", "p": "new", "g": 1, "edts": 1_051, "ets": 1_051},
+    )
+    s.upsert_post(12, {"ts": 1_100, "fc": "M0FOO", "p": "newest"})
+    record = s.connect_record(name="T", callsign="M0ME", version=0.1)
+    chan = next(c for c in record["cc"] if c["cid"] == 12)
+    # Floor is the gap-marker ts, NOT max(post.ts) (which would suppress
+    # replay of edits to pre-gap posts that happened during the gap).
+    assert chan["led"] == 1_051
+    assert chan["le"] == 1_051
+    assert chan["lp"] == 1_100
+    s.close()
+
+
+def test_connect_record_with_gap_keeps_observed_edit_cursor(tmp_path: Path) -> None:
+    """When the channel's last_edit cursor is already ahead of the gap
+    marker (we observed edits this session), the floor stays on
+    last_edit so the server doesn't replay edits we've already seen.
+    """
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(13, True)
+    s.upsert_post(
+        13,
+        {"ts": 100, "fc": "M0FOO", "p": "x", "g": 1, "edts": 100, "ets": 100},
+    )
+    s.upsert_post(13, {"ts": 200, "fc": "M0FOO", "p": "y"})
+    s.bump_channel_last_edit(13, 999)
+    record = s.connect_record(name="T", callsign="M0ME", version=0.1)
+    chan = next(c for c in record["cc"] if c["cid"] == 13)
+    assert chan["led"] == 999
+    s.close()
+
+
+def test_upsert_post_persists_g_and_ets(tmp_path: Path) -> None:
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(20, True)
+    s.upsert_post(
+        20,
+        {"ts": 500, "fc": "M0FOO", "p": "hello", "g": 1, "edts": 500, "ets": 500},
+    )
+    row = s.lookup_post(20, 500)
+    assert row is not None
+    assert row["is_gap"] == 1
+    assert row["ets"] == 500
+    s.close()
+
+
+def test_upsert_post_gap_flag_is_sticky(tmp_path: Path) -> None:
+    """A later upsert without ``g`` (e.g. a backfill that re-sends the
+    same post via cpb without the gap flag) must not clear the marker."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(21, True)
+    s.upsert_post(21, {"ts": 600, "fc": "M0FOO", "p": "first", "g": 1})
+    s.upsert_post(21, {"ts": 600, "fc": "M0FOO", "p": "first-rewritten"})
+    row = s.lookup_post(21, 600)
+    assert row is not None
+    assert row["is_gap"] == 1
+    s.close()
+
+
+def test_upsert_post_ets_only_bumps(tmp_path: Path) -> None:
+    """A later upsert that omits ``ets`` (or carries an older value)
+    must not clear or regress an already-observed reaction baseline."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(22, True)
+    s.upsert_post(22, {"ts": 700, "fc": "M0FOO", "p": "x", "ets": 5_000})
+    s.upsert_post(22, {"ts": 700, "fc": "M0FOO", "p": "x"})
+    s.upsert_post(22, {"ts": 700, "fc": "M0FOO", "p": "x", "ets": 1_000})
+    row = s.lookup_post(22, 700)
+    assert row is not None
+    assert row["ets"] == 5_000
+    s.close()
+
+
+def test_post_emoji_upsert_bumps_post_ets(tmp_path: Path) -> None:
+    """``upsert_post_emoji`` must bump ``posts.ets`` so the per-channel
+    ``le`` floor reflects observed reactions even when the post was
+    originally inserted without an ets value (e.g. real-time `cp`
+    that predates any reaction)."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(30, True)
+    s.upsert_post(30, {"ts": 800, "fc": "M0FOO", "p": "x"})
+    s.upsert_post_emoji(30, 800, "1f44d", "M1ABC", 1_700_000_500)
+    row = s.lookup_post(30, 800)
+    assert row is not None
+    assert row["ets"] == 1_700_000_500
+    s.close()
+
+
+def test_post_emoji_batch_bumps_post_ets(tmp_path: Path) -> None:
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(31, True)
+    s.upsert_post(31, {"ts": 900, "fc": "M0FOO", "p": "x"})
+    s.apply_post_emoji_batch(
+        31,
+        900,
+        [{"e": "1f44d", "c": ["M1ABC"]}],
+        1_700_000_900,
+    )
+    row = s.lookup_post(31, 900)
+    assert row is not None
+    assert row["ets"] == 1_700_000_900
+    s.close()
+
+
+def test_schema_migration_adds_is_gap_and_ets_to_pre_existing_posts(
+    tmp_path: Path,
+) -> None:
+    """Old dbs predate the gap-handling columns. Re-opening such a db
+    must add ``is_gap`` and ``ets`` via ALTER, without disturbing
+    pre-existing rows."""
+    path = tmp_path / "state.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE posts (
+            channel_id INTEGER NOT NULL,
+            ts INTEGER NOT NULL,
+            from_call TEXT NOT NULL,
+            body TEXT NOT NULL,
+            edit_ts INTEGER,
+            reply_ts INTEGER,
+            reply_from TEXT,
+            received_ts INTEGER,
+            realtime INTEGER,
+            delivered_ts INTEGER,
+            PRIMARY KEY (channel_id, ts)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO posts(channel_id, ts, from_call, body) VALUES (?, ?, ?, ?)",
+        (40, 1_000, "M0FOO", "legacy"),
+    )
+    conn.commit()
+    conn.close()
+
+    s = SqliteStore(path)
+    cols = {r["name"] for r in s._conn.execute("PRAGMA table_info(posts)")}
+    assert "is_gap" in cols
+    assert "ets" in cols
+    row = s.lookup_post(40, 1_000)
+    assert row is not None
+    assert row["body"] == "legacy"
+    assert row["is_gap"] == 0  # default for legacy rows
+    assert row["ets"] is None
+    s.close()

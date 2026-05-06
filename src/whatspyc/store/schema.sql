@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS posts (
     from_call    TEXT NOT NULL,
     body         TEXT NOT NULL,
     edit_ts      INTEGER,
+    -- post-level emoji timestamp from the wire. The server bumps this
+    -- whenever a reaction lands on the post; cpb posts carry the current
+    -- value. Feeds the per-channel `le` floor in the connect record.
+    ets          INTEGER,
     reply_ts     INTEGER,
     reply_from   TEXT,
     -- local clock (ms) at first insert from the wire. NULL on rows we
@@ -74,6 +78,12 @@ CREATE TABLE IF NOT EXISTS posts (
     -- server-side `dts` from the `cpr` ack (or local clock fallback).
     -- NULL if not yet acked / not our row.
     delivered_ts INTEGER,
+    -- 1 when the wire `g` flag was set on this post (first post after a
+    -- paged-subscribe gap, per CHANNELS.md). Sticky once set. Drives the
+    -- gap-aware `led`/`le` floor in the connect record so the server
+    -- doesn't replay edits/reactions whose target posts fell into the
+    -- gap and will never arrive.
+    is_gap       INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (channel_id, ts)
 );
 
