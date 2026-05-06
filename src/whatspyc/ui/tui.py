@@ -1114,8 +1114,10 @@ class SubscribeModal(ModalScreen[int | None]):
     the default.
 
     Dismiss values:
-    - ``None``     — user said no at the confirm stage; the caller should
-                     leave the centre pane on its previous target.
+    - ``None``     — user cancelled. May have been at the confirm stage
+                     (no cs yet sent) or after the ack landed; check
+                     ``self.subscribed_on_server`` to tell. The caller
+                     undoes a completed subscribe with ``cs s=0``.
     - ``int >= 0`` — user is now subscribed; the caller should switch
                      centre to the channel and, if ``> 0``, fire
                      ``request_post_batch(cid, n)``.
@@ -1155,6 +1157,10 @@ class SubscribeModal(ModalScreen[int | None]):
         self._stage = "confirm"
         self._pc = 0
         self._default = 0
+        # Set True once the server's ``cs`` ack lands. The caller reads
+        # this after dismissal to decide whether a cancel needs to send
+        # a follow-up ``cs s=0`` to undo the subscription.
+        self.subscribed_on_server = False
 
     def compose(self) -> ComposeResult:
         # The count-stage Input is mounted on demand in `_do_subscribe`.
@@ -1188,12 +1194,11 @@ class SubscribeModal(ModalScreen[int | None]):
             self.dismiss(None)
 
     def action_cancel(self) -> None:
-        # At the count stage the subscribe RPC has already landed; honour
-        # that with the default count rather than throwing it away.
-        if self._stage == "count":
-            self.dismiss(self._default)
-        else:
-            self.dismiss(None)
+        # Esc cancels at every stage. If we already got past the cs ack
+        # (``subscribed_on_server == True``), the caller will send
+        # ``cs s=0`` to undo. Use Enter (with empty / numeric input) to
+        # *keep* the subscription.
+        self.dismiss(None)
 
     async def _do_subscribe(self) -> None:
         self._stage = "subscribing"
@@ -1217,6 +1222,9 @@ class SubscribeModal(ModalScreen[int | None]):
             self.query_one("#sub-hint", Static).update("[dim]Esc to close[/]")
             self._stage = "error"
             return
+        # The server has accepted ``cs s=1`` — we're subscribed
+        # regardless of what the user does next.
+        self.subscribed_on_server = True
         self._pc = int(pc) if pc else 0
         if self._pc <= 0:
             # No history available — close right away and let the caller
@@ -1230,7 +1238,7 @@ class SubscribeModal(ModalScreen[int | None]):
             f"How many of the {self._pc} historic posts to fetch?"
         )
         self.query_one("#sub-hint", Static).update(
-            f"[dim]Enter to fetch (default {self._default}); Esc to skip[/]"
+            f"[dim]Enter to fetch (default {self._default}); Esc to cancel[/]"
         )
         pane = self.query_one("#sub-pane", Vertical)
         inp = Input(id="sub-input", placeholder=f"default {self._default}")
@@ -2926,16 +2934,23 @@ class _WhatspycApp(App):
             return min(c.auto_backfill_post_count or 10, pc)
 
         async def _run() -> None:
-            result = await self.push_screen_wait(
-                SubscribeModal(
-                    channel_ref=self._channel_ref(cid),
-                    on_confirm=on_confirm,
-                    default_count_for=default_count_for,
-                    skip_confirm=skip_confirm,
-                )
+            modal = SubscribeModal(
+                channel_ref=self._channel_ref(cid),
+                on_confirm=on_confirm,
+                default_count_for=default_count_for,
+                skip_confirm=skip_confirm,
             )
+            result = await self.push_screen_wait(modal)
             if result is None:
-                # User declined — leave centre pane / target untouched.
+                # User cancelled. ``subscribe_and_wait`` has already done
+                # the cs round-trip if we got past the confirm stage, so
+                # the server (and the local store, via
+                # ``_on_subscribe_ack``) consider us subscribed. Undo.
+                if modal.subscribed_on_server:
+                    try:
+                        await c.unsubscribe(cid)
+                    except Exception as exc:
+                        self._status_error(f"[red][unsubscribe][/] {exc}")
                 return
             # Switch the centre pane to the new channel BEFORE requesting
             # the post batch. The cpb response races with the switch — if

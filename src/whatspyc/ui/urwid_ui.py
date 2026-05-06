@@ -972,12 +972,18 @@ class SubscribeModal(_Modal):
         self._pc: int = 0
         self._count_input: urwid.Edit | None = None
         self._body_pile: urwid.Pile | None = None
+        # Set True once the server's ``cs`` ack lands (i.e. we are now
+        # subscribed on the server side). The caller reads this after
+        # the modal dismisses to decide whether a cancel needs to send
+        # an undo ``cs s=0``.
+        self.subscribed_on_server = False
+        self.kickoff_task: asyncio.Task | None = None
 
     def build(self) -> urwid.Widget:
         self._body_pile = urwid.Pile([])
         self._render_stage()
         if self._skip_confirm:
-            asyncio.create_task(self._kick_off_subscribe())
+            self.kickoff_task = asyncio.create_task(self._kick_off_subscribe())
         return urwid.Filler(self._body_pile, valign="top")
 
     def _render_stage(self) -> None:
@@ -1044,6 +1050,10 @@ class SubscribeModal(_Modal):
             self._stage = "error"
             self._render_stage()
             return
+        # The server has now accepted our ``cs s=1`` — we're subscribed
+        # regardless of what happens to the modal. The caller uses this
+        # to undo the subscription if the user cancels the count prompt.
+        self.subscribed_on_server = True
         self._stage = "count"
         self._render_stage()
         if self._app is not None and self._app._loop is not None:
@@ -1057,7 +1067,7 @@ class SubscribeModal(_Modal):
             if key in ("y", "Y"):
                 self._stage = "subscribing"
                 self._render_stage()
-                asyncio.create_task(self._kick_off_subscribe())
+                self.kickoff_task = asyncio.create_task(self._kick_off_subscribe())
                 return None
             if key in ("n", "N"):
                 self.dismiss(None)
@@ -2733,6 +2743,26 @@ class _UrwidApp:
         async def _wait() -> None:
             n = await self._show_modal(modal)
             if n is None:
+                # User pressed Esc. ``subscribe_and_wait`` does the cs
+                # round-trip during the ``subscribing`` stage, so by the
+                # time the count prompt appears we are already
+                # subscribed on the server (and the local store has
+                # been updated by ``_on_subscribe_ack``). Honour the
+                # cancel by undoing the subscription. If the cancel
+                # came mid-flight, give the kickoff task a chance to
+                # finish so we know whether the ack landed.
+                if modal.kickoff_task is not None and not modal.kickoff_task.done():
+                    try:
+                        await modal.kickoff_task
+                    except Exception:
+                        pass
+                if modal.subscribed_on_server:
+                    try:
+                        await client.unsubscribe(cid)
+                    except Exception as e:
+                        self._status_error(("red", f"[unsubscribe] {e}"))
+                    self._invalidate_subscribed_cids()
+                    self._refresh_target_label(target)
                 return
             self._invalidate_subscribed_cids()
             self._refresh_target_label(target)
