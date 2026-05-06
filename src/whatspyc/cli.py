@@ -542,7 +542,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
     client = WpsClient(
         _no_stream,
         store,
-        my_call=c.my_call,  # type: ignore[arg-type]
+        my_call=c.app_call,  # type: ignore[arg-type]
         name=c.name,
         on_event=None,
         connect_script=[],
@@ -561,7 +561,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
     if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]
             client,
-            my_call=c.my_call,
+            my_call=c.app_call,
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
@@ -571,7 +571,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
     elif c.ui == "urwid":
         ui = UrwidUI(  # type: ignore[arg-type]
             client,
-            my_call=c.my_call,
+            my_call=c.app_call,
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
@@ -580,7 +580,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
     else:
         ui = LineUI(  # type: ignore[arg-type]
             client,
-            my_call=c.my_call,
+            my_call=c.app_call,
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
@@ -618,7 +618,7 @@ async def _connect_and_run_ui(
     client = WpsClient(
         lambda: _build_stream_for(profile, c.my_call),  # type: ignore[arg-type]
         store,
-        my_call=c.my_call,  # type: ignore[arg-type]
+        my_call=c.app_call,  # type: ignore[arg-type]
         name=c.name,
         on_event=event_hook,
         connect_script=profile.connect_script,
@@ -638,7 +638,7 @@ async def _connect_and_run_ui(
     if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]
             client,
-            my_call=c.my_call,
+            my_call=c.app_call,
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
@@ -647,7 +647,7 @@ async def _connect_and_run_ui(
     elif c.ui == "urwid":
         ui = UrwidUI(  # type: ignore[arg-type]
             client,
-            my_call=c.my_call,
+            my_call=c.app_call,
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
@@ -655,7 +655,7 @@ async def _connect_and_run_ui(
     else:
         ui = LineUI(  # type: ignore[arg-type]
             client,
-            my_call=c.my_call,
+            my_call=c.app_call,
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,

@@ -220,6 +220,24 @@ class Config:
             f"{[p.name for p in self.connect_profiles] or 'none'}"
         )
 
+    @property
+    def app_call(self) -> str | None:
+        """Bare callsign (SSID stripped) for use at the WPS application layer.
+
+        Users may put an SSID-bearing call (``2E0HKD-2``) in ``my_call`` so
+        AX.25 / RHP gets a proper source address, but the WPS server itself
+        strips the SSID after reading the ``<CALL>\\r\\n`` handshake line
+        (``wps/wps.py:1742-1746``) — so the user's identity inside WPS is
+        always bare. Mirror that here: ``my_call`` stays as the user wrote
+        it (and gets handed to the RHP ``local`` field), while every WPS-
+        layer site (the connect record's ``c``, outbound ``fc``/``tc``,
+        reaction attribution, self-callsign comparisons in the UIs) reads
+        ``app_call`` instead.
+        """
+        if self.my_call is None:
+            return None
+        return self.my_call.split("-", 1)[0].upper()
+
 
 def _default_state_dir() -> Path:
     base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")

@@ -117,6 +117,21 @@ def test_empty_config_yields_defaults() -> None:
     assert c.default_profile is None
     assert c.my_call is None
     assert c.name is None
+    assert c.app_call is None
+
+
+def test_app_call_strips_ssid() -> None:
+    """``app_call`` is the bare callsign WPS sees after its own SSID-strip
+    (``wps/wps.py:1742-1746``); ``my_call`` keeps the SSID for RHP."""
+    c = cfg_mod.Config(my_call="2E0HKD-2")
+    assert c.my_call == "2E0HKD-2"
+    assert c.app_call == "2E0HKD"
+
+    c = cfg_mod.Config(my_call="m0abc")
+    assert c.app_call == "M0ABC"
+
+    c = cfg_mod.Config(my_call="M0ABC")
+    assert c.app_call == "M0ABC"
 
 
 def test_default_port_unchanged() -> None:

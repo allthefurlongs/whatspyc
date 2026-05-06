@@ -152,7 +152,7 @@ top level is rejected at config-load time.
 
 | config key | CLI flag | type | default | meaning |
 | --- | --- | --- | --- | --- |
-| `my_call` | `--my-call` | string | *(required)* | Your callsign — `BASE[-SSID]`, base must be 1–6 alphanumerics including at least one digit, SSID 0–15. The server strips the SSID before storing. **Required**, in either the file or via the flag. |
+| `my_call` | `--my-call` | string | *(required)* | Your callsign — `BASE[-SSID]`, base must be 1–6 alphanumerics including at least one digit, SSID 0–15. The SSID is used as the AX.25 source for the RHP link, but stripped before anything inside the WPS application layer (connect record, message `fc`/`tc`, reaction attribution, self-call comparisons), matching the server's own SSID-strip on the callsign-line handshake. **Required**, in either the file or via the flag. |
 | `name` | `--name` | string | *(required)* | Display name in the type-`c` connect record. **Required**, in either the file or via the flag. |
 | `ui` | `--ui` | string | `"line"` | One of `"line"` (prompt_toolkit single-line REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. The legacy value `"tui"` was renamed to `"textual"` when the urwid backend was added; the parser refuses the old value with a migration error. |
 | `state_dir` | `--state-dir` | path | `$XDG_DATA_HOME/whatspyc` (i.e. `~/.local/share/whatspyc`) | Directory holding `state.sqlite3`. Created if missing. |
