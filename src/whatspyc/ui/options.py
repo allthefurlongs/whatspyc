@@ -43,6 +43,17 @@ def _parse_positive_int(raw: str) -> int:
     return v
 
 
+def _parse_nonneg_int(raw: str) -> int:
+    s = raw.strip()
+    try:
+        v = int(s)
+    except ValueError:
+        raise ValueError(f"expected a non-negative integer, got {raw!r}") from None
+    if v < 0:
+        raise ValueError(f"expected a non-negative integer, got {raw!r}")
+    return v
+
+
 def _format_int(v: int) -> str:
     return str(v)
 
@@ -90,6 +101,17 @@ _SPECS: dict[str, _OptionSpec] = {
         parse=_parse_positive_int,
         format=_format_int,
     ),
+    "tui_emoji_search_debounce_ms": _OptionSpec(
+        name="tui_emoji_search_debounce_ms",
+        description=(
+            "Milliseconds to wait after the last keystroke before "
+            "rebuilding the EmojiPrompt grid. 0 = rebuild on every "
+            "keystroke (historic behaviour). Higher values smooth "
+            "typing on slow hardware."
+        ),
+        parse=_parse_nonneg_int,
+        format=_format_int,
+    ),
 }
 
 
@@ -108,11 +130,13 @@ class SessionOptions:
         show_edits: bool = True,
         verbose_history: bool = False,
         delivery_timeout_s: int = 60,
+        tui_emoji_search_debounce_ms: int = 200,
     ) -> None:
         self.show_acks = show_acks
         self.show_edits = show_edits
         self.verbose_history = verbose_history
         self.delivery_timeout_s = delivery_timeout_s
+        self.tui_emoji_search_debounce_ms = tui_emoji_search_debounce_ms
 
     @classmethod
     def names(cls) -> list[str]:

@@ -754,3 +754,109 @@ def test_non_rhp_transport_does_not_require_engine() -> None:
     p = cfg_mod.parse(raw).resolve_profile("fake")
     assert p.engine is None
     assert p.port == 63001  # direct-tcp default still applied
+
+
+# ----------------------------------------------------------------------
+# TUI performance knobs (low_power_mode and tui_* keys)
+# ----------------------------------------------------------------------
+
+
+def test_tui_perf_defaults() -> None:
+    """A barebones config has all the perf knobs at their dataclass defaults."""
+    c = cfg_mod.parse({})
+    assert c.low_power_mode is False
+    assert c.tui_fps == 60
+    assert c.tui_animations is True
+    assert c.tui_smooth_scroll is True
+    assert c.tui_show_clock is True
+    assert c.tui_emoji_search_debounce_ms == 200
+
+
+def test_tui_fps_validation() -> None:
+    c = cfg_mod.parse({"tui_fps": 1})
+    assert c.tui_fps == 1
+    c = cfg_mod.parse({"tui_fps": 60})
+    assert c.tui_fps == 60
+    c = cfg_mod.parse({"tui_fps": 30})
+    assert c.tui_fps == 30
+
+    with pytest.raises(ValueError, match="tui_fps"):
+        cfg_mod.parse({"tui_fps": 0})
+    with pytest.raises(ValueError, match="tui_fps"):
+        cfg_mod.parse({"tui_fps": 61})
+    with pytest.raises(ValueError, match="tui_fps"):
+        cfg_mod.parse({"tui_fps": True})
+    with pytest.raises(ValueError, match="tui_fps"):
+        cfg_mod.parse({"tui_fps": "high"})
+
+
+def test_tui_animations_and_smooth_scroll_validation() -> None:
+    c = cfg_mod.parse({"tui_animations": False, "tui_smooth_scroll": False})
+    assert c.tui_animations is False
+    assert c.tui_smooth_scroll is False
+    with pytest.raises(ValueError, match="tui_animations"):
+        cfg_mod.parse({"tui_animations": "off"})
+    with pytest.raises(ValueError, match="tui_smooth_scroll"):
+        cfg_mod.parse({"tui_smooth_scroll": 1})
+
+
+def test_tui_show_clock_validation() -> None:
+    c = cfg_mod.parse({"tui_show_clock": False})
+    assert c.tui_show_clock is False
+    with pytest.raises(ValueError, match="tui_show_clock"):
+        cfg_mod.parse({"tui_show_clock": "no"})
+
+
+def test_tui_emoji_search_debounce_ms_validation() -> None:
+    # 0 is allowed (means: rebuild on every keystroke).
+    c = cfg_mod.parse({"tui_emoji_search_debounce_ms": 0})
+    assert c.tui_emoji_search_debounce_ms == 0
+    c = cfg_mod.parse({"tui_emoji_search_debounce_ms": 2000})
+    assert c.tui_emoji_search_debounce_ms == 2000
+
+    with pytest.raises(ValueError, match="tui_emoji_search_debounce_ms"):
+        cfg_mod.parse({"tui_emoji_search_debounce_ms": -1})
+    with pytest.raises(ValueError, match="tui_emoji_search_debounce_ms"):
+        cfg_mod.parse({"tui_emoji_search_debounce_ms": 2001})
+    with pytest.raises(ValueError, match="tui_emoji_search_debounce_ms"):
+        cfg_mod.parse({"tui_emoji_search_debounce_ms": True})
+
+
+def test_low_power_mode_preset_fills_in_defaults() -> None:
+    """``low_power_mode = true`` with no other knobs gives the bundled preset."""
+    c = cfg_mod.parse({"low_power_mode": True})
+    assert c.low_power_mode is True
+    assert c.tui_fps == 15
+    assert c.tui_animations is False
+    assert c.tui_smooth_scroll is False
+    assert c.tui_show_clock is False
+    assert c.tui_emoji_search_debounce_ms == 300
+
+
+def test_low_power_mode_preset_user_pin_wins() -> None:
+    """An explicit per-knob value beats the preset for that key only."""
+    c = cfg_mod.parse({"low_power_mode": True, "tui_fps": 30})
+    assert c.low_power_mode is True
+    assert c.tui_fps == 30  # user-pinned, not 15
+    # Other knobs follow the preset since the user didn't pin them.
+    assert c.tui_animations is False
+    assert c.tui_smooth_scroll is False
+    assert c.tui_show_clock is False
+    assert c.tui_emoji_search_debounce_ms == 300
+
+
+def test_low_power_mode_off_does_not_override() -> None:
+    """``low_power_mode = false`` (default) leaves all knobs at their defaults."""
+    c = cfg_mod.parse({"low_power_mode": False})
+    assert c.tui_fps == 60
+    assert c.tui_animations is True
+    assert c.tui_smooth_scroll is True
+    assert c.tui_show_clock is True
+    assert c.tui_emoji_search_debounce_ms == 200
+
+
+def test_low_power_mode_validation() -> None:
+    with pytest.raises(ValueError, match="low_power_mode"):
+        cfg_mod.parse({"low_power_mode": "yes"})
+    with pytest.raises(ValueError, match="low_power_mode"):
+        cfg_mod.parse({"low_power_mode": 1})

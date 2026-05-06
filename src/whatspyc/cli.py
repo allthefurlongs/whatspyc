@@ -35,6 +35,27 @@ from whatspyc.wps.connect_seq import ConnectSequence
 from whatspyc.wps.hop_script import HopScriptError, HopStep
 
 
+def _apply_tui_perf_env(c: cfg_mod.Config) -> None:
+    """Translate ``tui_*`` config keys into Textual env vars.
+
+    Textual reads ``TEXTUAL_FPS`` / ``TEXTUAL_ANIMATIONS`` /
+    ``TEXTUAL_SMOOTH_SCROLL`` once during ``App.__init__``, so we have
+    to set them before any Textual code runs (i.e. before ``run_async``
+    or even ``App()``). Caller is responsible for only invoking this
+    when the effective UI is the TUI.
+
+    ``os.environ.setdefault`` so a power user's shell-set value still
+    wins over the config — the config knob is the "if I haven't set it
+    in my shell" default.
+    """
+    if c.tui_fps != 60:
+        os.environ.setdefault("TEXTUAL_FPS", str(c.tui_fps))
+    if not c.tui_animations:
+        os.environ.setdefault("TEXTUAL_ANIMATIONS", "0")
+    if not c.tui_smooth_scroll:
+        os.environ.setdefault("TEXTUAL_SMOOTH_SCROLL", "0")
+
+
 # Sentinel profile that means "don't connect, just browse the local store".
 # Surfaced as picker entry 0 and recognised throughout the run path. Angle
 # brackets keep the name from colliding with anything a user might write
@@ -397,6 +418,11 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
         raise click.UsageError("--my-call is required (or set in ~/.config/whatspyc/config.toml)")
     if not c.name:
         raise click.UsageError("--name is required (or set in ~/.config/whatspyc/config.toml)")
+    # Translate TUI perf config keys into TEXTUAL_* env vars before any
+    # Textual code runs. Skipped for the line UI — those env vars only
+    # affect Textual's driver.
+    if effective_ui == "tui":
+        _apply_tui_perf_env(c)
 
     digi_list: list[str] | None = None
     if digipeaters is not None:
@@ -607,6 +633,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
         show_edits=c.show_edits,
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
+        tui_emoji_search_debounce_ms=c.tui_emoji_search_debounce_ms,
     )
     if c.ui == "tui":
         ui = TextualUI(  # type: ignore[arg-type]
@@ -616,6 +643,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
             history_backfill=c.history_backfill,
             options=options,
             offline=True,
+            show_clock=c.tui_show_clock,
         )
     else:
         ui = LineUI(  # type: ignore[arg-type]
@@ -673,6 +701,7 @@ async def _connect_and_run_ui(
         show_edits=c.show_edits,
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
+        tui_emoji_search_debounce_ms=c.tui_emoji_search_debounce_ms,
     )
     if c.ui == "tui":
         ui = TextualUI(  # type: ignore[arg-type]
@@ -681,6 +710,7 @@ async def _connect_and_run_ui(
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
+            show_clock=c.tui_show_clock,
         )
     else:
         ui = LineUI(  # type: ignore[arg-type]

@@ -175,6 +175,37 @@ class Config:
     # of ``log_file`` — both can be active. ``"pane"`` with a line UI is
     # incoherent and the CLI refuses to start.
     log_console: str = "auto"
+    # ----- TUI performance knobs -----
+    # Bundled "run on slow hardware" preset. When ``True`` and the
+    # individual ``tui_*`` knobs below are still at their dataclass
+    # defaults, ``resolve_low_power_defaults`` overrides them with a
+    # documented preset (15 FPS, no animations, no smooth scroll, no
+    # header clock, longer emoji-search debounce). Per-knob explicit
+    # settings always win — the preset only fills in what the user
+    # didn't already pin.
+    low_power_mode: bool = False
+    # Frame-rate cap for the Textual driver. Threaded into
+    # ``TEXTUAL_FPS`` env var before ``App.run`` so it must be set in
+    # config (or via shell env), not at runtime — Textual reads the
+    # var once during ``App.__init__``.
+    tui_fps: int = 60
+    # Disable Textual's animations (``TEXTUAL_ANIMATIONS=0``). Saves
+    # cycles on slow terminals where the easing transitions look
+    # janky anyway.
+    tui_animations: bool = True
+    # Disable sub-cell smooth scrolling (``TEXTUAL_SMOOTH_SCROLL=0``).
+    # Restart-required.
+    tui_smooth_scroll: bool = True
+    # Show the live clock in the Textual ``Header`` widget. The clock
+    # ticks once a second, which on slow hardware produces a visible
+    # compositor wake; turning it off gives the app one fewer reason
+    # to redraw at idle.
+    tui_show_clock: bool = True
+    # Coalesce EmojiPrompt search re-renders: wait this many ms after
+    # the last keystroke before rebuilding the grid. ``0`` keeps the
+    # historic per-keystroke behaviour. Session-mutable via
+    # ``/set tui_emoji_search_debounce_ms``.
+    tui_emoji_search_debounce_ms: int = 200
     connect_profiles: list[ConnectProfile] = field(default_factory=list)
     channels: list[ChannelInfo] = field(default_factory=list)
 
@@ -378,6 +409,60 @@ def parse(raw: dict) -> Config:
             )
         cfg.log_console = v
 
+    # ----- TUI performance knobs -----
+    # Track which of these the user explicitly set so the
+    # low_power_mode preset only fills in the rest.
+    perf_user_supplied: set[str] = set()
+    if "low_power_mode" in raw:
+        v = raw["low_power_mode"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"config: low_power_mode must be a boolean, got {v!r}"
+            )
+        cfg.low_power_mode = v
+    if "tui_fps" in raw:
+        v = raw["tui_fps"]
+        if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 60:
+            raise ValueError(
+                f"config: tui_fps must be an integer in [1, 60], got {v!r}"
+            )
+        cfg.tui_fps = v
+        perf_user_supplied.add("tui_fps")
+    if "tui_animations" in raw:
+        v = raw["tui_animations"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"config: tui_animations must be a boolean, got {v!r}"
+            )
+        cfg.tui_animations = v
+        perf_user_supplied.add("tui_animations")
+    if "tui_smooth_scroll" in raw:
+        v = raw["tui_smooth_scroll"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"config: tui_smooth_scroll must be a boolean, got {v!r}"
+            )
+        cfg.tui_smooth_scroll = v
+        perf_user_supplied.add("tui_smooth_scroll")
+    if "tui_show_clock" in raw:
+        v = raw["tui_show_clock"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"config: tui_show_clock must be a boolean, got {v!r}"
+            )
+        cfg.tui_show_clock = v
+        perf_user_supplied.add("tui_show_clock")
+    if "tui_emoji_search_debounce_ms" in raw:
+        v = raw["tui_emoji_search_debounce_ms"]
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 2000:
+            raise ValueError(
+                "config: tui_emoji_search_debounce_ms must be an integer "
+                f"in [0, 2000], got {v!r}"
+            )
+        cfg.tui_emoji_search_debounce_ms = v
+        perf_user_supplied.add("tui_emoji_search_debounce_ms")
+    resolve_low_power_defaults(cfg, perf_user_supplied)
+
     if "channels" in raw:
         raise ValueError(
             "config: [[channels]] now lives in its own file at "
@@ -444,6 +529,31 @@ def _parse_profile(entry: dict) -> ConnectProfile:
         user_supplied.add("connect_script")
     resolve_engine_defaults(p, user_supplied)
     return p
+
+
+def resolve_low_power_defaults(cfg: Config, user_supplied: set[str]) -> None:
+    """Apply the ``low_power_mode`` preset in place.
+
+    When ``cfg.low_power_mode`` is ``True``, override each of the
+    ``tui_*`` performance knobs the user did **not** explicitly set
+    with a preset tuned for slow hardware. The convention mirrors
+    ``resolve_engine_defaults`` — ``user_supplied`` carries the
+    keys the caller already pinned, and we never overwrite those.
+
+    No-op when ``low_power_mode`` is ``False``.
+    """
+    if not cfg.low_power_mode:
+        return
+    if "tui_fps" not in user_supplied:
+        cfg.tui_fps = 15
+    if "tui_animations" not in user_supplied:
+        cfg.tui_animations = False
+    if "tui_smooth_scroll" not in user_supplied:
+        cfg.tui_smooth_scroll = False
+    if "tui_show_clock" not in user_supplied:
+        cfg.tui_show_clock = False
+    if "tui_emoji_search_debounce_ms" not in user_supplied:
+        cfg.tui_emoji_search_debounce_ms = 300
 
 
 def resolve_engine_defaults(p: ConnectProfile, user_supplied: set[str]) -> None:

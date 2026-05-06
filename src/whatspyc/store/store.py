@@ -354,6 +354,41 @@ class SqliteStore:
         )
         return [dict(r) for r in cur.fetchall()]
 
+    def list_message_emojis_for_ids(
+        self, msg_ids: list[str]
+    ) -> dict[str, list[dict]]:
+        """Bulk variant of :meth:`list_message_emojis`.
+
+        Returns a dict keyed by ``msg_id``; ids with no reactions are
+        absent (callers must default to ``[]``). One SQL round trip
+        replaces N — meaningful when seeding a freshly-mounted message
+        ListView with the configured backfill count, since otherwise
+        every visible row triggers its own query.
+        """
+        if not msg_ids:
+            return {}
+        # Dedup while preserving order to keep placeholder count = ids.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for mid in msg_ids:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            unique.append(mid)
+        placeholders = ",".join("?" for _ in unique)
+        cur = self._conn.execute(
+            "SELECT msg_id, emoji, callsign, emoji_ts FROM message_emojis"
+            f" WHERE msg_id IN ({placeholders})"
+            " ORDER BY emoji_ts ASC, emoji ASC",
+            tuple(unique),
+        )
+        out: dict[str, list[dict]] = {}
+        for row in cur.fetchall():
+            d = dict(row)
+            mid = d.pop("msg_id")
+            out.setdefault(mid, []).append(d)
+        return out
+
     def list_dm_peers(self, my_call: str) -> list[dict]:
         """Return distinct DM peers ordered by most recent message.
 
@@ -620,6 +655,40 @@ class SqliteStore:
             (int(channel_id), int(ts)),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def list_post_emojis_for_keys(
+        self, channel_id: int, ts_list: list[int]
+    ) -> dict[int, list[dict]]:
+        """Bulk variant of :meth:`list_post_emojis` for one channel.
+
+        Returns a dict keyed by post ``ts``; entries with no reactions
+        are absent. Callers must default missing keys to ``[]``. Used by
+        the TUI's initial backfill to avoid one SQLite round trip per
+        post in a freshly-mounted channel view.
+        """
+        if not ts_list:
+            return {}
+        seen: set[int] = set()
+        unique: list[int] = []
+        for t in ts_list:
+            i = int(t)
+            if i in seen:
+                continue
+            seen.add(i)
+            unique.append(i)
+        placeholders = ",".join("?" for _ in unique)
+        cur = self._conn.execute(
+            "SELECT ts, emoji, callsign, emoji_ts FROM post_emojis"
+            f" WHERE channel_id = ? AND ts IN ({placeholders})"
+            " ORDER BY emoji_ts ASC, callsign ASC, emoji ASC",
+            (int(channel_id), *unique),
+        )
+        out: dict[int, list[dict]] = {}
+        for row in cur.fetchall():
+            d = dict(row)
+            ts_val = int(d.pop("ts"))
+            out.setdefault(ts_val, []).append(d)
+        return out
 
     def lookup_post_by_from_ts(self, from_call: str, ts: int) -> dict | None:
         """Return the post row keyed by ``(from_call, ts)``, or None.

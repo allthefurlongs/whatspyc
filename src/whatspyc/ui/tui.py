@@ -87,6 +87,7 @@ class TextualUI:
         history_backfill: int = 3,
         options: SessionOptions | None = None,
         offline: bool = False,
+        show_clock: bool = True,
     ) -> None:
         self._client = client
         self._my_call = my_call.upper()
@@ -94,6 +95,7 @@ class TextualUI:
         self._history_backfill = max(0, int(history_backfill))
         self._options = options or SessionOptions()
         self._offline = offline
+        self._show_clock = show_clock
         self._target: TargetKey | None = None
         self._pending: list[dict] = []
         self._app: _WhatspycApp | None = None
@@ -335,6 +337,12 @@ class MessageRow(ListItem):
         # handlers. The outbound react path writes through to the
         # store first, then refreshes this from the store.
         self.reactions: list[dict] = list(reactions or [])
+        # Cache key over inputs to ``_render_row`` so back-to-back
+        # ``refresh_label`` calls with no observable change skip the
+        # markup build + ``Static.update``. Ack flurries and the
+        # post-reaction-batch handler hit this path repeatedly with
+        # the same fields. ``None`` forces the first refresh through.
+        self._render_key: tuple | None = None
 
     def refresh_label(
         self,
@@ -344,6 +352,39 @@ class MessageRow(ListItem):
         ham_name: Callable[[str | None], str | None],
         delivery_timeout_s: int,
     ) -> None:
+        # Verbose-mode delivery status depends on wall-clock time
+        # (the "Delivering... → NOT DELIVERED" flip) for outbound
+        # rows we haven't seen an ack for. Including ``time.time()``
+        # in the cache key would defeat the cache; instead, mark
+        # those rows as uncacheable so the next refresh always
+        # re-evaluates the threshold.
+        is_pending_outbound = (
+            verbose
+            and (self.from_call or "").upper() == my_call
+            and self.delivered_ts is None
+            and self.ts is not None
+        )
+        if is_pending_outbound:
+            key: tuple | None = None
+        else:
+            key = (
+                self.body,
+                self.ts,
+                self.edit_ts,
+                self.delivered_ts,
+                self.received_ts,
+                self.realtime,
+                self.lid,
+                verbose,
+                my_call,
+                delivery_timeout_s,
+                tuple(
+                    (r.get("emoji"), r.get("callsign"))
+                    for r in self.reactions
+                ),
+            )
+            if key == self._render_key:
+                return
         text = _render_row(
             kind=self.kind,
             from_call=self.from_call,
@@ -360,6 +401,7 @@ class MessageRow(ListItem):
             delivery_timeout_s=delivery_timeout_s,
             reactions=self.reactions,
         )
+        self._render_key = key
         self._static.update(text)
 
 
@@ -542,6 +584,18 @@ class _EmojiButton(Button):
         super().__init__(char, id=f"emoji-btn-{idx}")
         self.emoji: str = char
 
+    def set_emoji(self, char: str) -> None:
+        """Mutate the button's emoji + label in place.
+
+        Used by EmojiPrompt's grid update path: when a search refinement
+        produces the same number of results, we update the existing
+        buttons' contents instead of unmounting the entire grid and
+        mounting a fresh batch (the original behaviour, which spent
+        most of its time in mount/unmount on slow hardware).
+        """
+        self.emoji = char
+        self.label = char
+
 
 def _slug(s: str) -> str:
     """Stable Textual id from a CLDR subgroup name (alnum + dashes)."""
@@ -623,7 +677,7 @@ class EmojiPrompt(ModalScreen[str | None]):
     }
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, debounce_ms: int = 0) -> None:
         super().__init__()
         # Active "view" — what the grid currently shows. Drives _render.
         # The subgroup tab id (when in People & Body), else "" for the
@@ -633,6 +687,14 @@ class EmojiPrompt(ModalScreen[str | None]):
         self._search_active: bool = False
         # Cache the buttons currently mounted, in DOM order.
         self._grid_buttons: list[_EmojiButton] = []
+        # ms to wait after the last keystroke before re-rendering the
+        # grid for a search update. 0 keeps the historic per-keystroke
+        # behaviour. Tab clicks bypass this — they're a single user
+        # gesture, not a stream of events.
+        self._debounce_ms: int = max(0, debounce_ms)
+        # Active debounce timer (Textual ``Timer``). Stopped + replaced
+        # by each keystroke; cleared when the timer fires.
+        self._render_timer: Any = None
 
     # ------------------------------------------------------------------
     # Compose / mount
@@ -696,12 +758,24 @@ class EmojiPrompt(ModalScreen[str | None]):
     async def _render_view(self) -> None:
         chars = self._entries_for_view()
         grid = self.query_one("#emoji-grid", Grid)
-        # Drop existing buttons and mount a fresh batch in CLDR order.
-        await grid.remove_children()
-        new_buttons = [_EmojiButton(c, i) for i, c in enumerate(chars)]
-        if new_buttons:
-            await grid.mount(*new_buttons)
-        self._grid_buttons = new_buttons
+        existing = self._grid_buttons
+        # Fast path: same number of buttons → mutate labels in place
+        # instead of unmounting + remounting the entire grid. The
+        # original code path (and the slow path below) take the unmount/
+        # mount cost for any change at all, which dominates EmojiPrompt
+        # CPU during search typing.
+        if existing and len(existing) == len(chars):
+            for btn, char in zip(existing, chars):
+                if btn.emoji != char:
+                    btn.set_emoji(char)
+        else:
+            # Slow path: drop and rebuild. Triggered when search shrinks
+            # / grows the result set or the active tab changes.
+            await grid.remove_children()
+            new_buttons = [_EmojiButton(c, i) for i, c in enumerate(chars)]
+            if new_buttons:
+                await grid.mount(*new_buttons)
+            self._grid_buttons = new_buttons
         # Reset scroll to top and clear focused-name caption.
         try:
             self.query_one("#emoji-scroll", VerticalScroll).scroll_home(animate=False)
@@ -783,8 +857,28 @@ class EmojiPrompt(ModalScreen[str | None]):
         q = event.value
         self._search_active = bool(q.strip())
         # Re-render either way; tab strip stays where it was so clearing
-        # the search box reverts to the active tab.
-        await self._render_view()
+        # the search box reverts to the active tab. Debounce so a burst
+        # of keystrokes only causes one grid rebuild — the search loop
+        # itself is fast (~ms in the catalogue) but the resulting
+        # mount/unmount of up to 200 buttons isn't.
+        if self._render_timer is not None:
+            try:
+                self._render_timer.stop()
+            except Exception:
+                pass
+            self._render_timer = None
+        if self._debounce_ms <= 0:
+            await self._render_view()
+            return
+
+        def _fire() -> None:
+            self._render_timer = None
+            # ``set_timer`` callbacks are scheduled on the App's pump.
+            # Spawn the actual render in a worker so we can ``await``
+            # the asynchronous ``Grid.mount`` / ``Grid.remove_children``.
+            self.run_worker(self._render_view(), exclusive=True, name="emoji-render")
+
+        self._render_timer = self.set_timer(self._debounce_ms / 1000.0, _fire)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
@@ -1610,12 +1704,41 @@ class _WhatspycApp(App):
         # callback.
         self._event_queue: asyncio.Queue[dict] = asyncio.Queue()
 
+        # Cached handles for static-DOM widgets — populated in on_mount,
+        # consulted from hot handlers that would otherwise call
+        # ``query_one`` on every event. The dynamic per-target message
+        # ListViews still use ``query_one(f"#{view_id}")`` because their
+        # ids are minted lazily.
+        self._w_input: Input | None = None
+        self._w_status: RichLog | None = None
+        self._w_thread_header: Static | None = None
+        self._w_online: ListView | None = None
+        self._w_online_header: Static | None = None
+        self._w_msg_switcher: ContentSwitcher | None = None
+        self._w_target_switcher: ContentSwitcher | None = None
+        self._w_tabs: Tabs | None = None
+
+        # Online pane incremental-diff state. Keys are callsigns; each
+        # value is the ``ListItem`` currently mounted for that user.
+        # ``_online_label_cache`` holds the last formatted label so we
+        # only ``Static.update`` when the resolved name actually changed
+        # (relevant after an ``he`` (ham name) event).
+        self._online_items: dict[str, ListItem] = {}
+        self._online_label_cache: dict[str, str] = {}
+
+        # Targets whose mounted MessageRow widgets are stale w.r.t. the
+        # current verbose_history setting. Populated by
+        # ``action_toggle_verbose`` for every non-active target; cleared
+        # lazily by ``_switch_centre_to`` when each target gets
+        # activated. Avoids walking every row in every view on Ctrl+D.
+        self._verbose_dirty: set[TargetKey] = set()
+
     # ------------------------------------------------------------------
     # Compose / mount
     # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=self._ui._show_clock)
         with Horizontal(id="main"):
             with Vertical(id="left"):
                 yield Tabs(
@@ -1645,6 +1768,17 @@ class _WhatspycApp(App):
 
     async def on_mount(self) -> None:
         self.is_mounted = True
+        # Resolve handles for static-DOM widgets once so hot handlers
+        # (online refresh, status writes, focus management, ...) don't
+        # call ``query_one`` per event.
+        self._w_input = self.query_one("#input", Input)
+        self._w_status = self.query_one("#status", RichLog)
+        self._w_thread_header = self.query_one("#thread-header", Static)
+        self._w_online = self.query_one("#online", ListView)
+        self._w_online_header = self.query_one("#online-header", Static)
+        self._w_msg_switcher = self.query_one("#message-switcher", ContentSwitcher)
+        self._w_target_switcher = self.query_one("#target-switcher", ContentSwitcher)
+        self._w_tabs = self.query_one("#tab-strip", Tabs)
         self._apply_left_pane_width()
         self._populate_initial_target_lists()
         self._refresh_online_pane(self._ui._client.online_users())
@@ -1667,7 +1801,7 @@ class _WhatspycApp(App):
         for obj in self._ui._pending:
             self.render_event(obj)
         self._ui._pending.clear()
-        self.query_one("#input", Input).focus()
+        self._w_input.focus()
 
     def on_unmount(self) -> None:
         log_mod.remove_pane_handler(self._log_handler)
@@ -1921,17 +2055,24 @@ class _WhatspycApp(App):
 
     async def _switch_centre_to(self, target: TargetKey) -> None:
         lv = await self._ensure_message_view(target)
-        switcher = self.query_one("#message-switcher", ContentSwitcher)
-        switcher.current = lv.id  # type: ignore[assignment]
+        if self._w_msg_switcher is not None:
+            self._w_msg_switcher.current = lv.id  # type: ignore[assignment]
+        # If verbose_history was toggled while this target was inactive
+        # its rows still hold the old render; refresh them now (lazy
+        # paydown of the work the toggle handler deliberately deferred).
+        if target in self._verbose_dirty:
+            self._verbose_dirty.discard(target)
+            for (k, t, _), row in self._rows.items():
+                if (k, t) == target:
+                    self._refresh_row_label(row)
         # Activating clears the unread count.
         if self._unread.pop(target, 0):
             self._refresh_target_label(target)
         self._refresh_thread_header(target)
 
     def _refresh_thread_header(self, target: TargetKey | None = None) -> None:
-        try:
-            hdr = self.query_one("#thread-header", Static)
-        except Exception:
+        hdr = self._w_thread_header
+        if hdr is None:
             return
         if target is None:
             target = self._active_target()
@@ -1953,9 +2094,8 @@ class _WhatspycApp(App):
             hdr.update(f"[b]DM:[/] {user}" if user else f"[b]DM:[/] {key}")
 
     def _active_view_id(self) -> str | None:
-        try:
-            switcher = self.query_one("#message-switcher", ContentSwitcher)
-        except Exception:
+        switcher = self._w_msg_switcher
+        if switcher is None:
             return None
         cur = switcher.current
         return cur if cur and cur.startswith("msgs-") else None
@@ -1976,11 +2116,10 @@ class _WhatspycApp(App):
         opens with rows already filling the visible area) and fall back
         to the configured backfill count otherwise."""
         base = self._ui._history_backfill or 30
-        try:
-            switcher = self.query_one("#message-switcher", ContentSwitcher)
-            h = switcher.size.height
-        except Exception:
+        switcher = self._w_msg_switcher
+        if switcher is None:
             return base
+        h = switcher.size.height
         if h <= 0:
             return base
         # Trim a couple of rows for the rounded border + status pane room.
@@ -1999,14 +2138,59 @@ class _WhatspycApp(App):
                 rows = []
         # Mount oldest first, since each `append` puts the row at the bottom.
         rows = list(reversed(rows))
+        # Bulk-fetch reactions for the whole backfill in one query so the
+        # per-row mount path doesn't spawn N SQLite round trips.
+        reactions_by_key = self._bulk_reactions(target, rows)
         with self._batch_mutate():
             for r in rows:
-                self._mount_row(target, lv, r, append=True)
+                self._mount_row(
+                    target,
+                    lv,
+                    r,
+                    append=True,
+                    reactions_by_key=reactions_by_key,
+                    defer_scroll=True,
+                )
         # The newest row should be visible on first activation. Layout
         # hasn't measured yet during the loop (max_scroll_y is still 0),
-        # so schedule the scroll for after the next refresh.
+        # so schedule the scroll for after the next refresh — one job,
+        # not one per row.
         if rows:
             self.call_after_refresh(lv.scroll_end, animate=False)
+
+    def _bulk_reactions(
+        self, target: TargetKey, rows: list[dict]
+    ) -> dict | None:
+        """Pre-fetch all reactions for ``rows`` in a single SQL query.
+
+        Returns a dict shaped for ``_build_row(reactions_by_key=...)``,
+        or ``None`` on any error (callers fall back to per-row lookup).
+        For DMs the dict is keyed by ``msg_id`` strings; for channel
+        posts by integer ``ts``.
+        """
+        if not rows:
+            return {}
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        kind, key = target
+        try:
+            if kind == "dm":
+                ids = [self._natural_key_for_row(kind, r) for r in rows]
+                ids = [i for i in ids if i]
+                return store.list_message_emojis_for_ids(ids)
+            if kind == "ch":
+                ts_list: list[int] = []
+                for r in rows:
+                    nat = self._natural_key_for_row(kind, r)
+                    if not nat:
+                        continue
+                    try:
+                        ts_list.append(int(nat))
+                    except ValueError:
+                        continue
+                return store.list_post_emojis_for_keys(int(key), ts_list)
+        except Exception:
+            return None
+        return None
 
     async def _reset_message_view(self, target: TargetKey) -> None:
         """Drop every mounted item for ``target`` and re-seed from the
@@ -2075,6 +2259,7 @@ class _WhatspycApp(App):
         # iterate as-is and mount each at ``before=0`` so each newer
         # row pushes the previous insertion down, leaving the oldest at
         # the top.
+        reactions_by_key = self._bulk_reactions(target, rows)
         with self._batch_mutate():
             for r in rows:
                 key_tuple = (kind, key, self._natural_key_for_row(kind, r))
@@ -2083,7 +2268,7 @@ class _WhatspycApp(App):
                     # be re-prepended (would happen if the cursor query
                     # ever returned an overlap).
                     continue
-                new_row = self._build_row(target, r)
+                new_row = self._build_row(target, r, reactions_by_key=reactions_by_key)
                 lv.mount(new_row, before=0)
                 self._rows[key_tuple] = new_row
                 self._refresh_row_label(new_row)
@@ -2099,10 +2284,31 @@ class _WhatspycApp(App):
             return str(row.get("id") or row.get("_id") or "")
         return str(row.get("ts") or "")
 
-    def _build_row(self, target: TargetKey, row: dict) -> MessageRow:
+    def _build_row(
+        self,
+        target: TargetKey,
+        row: dict,
+        *,
+        reactions_by_key: dict | None = None,
+    ) -> MessageRow:
         kind, key = target
         natural_key = self._natural_key_for_row(kind, row)
-        reactions = self._lookup_reactions(kind, key, natural_key)
+        if reactions_by_key is not None:
+            # Bulk-prefetched: avoid the per-row store roundtrip that
+            # ``_lookup_reactions`` would otherwise do. The key shape
+            # mirrors what the bulk query returns: ``msg_id`` for DMs,
+            # ``int(ts)`` for posts.
+            if kind == "dm":
+                reactions = reactions_by_key.get(natural_key, [])
+            elif kind == "ch":
+                try:
+                    reactions = reactions_by_key.get(int(natural_key), [])
+                except (TypeError, ValueError):
+                    reactions = []
+            else:
+                reactions = []
+        else:
+            reactions = self._lookup_reactions(kind, key, natural_key)
         return MessageRow(
             kind=kind,
             target_key=key,
@@ -2138,10 +2344,17 @@ class _WhatspycApp(App):
         return []
 
     def _mount_row(
-        self, target: TargetKey, lv: ListView, row: dict, *, append: bool = True
+        self,
+        target: TargetKey,
+        lv: ListView,
+        row: dict,
+        *,
+        append: bool = True,
+        reactions_by_key: dict | None = None,
+        defer_scroll: bool = False,
     ) -> MessageRow:
         kind, key = target
-        new_row = self._build_row(target, row)
+        new_row = self._build_row(target, row, reactions_by_key=reactions_by_key)
         existing = self._rows.get((kind, key, new_row.natural_key))
         if existing is not None:
             return existing
@@ -2150,7 +2363,12 @@ class _WhatspycApp(App):
             # itself push us off the bottom and break the check.
             was_at_bottom = lv.is_vertical_scroll_end
             lv.append(new_row)
-            if was_at_bottom:
+            # ``defer_scroll`` lets a caller batch-mounting many rows
+            # (e.g. ``_mount_initial_history``) suppress per-row scroll
+            # scheduling and emit one ``scroll_end`` at the end of the
+            # loop. Otherwise N rows = N ``call_after_refresh`` jobs,
+            # all racing to put the cursor at the bottom.
+            if was_at_bottom and not defer_scroll:
                 self.call_after_refresh(lv.scroll_end, animate=False)
         else:
             lv.mount(new_row, before=0)
@@ -2166,57 +2384,127 @@ class _WhatspycApp(App):
             delivery_timeout_s=self._ui._options.delivery_timeout_s,
         )
 
-    def _refresh_all_rows(self) -> None:
-        for row in self._rows.values():
-            self._refresh_row_label(row)
+    def _refresh_active_rows(self) -> None:
+        """Refresh only rows belonging to the currently-active target.
+
+        Inactive views are repainted lazily on activation — see
+        ``_switch_centre_to``, which consults ``_verbose_dirty`` and
+        plays catch-up there. Walking every row in every view on Ctrl+D
+        was the original behaviour and dominated CPU on slow hardware
+        once the user had bounced through several channels in a
+        session.
+        """
+        target = self._active_target()
+        if target is None:
+            return
+        kind, key = target
+        for (k, t, _), row in self._rows.items():
+            if k == kind and t == key:
+                self._refresh_row_label(row)
 
     # ------------------------------------------------------------------
     # Online users
     # ------------------------------------------------------------------
 
     def _refresh_online_pane(self, users: list[str]) -> None:
-        try:
-            lv = self.query_one("#online", ListView)
-            header = self.query_one("#online-header", Static)
-        except Exception:
+        """Incrementally reconcile the online ListView with ``users``.
+
+        Originally this cleared and rebuilt the whole ListView on every
+        ``uc`` / ``ud`` / ``o`` / ``he`` event — fine with a few users,
+        a major hot path with 100+ users + churn (one full unmount /
+        remount per join or part).
+
+        The diff here:
+          * drops items for callsigns no longer in ``users``,
+          * appends items for new callsigns at the end,
+          * leaves retained callsigns mounted untouched, only updating
+            their label when the resolved display name changed (this
+            matters for ``he`` events, which can rewrite names without
+            changing the roster).
+
+        Callsigns are case-insensitive so we normalise to upper-case
+        keys to avoid mounting a duplicate when the same call comes
+        back with different casing.
+        """
+        lv = self._w_online
+        header = self._w_online_header
+        if lv is None or header is None:
             return
-        lv.clear()
+        wanted_norm: list[str] = []
+        seen: set[str] = set()
         for call in users:
-            label = _fmt_user(call, self._ui._client.ham_name)
-            lv.append(ListItem(Static(label, markup=True)))
-        header.update(f"Online ({len(users)})")
+            up = call.upper()
+            if up in seen:
+                continue
+            seen.add(up)
+            wanted_norm.append(up)
+        wanted_set = set(wanted_norm)
+        current_set = set(self._online_items.keys())
+        ham_name = self._ui._client.ham_name
+
+        # Drop items for users who logged off.
+        for call in current_set - wanted_set:
+            item = self._online_items.pop(call, None)
+            self._online_label_cache.pop(call, None)
+            if item is not None:
+                try:
+                    item.remove()
+                except Exception:
+                    pass
+
+        # Add items for fresh joins. Append in the order they appear in
+        # ``wanted_norm`` so the visual order matches the server's.
+        for call in wanted_norm:
+            if call in self._online_items:
+                continue
+            label = _fmt_user(call, ham_name)
+            self._online_label_cache[call] = label
+            item = ListItem(Static(label, markup=True))
+            self._online_items[call] = item
+            lv.append(item)
+
+        # Retained users: only refresh labels when name resolution
+        # actually changed (an ``he`` event for that callsign).
+        for call in (current_set & wanted_set):
+            new_label = _fmt_user(call, ham_name)
+            if new_label != self._online_label_cache.get(call):
+                self._online_label_cache[call] = new_label
+                item = self._online_items.get(call)
+                if item is not None:
+                    try:
+                        item.query_one(Static).update(new_label)
+                    except Exception:
+                        pass
+
+        header.update(f"Online ({len(wanted_norm)})")
 
     # ------------------------------------------------------------------
     # Status pane (Ctrl+S)
     # ------------------------------------------------------------------
 
     def action_toggle_status(self) -> None:
-        try:
-            pane = self.query_one("#status", RichLog)
-        except Exception:
+        pane = self._w_status
+        if pane is None:
             return
         pane.styles.display = "none" if pane.display else "block"
 
     def _status_visible(self) -> bool:
-        try:
-            return bool(self.query_one("#status", RichLog).display)
-        except Exception:
-            return False
+        pane = self._w_status
+        return bool(pane.display) if pane is not None else False
 
     def _status_write(self, line: str) -> None:
-        try:
-            self.query_one("#status", RichLog).write(line)
-        except Exception:
-            pass
+        pane = self._w_status
+        if pane is None:
+            return
+        pane.write(line)
 
     def _status_error(self, line: str) -> None:
         """Write a user-facing error / warning to the status pane and
         force it visible. Slash-command argument validation, async
         worker exceptions and other error paths funnel through here so
         the user notices without polluting their conversation thread."""
-        try:
-            pane = self.query_one("#status", RichLog)
-        except Exception:
+        pane = self._w_status
+        if pane is None:
             return
         pane.write(line)
         if not pane.display:
@@ -2244,7 +2532,12 @@ class _WhatspycApp(App):
     def action_toggle_verbose(self) -> None:
         opts = self._ui._options
         opts.verbose_history = not opts.verbose_history
-        self._refresh_all_rows()
+        # Mark every other target as dirty so its rows get repainted
+        # next time it's activated; refresh only the visible target's
+        # rows now.
+        active = self._active_target()
+        self._verbose_dirty = {t for t in self._views if t != active}
+        self._refresh_active_rows()
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
@@ -2253,8 +2546,10 @@ class _WhatspycApp(App):
         self._open_settings_modal()
 
     def action_insert_emoji(self) -> None:
+        debounce = self._ui._options.tui_emoji_search_debounce_ms
+
         async def _run() -> None:
-            picked = await self.push_screen_wait(EmojiPrompt())
+            picked = await self.push_screen_wait(EmojiPrompt(debounce_ms=debounce))
             if not picked:
                 return
             # Hex codepoint fallback (for terminals that can't render
@@ -2281,29 +2576,29 @@ class _WhatspycApp(App):
     # ------------------------------------------------------------------
 
     def action_focus_input(self) -> None:
-        try:
-            self.query_one("#input", Input).focus()
-        except Exception:
-            pass
+        if self._w_input is not None:
+            self._w_input.focus()
 
     def _focus_target_for_step(self, step: str) -> Any | None:
         if step == "input":
-            return self.query_one("#input", Input)
+            return self._w_input
         if step == "msg-active":
             active = self._active_view_id()
             if active:
                 return self.query_one(f"#{active}", ListView)
             return None
         if step == "tab-strip":
-            return self.query_one("#tab-strip", Tabs)
+            return self._w_tabs
         if step == "target-active":
-            switcher = self.query_one("#target-switcher", ContentSwitcher)
+            switcher = self._w_target_switcher
+            if switcher is None:
+                return None
             current_id = switcher.current
             if current_id:
                 return self.query_one(f"#{current_id}", ListView)
             return None
         if step == "online":
-            return self.query_one("#online", ListView)
+            return self._w_online
         return None
 
     def _focus_step(self, delta: int) -> None:
@@ -2312,7 +2607,7 @@ class _WhatspycApp(App):
         cycle = _FOCUS_CYCLE
         # Find current position; tab-strip / lists may be matched by id.
         active_msg = self._active_view_id()
-        active_target = self.query_one("#target-switcher", ContentSwitcher).current
+        active_target = self._w_target_switcher.current if self._w_target_switcher is not None else None
         try:
             if focused_id == "input":
                 idx = cycle.index("input")
@@ -2613,8 +2908,7 @@ class _WhatspycApp(App):
         if t == "m":
             await self._handle_inbound_dm(obj, batched=False)
         elif t == "mb":
-            for m in obj.get("m", []):
-                await self._handle_inbound_dm(m, batched=True)
+            await self._handle_inbound_dm_batch(list(obj.get("m", [])))
         # Post / batched post
         elif t == "cp":
             await self._handle_inbound_post(obj, batched=False)
@@ -2622,8 +2916,7 @@ class _WhatspycApp(App):
             cid = obj.get("cid")
             if cid is None:
                 return
-            for p in obj.get("p", []):
-                await self._handle_inbound_post({**p, "cid": cid}, batched=True)
+            await self._handle_inbound_post_batch(cid, list(obj.get("p", [])))
         # Acks
         elif t == "mr":
             self._handle_dm_ack(obj)
@@ -2638,13 +2931,11 @@ class _WhatspycApp(App):
         elif t == "mem":
             self._handle_dm_reaction(obj)
         elif t == "memb":
-            for entry in obj.get("mem", []):
-                self._handle_dm_reaction(entry)
+            self._handle_dm_reaction_batch(list(obj.get("mem", [])))
         elif t == "cpem":
             self._handle_post_reaction(obj)
         elif t == "cpemb":
-            for group in obj.get("e", []):
-                self._handle_post_reaction_batch(group)
+            self._handle_post_reaction_groups(list(obj.get("e", [])))
         # Roster
         elif t == "uc":
             self._refresh_online_pane(self._ui._client.online_users())
@@ -2725,6 +3016,117 @@ class _WhatspycApp(App):
             self._status_error(f"[red][error][/] {obj.get('exc')}")
         elif t == "_delivery_timeout":
             self._handle_delivery_timeout(obj)
+
+    async def _handle_inbound_dm_batch(self, items: list[dict]) -> None:
+        """Process a wire ``mb`` (batch DM) payload.
+
+        Groups items by peer, opens one ``_batch_mutate`` block per
+        target, bulk-fetches reactions for the whole active-target
+        group in a single SQL query, and coalesces unread bumps + label
+        refreshes per target. Replaces the original loop-of-handlers
+        approach which paid the LV-resolve + label-refresh cost per
+        item, plus one SQLite round trip per row for reactions.
+        """
+        if not items:
+            return
+        by_peer: dict[TargetKey, list[dict]] = {}
+        for m in items:
+            fc = m.get("fc")
+            tc = m.get("tc")
+            peer = tc if fc == self._ui._my_call else fc
+            if not peer:
+                continue
+            target: TargetKey = ("dm", peer)
+            by_peer.setdefault(target, []).append(m)
+        active = self._active_target()
+        for target, group in by_peer.items():
+            self._add_target(target)
+            if active != target:
+                # Inactive target: just bump unread by the group size and
+                # refresh the label once. Rows page in from the store
+                # on activation.
+                self._unread[target] = self._unread.get(target, 0) + len(group)
+                self._refresh_target_label(target)
+                continue
+            # Active target: resolve store rows for each item once, then
+            # bulk-fetch reactions for the whole group in one query
+            # before mounting.
+            store_rows: list[dict] = []
+            for m in group:
+                msg_id = m.get("_id") or (
+                    f"{m.get('ts')}-{m.get('fc')}"
+                    if m.get("ts") and m.get("fc")
+                    else None
+                )
+                row = None
+                if msg_id:
+                    try:
+                        row = self._ui._client._store.lookup_message_by_id(msg_id)  # type: ignore[attr-defined]
+                    except Exception:
+                        row = None
+                if row is None:
+                    row = {
+                        "id": msg_id,
+                        "from_call": m.get("fc"),
+                        "to_call": m.get("tc"),
+                        "body": m.get("m"),
+                        "ts": m.get("ts"),
+                        "edit_ts": m.get("edts"),
+                        "lid": None,
+                    }
+                store_rows.append(row)
+            lv = await self._ensure_message_view(target)
+            reactions_by_key = self._bulk_reactions(target, store_rows)
+            with self._batch_mutate():
+                for r in store_rows:
+                    self._mount_row(
+                        target, lv, r, append=True,
+                        reactions_by_key=reactions_by_key,
+                    )
+
+    async def _handle_inbound_post_batch(self, cid: int, items: list[dict]) -> None:
+        """Process a wire ``cpb`` (batch posts) payload for one channel.
+
+        ``cpb`` carries one ``cid`` and a list of posts under ``p`` —
+        already grouped by target, so we just resolve the LV once,
+        bulk-prefetch reactions, and mount.
+        """
+        if not items:
+            return
+        target: TargetKey = ("ch", str(cid))
+        self._add_target(target)
+        active = self._active_target()
+        if active != target:
+            self._unread[target] = self._unread.get(target, 0) + len(items)
+            self._refresh_target_label(target)
+            return
+        store_rows: list[dict] = []
+        for p in items:
+            ts = p.get("ts")
+            row = None
+            if isinstance(ts, int):
+                try:
+                    row = self._ui._client._store.lookup_post(int(cid), int(ts))  # type: ignore[attr-defined]
+                except Exception:
+                    row = None
+            if row is None:
+                row = {
+                    "channel_id": cid,
+                    "from_call": p.get("fc"),
+                    "body": p.get("p"),
+                    "ts": ts,
+                    "edit_ts": p.get("edts"),
+                    "lid": None,
+                }
+            store_rows.append(row)
+        lv = await self._ensure_message_view(target)
+        reactions_by_key = self._bulk_reactions(target, store_rows)
+        with self._batch_mutate():
+            for r in store_rows:
+                self._mount_row(
+                    target, lv, r, append=True,
+                    reactions_by_key=reactions_by_key,
+                )
 
     async def _handle_inbound_dm(self, m: dict, *, batched: bool) -> None:
         fc = m.get("fc")
@@ -2967,6 +3369,88 @@ class _WhatspycApp(App):
         msg_row.reactions = self._lookup_reactions("ch", str(cid), str(ts))
         self._refresh_row_label(msg_row)
 
+    def _handle_dm_reaction_batch(self, items: list[dict]) -> None:
+        """Apply a wire ``memb`` (batch DM reaction) payload.
+
+        Resolves each entry's peer (one ``lookup_message_by_id`` per
+        item) but bulk-fetches the reaction lists in a single SQL
+        query for items whose row is currently mounted.
+        """
+        if not items:
+            return
+        # Resolve mounted rows + their peers up front so we know what
+        # we'll actually need to refresh.
+        targets: list[tuple[MessageRow, str, str]] = []
+        msg_ids: list[str] = []
+        for obj in items:
+            msg_id = obj.get("_id")
+            if not isinstance(msg_id, str):
+                continue
+            try:
+                row = self._ui._client._store.lookup_message_by_id(msg_id)  # type: ignore[attr-defined]
+            except Exception:
+                row = None
+            if row is None:
+                continue
+            peer = str(row.get("to_call") or row.get("from_call") or "")
+            rk = ("dm", peer, msg_id)
+            msg_row = self._rows.get(rk)
+            if msg_row is None:
+                continue
+            targets.append((msg_row, peer, msg_id))
+            msg_ids.append(msg_id)
+        if not targets:
+            return
+        try:
+            bulk = self._ui._client._store.list_message_emojis_for_ids(msg_ids)  # type: ignore[attr-defined]
+        except Exception:
+            bulk = None
+        for msg_row, _peer, msg_id in targets:
+            if bulk is not None:
+                msg_row.reactions = list(bulk.get(msg_id, []))
+            else:
+                msg_row.reactions = self._lookup_reactions(
+                    "dm", _peer, msg_id
+                )
+            self._refresh_row_label(msg_row)
+
+    def _handle_post_reaction_groups(self, groups: list[dict]) -> None:
+        """Apply a wire ``cpemb`` (batch post-reaction) payload.
+
+        ``cpemb`` carries a list of ``{cid, ts, e:[...], ets}`` groups.
+        We group by ``cid`` so that each channel's reactions are
+        prefetched in a single SQL query.
+        """
+        if not groups:
+            return
+        by_cid: dict[int, list[int]] = {}
+        valid: list[tuple[int, int]] = []
+        for g in groups:
+            cid = g.get("cid")
+            ts = g.get("ts")
+            if not isinstance(cid, int) or not isinstance(ts, int):
+                continue
+            valid.append((cid, ts))
+            by_cid.setdefault(cid, []).append(ts)
+        if not valid:
+            return
+        # Bulk-fetch reactions per cid.
+        bulk_by_cid: dict[int, dict[int, list[dict]]] = {}
+        for cid, ts_list in by_cid.items():
+            try:
+                bulk_by_cid[cid] = self._ui._client._store.list_post_emojis_for_keys(  # type: ignore[attr-defined]
+                    cid, ts_list
+                )
+            except Exception:
+                bulk_by_cid[cid] = {}
+        for cid, ts in valid:
+            rk = ("ch", str(cid), str(ts))
+            msg_row = self._rows.get(rk)
+            if msg_row is None:
+                continue
+            msg_row.reactions = list(bulk_by_cid.get(cid, {}).get(int(ts), []))
+            self._refresh_row_label(msg_row)
+
     async def _handle_cs(self, obj: dict) -> None:
         cid = obj.get("cid")
         subscribed = bool(obj.get("s"))
@@ -3084,7 +3568,8 @@ class _WhatspycApp(App):
     async def _do_react(self, row: MessageRow) -> None:
         if self._refuse_offline("reacting"):
             return
-        emoji = await self.push_screen_wait(EmojiPrompt())
+        debounce = self._ui._options.tui_emoji_search_debounce_ms
+        emoji = await self.push_screen_wait(EmojiPrompt(debounce_ms=debounce))
         if not emoji:
             return
         c = self._ui._client
@@ -3424,7 +3909,10 @@ class _WhatspycApp(App):
         # don't apply here.
         del args
         self._ui._options.verbose_history = verbose
-        self._refresh_all_rows()
+        # Same dirty-set mechanic as Ctrl+D — see ``action_toggle_verbose``.
+        active = self._active_target()
+        self._verbose_dirty = {t for t in self._views if t != active}
+        self._refresh_active_rows()
 
     def _handle_help(self, args: list[str]) -> None:
         focus = args[0] if args else None
@@ -3439,7 +3927,9 @@ class _WhatspycApp(App):
             if name == "delivery_timeout_s":
                 self._ui._client.set_delivery_timeout_s(new)
             if name == "verbose_history":
-                self._refresh_all_rows()
+                active = self._active_target()
+                self._verbose_dirty = {t for t in self._views if t != active}
+                self._refresh_active_rows()
         self.push_screen(SettingsModal(options=self._ui._options, on_change=on_change))
 
     async def _handle_sub(self, args: list[str]) -> None:
