@@ -152,3 +152,14 @@ def test_catalog_round_trips_through_wire_layer() -> None:
         else:
             assert wire == c
             assert emoji_for_display(wire) == c
+
+
+def test_emoji_for_display_decodes_hyphen_separated_sequences() -> None:
+    # Peers (web client included) emit multi-codepoint reactions as
+    # hyphen-joined hex: "2764-fe0f" = ❤ + VS16, "1f469-200d-1f4bb" =
+    # woman + ZWJ + laptop.
+    assert emoji_for_display("2764-fe0f") == "❤️"
+    assert emoji_for_display("1f469-200d-1f4bb") == "\U0001f469‍\U0001f4bb"
+    # Non-matching strings still pass through unchanged.
+    assert emoji_for_display("not-hex-at-all") == "not-hex-at-all"
+    assert emoji_for_display("") == ""

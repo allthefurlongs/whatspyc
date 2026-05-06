@@ -28,6 +28,7 @@ def ts_to_ms(ts: int | float | None) -> int | None:
 
 
 _HEX_CODEPOINT = re.compile(r"\A[0-9a-fA-F]{4,6}\Z")
+_HEX_SEQUENCE = re.compile(r"\A[0-9a-fA-F]{4,6}(?:-[0-9a-fA-F]{4,6})+\Z")
 
 
 def emoji_for_display(s: str) -> str:
@@ -35,14 +36,20 @@ def emoji_for_display(s: str) -> str:
 
     The WhatsPac protocol carries reaction emoji as hex-codepoint
     strings (e.g. ``"1f622"`` for 😢) — see MESSAGES.md type ``mem``.
-    The web client renders them via ``String.fromCodePoint(parseInt(t,
-    16))``; we mirror that. Strings that aren't 4-6 hex digits or that
-    don't resolve to a valid Unicode codepoint pass through unchanged,
-    so legacy rows or terminal-typed literals render as-is.
+    Multi-codepoint sequences (variation selectors like
+    ``"2764-fe0f"`` for ❤️, ZWJ joins like ``"1f469-200d-1f4bb"`` for
+    👩‍💻) arrive as hyphen-separated hex on the wire. Strings that
+    don't match either form pass through unchanged, so legacy rows or
+    terminal-typed literals render as-is.
     """
     if _HEX_CODEPOINT.match(s):
         try:
             return chr(int(s, 16))
+        except (ValueError, OverflowError):
+            pass
+    elif _HEX_SEQUENCE.match(s):
+        try:
+            return "".join(chr(int(p, 16)) for p in s.split("-"))
         except (ValueError, OverflowError):
             pass
     return s
