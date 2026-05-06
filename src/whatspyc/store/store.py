@@ -89,28 +89,52 @@ class SqliteStore:
     # ------------------------------------------------------------------
 
     def connect_record(self, name: str, callsign: str, version: float) -> dict:
-        """Build a type-`c` client record using stored timestamps."""
+        """Build a type-`c` client record using stored timestamps.
+
+        ``led`` (last-edit cursor) is floored to ``max(ts)`` over the
+        rows it scopes — channel posts for the per-channel ``led``, DMs
+        for the top-level ``led``. Reason: the server's edit-replay
+        filter (see ``wps/db.py:dbGetPostEdits`` and the equivalent
+        message path) is ``edts > led AND ts <= lp``. ``last_edit`` is
+        only ever bumped when we *observe* a `cped`/`cpedb`/`med`/`medb`
+        — a fresh subscription, or a channel where we've simply never
+        been online while an edit happened, leaves it at 0. The server
+        then replays every historical edit on next connect (gigabytes
+        on long-lived channels). A post can only be edited *after* it
+        was created (``edts > ts``), and `cpb` always delivers the
+        current body, so any edit with ``edts <= max(ts)`` is already
+        baked into the bodies we hold; flooring ``led`` to ``max(ts)``
+        suppresses the firehose without risking a missed edit.
+        """
         cur = self._conn.execute("SELECT key, value FROM meta")
         meta = {row["key"]: row["value"] for row in cur.fetchall()}
         cur = self._conn.execute(
-            "SELECT cid, last_post, last_emoji, last_edit FROM channels WHERE subscribed = 1"
+            "SELECT c.cid, c.last_post, c.last_emoji, c.last_edit,"
+            "       COALESCE(MAX(p.ts), 0) AS max_post_ts"
+            "  FROM channels c"
+            "  LEFT JOIN posts p ON p.channel_id = c.cid"
+            " WHERE c.subscribed = 1"
+            " GROUP BY c.cid, c.last_post, c.last_emoji, c.last_edit"
         )
         channels = [
             {
                 "cid": r["cid"],
                 "lp": r["last_post"],
                 "le": r["last_emoji"],
-                "led": r["last_edit"],
+                "led": max(r["last_edit"], r["max_post_ts"]),
             }
             for r in cur.fetchall()
         ]
+        max_msg_ts = self._conn.execute(
+            "SELECT COALESCE(MAX(ts), 0) AS m FROM messages"
+        ).fetchone()["m"]
         return {
             "t": "c",
             "n": name,
             "c": callsign.upper(),
             "lm": meta.get("last_message", 0),
             "le": meta.get("last_emoji", 0),
-            "led": meta.get("last_edit", 0),
+            "led": max(meta.get("last_edit", 0), max_msg_ts),
             "lhts": meta.get("last_ham_ts", 0),
             "v": version,
             "cc": channels,
