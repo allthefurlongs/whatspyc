@@ -91,20 +91,26 @@ class SqliteStore:
     def connect_record(self, name: str, callsign: str, version: float) -> dict:
         """Build a type-`c` client record using stored timestamps.
 
-        ``led`` (last-edit cursor) is floored to ``max(ts)`` over the
-        rows it scopes — channel posts for the per-channel ``led``, DMs
-        for the top-level ``led``. Reason: the server's edit-replay
-        filter (see ``wps/db.py:dbGetPostEdits`` and the equivalent
-        message path) is ``edts > led AND ts <= lp``. ``last_edit`` is
-        only ever bumped when we *observe* a `cped`/`cpedb`/`med`/`medb`
-        — a fresh subscription, or a channel where we've simply never
-        been online while an edit happened, leaves it at 0. The server
-        then replays every historical edit on next connect (gigabytes
-        on long-lived channels). A post can only be edited *after* it
-        was created (``edts > ts``), and `cpb` always delivers the
-        current body, so any edit with ``edts <= max(ts)`` is already
-        baked into the bodies we hold; flooring ``led`` to ``max(ts)``
-        suppresses the firehose without risking a missed edit.
+        Both ``led`` (last-edit cursor) and ``le`` (last-reaction
+        cursor) are floored to ``max(ts)`` over the rows they scope —
+        channel posts for the per-channel pair, DMs for the top-level
+        pair. Reason: the server's replay filters (see
+        ``wps/db.py:dbGetPostEdits`` / ``dbGetPostEmojis`` and the
+        equivalent message paths) are ``edts > led AND ts <= lp`` and
+        ``ets > le AND ts <= lp``. ``last_edit`` / ``last_emoji`` are
+        only ever bumped when we *observe* the matching wire event
+        (`cped`/`cpedb`/`med`/`medb` for edits, `cpem`/`cpemb`/`mem`
+        for reactions) — a fresh subscription, or a channel where
+        we've simply never been online while an edit or reaction
+        happened, leaves the cursor at 0. The server then replays
+        every historical edit/reaction on next connect (gigabytes on
+        long-lived channels). Edits and reactions can only happen
+        *after* the post is created (``edts > ts``, ``ets > ts``), and
+        `cpb` always delivers the current body and inline reaction
+        state, so anything with ``edts <= max(ts)`` or
+        ``ets <= max(ts)`` is already baked into the bodies we hold;
+        flooring suppresses the firehose without risking a missed
+        update.
         """
         cur = self._conn.execute("SELECT key, value FROM meta")
         meta = {row["key"]: row["value"] for row in cur.fetchall()}
@@ -120,7 +126,7 @@ class SqliteStore:
             {
                 "cid": r["cid"],
                 "lp": r["last_post"],
-                "le": r["last_emoji"],
+                "le": max(r["last_emoji"], r["max_post_ts"]),
                 "led": max(r["last_edit"], r["max_post_ts"]),
             }
             for r in cur.fetchall()
@@ -133,7 +139,7 @@ class SqliteStore:
             "n": name,
             "c": callsign.upper(),
             "lm": meta.get("last_message", 0),
-            "le": meta.get("last_emoji", 0),
+            "le": max(meta.get("last_emoji", 0), max_msg_ts),
             "led": max(meta.get("last_edit", 0), max_msg_ts),
             "lhts": meta.get("last_ham_ts", 0),
             "v": version,
