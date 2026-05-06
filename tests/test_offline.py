@@ -7,7 +7,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import tomllib
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
 import click
 

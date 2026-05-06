@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import pytest
-import tomllib
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
 from whatspyc import config as cfg_mod
 from whatspyc.config import ConnectProfile

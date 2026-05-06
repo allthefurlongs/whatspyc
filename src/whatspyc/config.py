@@ -27,10 +27,14 @@ freely edit/extend the file from there.
 from __future__ import annotations
 
 import os
-import tomllib
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
 from whatspyc.wps.hop_script import HopStep
 
