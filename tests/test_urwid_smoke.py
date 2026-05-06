@@ -551,6 +551,16 @@ def test_inbound_post_to_active_channel_mounts_row(tmp_path: Path) -> None:
 def test_dm_edit_updates_existing_row(tmp_path: Path) -> None:
     ui, app, store = _make_app(tmp_path)
     try:
+        # In production, WpsClient persists `m` to the store before
+        # invoking `on_event`. The test pipes events directly into
+        # `_dispatch_event`, so we have to do the upsert ourselves to
+        # give the edit handler a row to look up.
+        store.upsert_message(
+            {"_id": "abc-M0FOO", "fc": "M0FOO", "tc": "M0ABC",
+             "ts": 1, "m": "original body"},
+            realtime=True,
+        )
+
         async def _run() -> None:
             ui._target = ("dm", "M0FOO")
             await app._switch_centre_to(("dm", "M0FOO"))
@@ -558,6 +568,7 @@ def test_dm_edit_updates_existing_row(tmp_path: Path) -> None:
                 {"t": "m", "_id": "abc-M0FOO", "fc": "M0FOO", "tc": "M0ABC",
                  "ts": 1, "m": "original body"}
             )
+            store.apply_message_edit("abc-M0FOO", "edited body", 999)
             await app._dispatch_event(
                 {"t": "med", "_id": "abc-M0FOO", "m": "edited body", "edts": 999}
             )
@@ -572,6 +583,15 @@ def test_dm_edit_updates_existing_row(tmp_path: Path) -> None:
 def test_dm_ack_marks_delivered(tmp_path: Path) -> None:
     ui, app, store = _make_app(tmp_path)
     try:
+        # See `test_dm_edit_updates_existing_row` — the ack handler
+        # looks up the store row to recover lid + ts for the status
+        # line, so the test has to upsert before dispatch.
+        store.upsert_message(
+            {"_id": "abc-M0FOO", "fc": "M0FOO", "tc": "M0ABC",
+             "ts": 1, "m": "hi"},
+            realtime=True,
+        )
+
         async def _run() -> None:
             ui._target = ("dm", "M0FOO")
             await app._switch_centre_to(("dm", "M0FOO"))
@@ -579,6 +599,7 @@ def test_dm_ack_marks_delivered(tmp_path: Path) -> None:
                 {"t": "m", "_id": "abc-M0FOO", "fc": "M0FOO", "tc": "M0ABC",
                  "ts": 1, "m": "hi"}
             )
+            store.mark_message_delivered("abc-M0FOO", 12345)
             await app._dispatch_event(
                 {"t": "mr", "_id": "abc-M0FOO", "dts": 12345}
             )
@@ -654,6 +675,99 @@ def test_emoji_prompt_initial_view_is_quick_picks(tmp_path: Path) -> None:
         assert modal._active_group == "__quick__"
         assert modal._entries  # non-empty
         assert modal._entries[0].char in "👍🙏❤️😂😢😡🎉🔥👀✅❌😀😎🤔🙌😉👋"
+    finally:
+        store.close()
+
+
+def test_emoji_prompt_enter_picks_focused_button_not_first(tmp_path: Path) -> None:
+    """Enter on a focused emoji button must dismiss with that button's
+    char — not always the first entry on the page. Regression: the
+    modal-level keypress used to intercept Enter unconditionally and
+    dismiss with ``entries[0]``, so navigating with arrows had no
+    effect on what got picked.
+    """
+    import asyncio as _asyncio
+
+    from whatspyc.ui.urwid_ui import _EmojiButton
+
+    ui, app, store = _make_app(tmp_path)
+    try:
+        loop = _asyncio.new_event_loop()
+        try:
+            modal = EmojiPrompt(debounce_ms=0)
+            modal.future = loop.create_future()
+            modal._app = app
+            modal.build()
+            assert modal._pile is not None
+            assert modal._grid_row_index >= 0
+            assert len(modal._entries) >= 2
+
+            # Move focus into the grid row, then to the second button
+            # in the first row of the grid.
+            modal._pile.focus_position = modal._grid_row_index
+            grid_row = modal._pile.contents[modal._grid_row_index][0]
+            # BoxAdapter -> ListBox -> walker[0] = grid_pile (Pile of Columns)
+            listbox = grid_row.original_widget
+            grid_pile = listbox.body[0]
+            first_columns = grid_pile.contents[0][0]
+            # Find the second _EmojiButton in the row.
+            buttons = [w for (w, _opts) in first_columns.contents if isinstance(w, _EmojiButton)]
+            assert len(buttons) >= 2
+            target_char = buttons[1].char
+            assert target_char != modal._entries[0].char
+            # Set focus on the second button via the column index.
+            for idx, (w, _opts) in enumerate(first_columns.contents):
+                if w is buttons[1]:
+                    first_columns.focus_position = idx
+                    break
+
+            # Modal-level keypress on Enter should fall through (return
+            # the key) when the grid row is focused, so the body can
+            # dispatch to _EmojiButton.keypress.
+            assert modal.keypress((40, 20), "enter") == "enter"
+
+            # _EmojiButton.keypress dismisses with its own char.
+            buttons[1].keypress((4,), "enter")
+            assert modal.future.done()
+            assert modal.future.result() == target_char
+        finally:
+            loop.close()
+    finally:
+        store.close()
+
+
+def test_emoji_button_mouse_click_dismisses_with_own_char(tmp_path: Path) -> None:
+    """A left-click on an _EmojiButton must activate that button (not
+    a no-op via the wrapped Text). Regression: _EmojiButton had no
+    ``mouse_event`` override, so clicks fell through and did nothing.
+    """
+    import asyncio as _asyncio
+
+    from whatspyc.ui.urwid_ui import _EmojiButton
+
+    ui, app, store = _make_app(tmp_path)
+    try:
+        loop = _asyncio.new_event_loop()
+        try:
+            modal = EmojiPrompt(debounce_ms=0)
+            modal.future = loop.create_future()
+            modal._app = app
+            modal.build()
+            assert len(modal._entries) >= 3
+
+            grid_row = modal._pile.contents[modal._grid_row_index][0]
+            listbox = grid_row.original_widget
+            grid_pile = listbox.body[0]
+            first_columns = grid_pile.contents[0][0]
+            buttons = [w for (w, _opts) in first_columns.contents if isinstance(w, _EmojiButton)]
+            target = buttons[2]
+
+            handled = target.mouse_event((4,), "mouse press", 1, 0, 0, True)
+            assert handled is True
+            assert modal.future.done()
+            assert modal.future.result() == target.char
+        finally:
+            loop.close()
     finally:
         store.close()
 
@@ -1159,9 +1273,25 @@ def test_outbound_post_is_mounted_optimistically_and_dimmed(tmp_path: Path) -> N
         # Row is in the pending-outbound state (dimmed).
         assert rows[0].delivered_ts is None
 
+        # In production WpsClient.post persists the outbound post to
+        # the store before returning; the fake `fake_post` here
+        # doesn't, so we mirror that step by hand. The ack handler
+        # looks up the row via `lookup_post_by_from_ts` to recover
+        # the lid, so the upsert needs to be in place before `cpr`
+        # is dispatched.
+        store.upsert_post(
+            5,
+            {"ts": 1_700_000_000_000, "fc": "M0ABC", "p": "hello channel"},
+        )
+
         # When the server's ``cpr`` ack arrives, the row's
         # ``delivered_ts`` should be set and the dim cleared.
         async def _ack() -> None:
+            store.mark_post_delivered(
+                from_call="M0ABC",
+                ts=1_700_000_000_000,
+                delivered_ts=1_700_000_000_500,
+            )
             await app._dispatch_event(
                 {"t": "cpr", "cid": 5, "ts": 1_700_000_000_000,
                  "fc": "M0ABC", "dts": 1_700_000_000_500}

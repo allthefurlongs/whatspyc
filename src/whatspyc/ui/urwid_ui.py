@@ -168,6 +168,21 @@ def _fmt_duration_ms(ms: int | float) -> str:
     return f"{m}m{s}s"
 
 
+def _fmt_ts_str(ts: int | float | None) -> str:
+    ms = ts_to_ms(ts)
+    if ms is None:
+        return "[--]"
+    dt = datetime.fromtimestamp(ms / 1000)
+    return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')}]"
+
+
+def _fmt_user(call: str | None, ham_name: Callable[[str | None], str | None]) -> str:
+    if not call:
+        return ""
+    name = ham_name(call)
+    return f"{name}, {call}" if name else str(call)
+
+
 def _verbose_status(
     *,
     from_call: str,
@@ -767,6 +782,14 @@ class _Modal:
     """
 
     title: str = ""
+    # Hard floor passed to ``urwid.Overlay(min_height=...)``. The
+    # default 4 fits a confirm-dialog body (one prompt line plus the
+    # LineBox border). Modals with fixed-size lists override this so
+    # all rows stay visible regardless of terminal height — without
+    # the override, ``overlay_size``'s relative-percent height
+    # collapses to ``min_height`` on small terminals and clips the
+    # tail of the list.
+    overlay_min_height: int = 4
 
     def __init__(self) -> None:
         # Future is lazy: created at ``attach`` time when we know a
@@ -886,6 +909,12 @@ _KEYBINDING_HELP_LINES = [
 
 class ActionMenu(_Modal):
     title = "Action"
+    # 3 menu items + 2-row LineBox border + 1 row of slack inside the
+    # BoxAdapter = 6. Without this override the modal collapses to
+    # ``min_height=4`` on small terminals (the 6% relative height in
+    # ``overlay_size`` rounds to 1 on a 24-row terminal) and the
+    # bottom-most row — React — falls outside the visible window.
+    overlay_min_height = 6
 
     def __init__(self, *, allow_edit: bool, allow_resend: bool) -> None:
         super().__init__()
@@ -1097,7 +1126,7 @@ class QuitConfirmModal(_Modal):
 
     def build(self) -> urwid.Widget:
         rows = [
-            urwid.Text(("bold", "Quit whatspyc?")),
+            urwid.Text(("bold", "Quit whatspyc? y/n")),
             urwid.Divider(),
             urwid.Text([("yellow", "  y"), ("default", " → quit          ")]),
             urwid.Text([("yellow", "  n"), ("default", " or "), ("yellow", "Esc"), ("default", " → cancel  (default = no)")]),
@@ -1304,6 +1333,12 @@ class _EmojiButton(urwid.WidgetWrap):
             return None
         return key
 
+    def mouse_event(self, size, event, button, col, row, focus):  # type: ignore[override]
+        if urwid.util.is_mouse_press(event) and button == 1:
+            self._on_activate(self._char)
+            return True
+        return False
+
 
 class EmojiPrompt(_Modal):
     """Searchable emoji picker.
@@ -1331,6 +1366,8 @@ class EmojiPrompt(_Modal):
         self._entries: list[EmojiEntry] = []
         self._active_group: str = ""
         self._active_subgroup: str | None = None
+        self._pile: urwid.Pile | None = None
+        self._grid_row_index: int = -1
 
     def build(self) -> urwid.Widget:
         # Top-level groups: ★ Quick + the nine CLDR groups.
@@ -1343,23 +1380,25 @@ class EmojiPrompt(_Modal):
         )
         urwid.connect_signal(self._search_input, "change", self._on_search_change)
 
+        grid_row = urwid.BoxAdapter(
+            urwid.ListBox(urwid.SimpleFocusListWalker([self._grid_pile])),
+            height=12,
+        )
         body_rows: list[urwid.Widget] = [
             self._search_input,
             self._tabs_top,
             self._tabs_sub_holder,
             urwid.Divider("─"),
-            urwid.BoxAdapter(
-                urwid.ListBox(urwid.SimpleFocusListWalker([self._grid_pile])),
-                height=12,
-            ),
+            grid_row,
             urwid.Divider("─"),
             self._caption,
             self._fallback_input,
             urwid.Text(("dim", "Type to search · ↑↓←→ to navigate · Enter to pick · Esc to cancel")),
         ]
-        pile = urwid.Pile(body_rows)
+        self._grid_row_index = body_rows.index(grid_row)
+        self._pile = urwid.Pile(body_rows)
         self._render_view()
-        return pile
+        return self._pile
 
     @property
     def overlay_size(self) -> tuple[int, str, int]:
@@ -1476,8 +1515,15 @@ class EmojiPrompt(_Modal):
             self.dismiss(None)
             return None
         if key == "enter":
-            # If the fallback input is focused and has text, use it;
-            # otherwise dismiss with the focused emoji (or first match).
+            # When the grid is focused, fall through so the focused
+            # _EmojiButton's keypress dismisses with its own char.
+            # Intercepting here would always pick entries[0] regardless
+            # of which button the user navigated to.
+            if (
+                self._pile is not None
+                and self._pile.focus_position == self._grid_row_index
+            ):
+                return key
             if self._fallback_input.edit_text.strip():
                 self.dismiss(self._fallback_input.edit_text.strip())
                 return None
@@ -1713,6 +1759,15 @@ class _UrwidApp:
         # Enter on a message row never fires because focus actually
         # lands on the wrong child of the Pile.
         self._centre_pane = centre_pane
+        # The first ``_refresh_status_pane`` call ran before
+        # ``_centre_pane`` was assigned, so the Pile-mutation branch
+        # was a no-op. Re-run it now to drop the status holder when
+        # it starts hidden.
+        self._refresh_status_pane()
+        if self._ui._offline:
+            self._status_write(
+                ("yellow", "[offline] read-only mode — browsing local store, no connection")
+            )
 
         # ----- Main split: left + centre -----
         left_width = self._compute_left_pane_width()
@@ -2364,6 +2419,21 @@ class _UrwidApp:
             )
         else:
             self._status_holder.original_widget = urwid.Filler(urwid.Text(""))
+        # Add/remove the holder from the centre Pile so the message
+        # ListBox reclaims the space when status is hidden, and yields
+        # it back when status is shown.
+        if self._centre_pane is not None:
+            contents = self._centre_pane.contents
+            idx = next(
+                (i for i, (w, _) in enumerate(contents) if w is self._status_holder),
+                None,
+            )
+            if self._status_visible and idx is None:
+                contents.insert(
+                    0, (self._status_holder, self._centre_pane.options("weight", 1))
+                )
+            elif not self._status_visible and idx is not None:
+                del contents[idx]
 
     def _status_write(self, markup: Any) -> None:
         if self._status_walker is None:
@@ -2412,6 +2482,40 @@ class _UrwidApp:
     def _channel_ref(self, cid: int) -> str:
         name = self._channel_name(cid)
         return f"#{name} (ch:{cid})" if name else f"ch:{cid}"
+
+    def _fmt_target_label(self, target: TargetKey) -> str:
+        kind, key = target
+        if kind == "ch":
+            try:
+                cid = int(key)
+            except ValueError:
+                return f"ch:{key}"
+            name = self._channel_name(cid)
+            return f"ch:{cid} #{name}" if name else f"ch:{cid}"
+        return f"dm:{key}"
+
+    def _write_to_active(self, markup: Any) -> None:
+        """Append a system / hint line to the currently active message
+        ListBox. Mirrors ``TextualUI._write_to_active``: the line stays
+        with the conversation context (visible in the message log)
+        rather than being routed to the toggleable status pane.
+        """
+        target = self._active_target()
+        if target is None:
+            return
+        walker = self._walkers.get(target)
+        if walker is None:
+            return
+        walker.append(urwid.Text(markup))
+        # Auto-scroll to the new line if the user is already at the
+        # bottom (focus on the previous last row). Skip when they've
+        # scrolled up to read older history so we don't yank the view.
+        if walker:
+            try:
+                if walker.focus is None or walker.focus >= len(walker) - 2:
+                    walker.set_focus(len(walker) - 1)
+            except (IndexError, TypeError):
+                pass
 
     def _known_cids(self) -> set[int]:
         cids: set[int] = {ch.cid for ch in self._ui._channels}
@@ -2515,7 +2619,7 @@ class _UrwidApp:
             valign=valign,
             height=("relative", rows_pct),
             min_width=20,
-            min_height=4,
+            min_height=modal.overlay_min_height,
         )
         self._modal_stack.append((modal, prev_top, None))
         self._frame_holder.original_widget = overlay
@@ -3160,38 +3264,77 @@ class _UrwidApp:
             self._refresh_online_pane(list(obj.get("o") or []))
         elif t == "he":
             self._schedule_he_refresh()
-        elif t == "c":
+        elif t == "c" and "n" not in obj:
+            # Server's type-`c` reply (no client-form `n`/`c` fields).
+            # Routed to the active message pane like textual, so the
+            # connect summary stays with the conversation context.
             mc = obj.get("mc", 0)
             pc = obj.get("pc", 0)
             v = obj.get("v", "")
-            self._status_write(("green", f"[connect] mc={mc} pc={pc} v={v}"))
+            self._write_to_active(
+                [("green", "[connect]"), f" mc={mc} pc={pc} v={v}"]
+            )
         elif t == "_disconnect":
-            auto = obj.get("auto_reconnect", False)
-            self._status_error(("disconnect_line", f"[disconnect] {obj.get('reason') or ''}"))
-            if not auto:
+            line = [
+                ("disconnect_line", "[link]"),
+                f" disconnected ({obj.get('reason') or ''})",
+            ]
+            self._write_to_active(line)
+            if self._status_visible:
+                self._status_write(line)
+            if not self._ui._client.is_auto_reconnect:
                 self._signal_terminal_link_loss()
         elif t == "_reconnecting":
             attempt = obj.get("attempt", 0)
             delay = obj.get("delay", 0)
-            self._status_write(("reconnect_line", f"[reconnecting] attempt {attempt} (in {delay:.1f}s)"))
-        elif t == "_reconnected":
-            self._status_write(("green", "[reconnected]"))
-            self._invalidate_subscribed_cids()
+            line = [
+                ("reconnect_line", "[link]"),
+                f" reconnect attempt {attempt} in {delay:.1f}s",
+            ]
+            self._write_to_active(line)
+            if self._status_visible:
+                self._status_write(line)
         elif t == "_reconnect_failed":
-            self._status_error(("disconnect_line", f"[reconnect-failed] {obj.get('error') or ''}"))
+            line = [
+                ("reconnect_line", "[link]"),
+                f" reconnect attempt {obj.get('attempt')} failed: {obj.get('error') or obj.get('exc') or ''}",
+            ]
+            self._write_to_active(line)
+            if self._status_visible:
+                self._status_write(line)
+        elif t == "_reconnected":
+            line = [
+                ("green", "[link]"),
+                f" reconnected (attempt {obj.get('attempt')})",
+            ]
+            self._write_to_active(line)
+            if self._status_visible:
+                self._status_write(line)
+            # Server-side subscription state may have shifted across
+            # the link drop; rebuild the cache lazily on next consult.
+            self._invalidate_subscribed_cids()
         elif t == "_reconnect_giveup":
-            self._status_error(("disconnect_line", "[reconnect-giveup] gave up"))
+            line = [
+                ("disconnect_line", "[link]"),
+                f" giving up after {obj.get('attempts')} reconnect attempts",
+            ]
+            self._write_to_active(line)
+            if self._status_visible:
+                self._status_write(line)
             self._signal_terminal_link_loss()
         elif t == "_silence_disconnect":
-            self._status_error(("disconnect_line", "[silence-disconnect] no traffic for too long"))
+            line = [
+                ("disconnect_line", "[link]"),
+                " silence-disconnect — no traffic for too long",
+            ]
+            self._write_to_active(line)
+            if self._status_visible:
+                self._status_write(line)
             self._signal_terminal_link_loss()
         elif t == "_delivery_timeout":
             self._handle_delivery_timeout(obj)
         elif t == "_error":
-            self._status_error(("red", f"[error] {obj.get('msg') or ''}"))
-        # Acks (mr, cpr) write a status line if show_acks is on.
-        if t in ("mr", "cpr") and self._ui._options.show_acks:
-            self._status_write(("ack_line", f"[ack] {t}"))
+            self._status_error(("red", f"[error] {obj.get('msg') or obj.get('exc') or ''}"))
 
     def _signal_terminal_link_loss(self) -> None:
         self._ui.exit_reason = "terminal"
@@ -3285,7 +3428,44 @@ class _UrwidApp:
         bulk: dict | None = None,
     ) -> dict:
         """Convert a wire-form m/cp dict into the store-row shape that
-        ``_build_row`` expects."""
+        ``_build_row`` expects.
+
+        WpsClient persists the row before emitting the event (see
+        ``_dispatch`` in wps/client.py: handler runs before
+        ``_on_event``), so look the canonical row up by its natural key
+        first — that pulls in the SQLite rowid as ``lid`` so verbose
+        render shows a real id instead of ``None``. Fall back to a
+        wire-only dict if the lookup misses (defensive; shouldn't happen
+        in practice)."""
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        if kind == "dm":
+            msg_id = wire.get("_id") or (
+                f"{wire.get('ts')}-{wire.get('fc')}"
+                if wire.get("ts") and wire.get("fc")
+                else None
+            )
+            if msg_id:
+                try:
+                    row = store.lookup_message_by_id(msg_id)
+                except Exception:
+                    row = None
+                if row is not None:
+                    return row
+        else:  # "post"
+            _, target_key = target
+            ts = wire.get("ts")
+            if isinstance(ts, int):
+                try:
+                    cid = int(target_key)
+                except ValueError:
+                    cid = None
+                if cid is not None:
+                    try:
+                        row = store.lookup_post(cid, ts)
+                    except Exception:
+                        row = None
+                    if row is not None:
+                        return row
         return {
             "id": wire.get("_id"),
             "ts": wire.get("ts"),
@@ -3295,7 +3475,7 @@ class _UrwidApp:
             "delivered_ts": wire.get("dts"),
             "received_ts": int(time.time() * 1000) if wire.get("fc", "").upper() != self._ui._my_call else None,
             "realtime": 1,
-            "lid": None,  # filled by store on next look-up if needed
+            "lid": None,
         }
 
     def _mount_row_obj(
@@ -3312,71 +3492,120 @@ class _UrwidApp:
 
     def _handle_dm_ack(self, obj: dict) -> None:
         msg_id = obj.get("_id")
-        dts = obj.get("dts") or int(time.time() * 1000)
-        if not msg_id:
+        if not isinstance(msg_id, str):
             return
-        # Find the matching row across all DM targets.
-        for (kind, tkey, nat), row in self._rows.items():
+        try:
+            store_row = self._ui._client._store.lookup_message_by_id(msg_id)  # type: ignore[attr-defined]
+        except Exception:
+            store_row = None
+        if store_row is None:
+            return
+        peer = store_row.get("to_call") or store_row.get("from_call") or ""
+        target: TargetKey = ("dm", str(peer))
+        for (kind, tkey, nat), msg_row in self._rows.items():
             if kind == "dm" and nat == msg_id:
-                row.delivered_ts = int(dts)
-                self._refresh_row_label(row)
+                msg_row.delivered_ts = (
+                    store_row.get("delivered_ts") or int(time.time() * 1000)
+                )
+                self._refresh_row_label(msg_row)
                 break
+        if self._status_visible:
+            ts_ms = ts_to_ms(store_row.get("ts"))
+            now = int(time.time() * 1000)
+            duration = _fmt_duration_ms(now - ts_ms) if ts_ms else "?"
+            label = self._fmt_target_label(target)
+            self._status_write(
+                ("ack_line", f"[ack] {label} msg {store_row.get('lid')} delivered in {duration}")
+            )
 
     def _handle_post_ack(self, obj: dict) -> None:
         ts = obj.get("ts")
-        dts = obj.get("dts") or int(time.time() * 1000)
-        fc = (obj.get("fc") or "").upper()
-        if ts is None:
+        dts = obj.get("dts")
+        if not isinstance(ts, int):
             return
-        for (kind, tkey, nat), row in self._rows.items():
-            if kind != "ch":
-                continue
-            try:
-                if int(nat) == int(ts) and (not fc or row.from_call.upper() == fc):
-                    row.delivered_ts = int(dts)
-                    self._refresh_row_label(row)
-                    break
-            except ValueError:
-                continue
+        try:
+            store_row = self._ui._client._store.lookup_post_by_from_ts(  # type: ignore[attr-defined]
+                self._ui._my_call, ts
+            )
+        except Exception:
+            store_row = None
+        if store_row is None:
+            return
+        cid = store_row.get("channel_id")
+        target: TargetKey = ("ch", str(cid))
+        nat = str(int(ts))
+        for (kind, tkey, n), msg_row in self._rows.items():
+            if kind == "ch" and tkey == str(cid) and n == nat:
+                msg_row.delivered_ts = (
+                    int(dts) if isinstance(dts, int) else int(time.time() * 1000)
+                )
+                self._refresh_row_label(msg_row)
+                break
+        if self._status_visible:
+            ts_ms = ts_to_ms(ts)
+            end = ts_to_ms(dts) if isinstance(dts, int) else int(time.time() * 1000)
+            duration = _fmt_duration_ms(end - ts_ms) if ts_ms else "?"
+            label = self._fmt_target_label(target)
+            self._status_write(
+                ("ack_line", f"[ack] {label} post {store_row.get('lid')} delivered in {duration}")
+            )
 
     # --- Edits ---
 
     def _handle_dm_edit(self, obj: dict, *, clear_delivered: bool = False) -> None:
         msg_id = obj.get("_id")
-        if not msg_id:
+        if not isinstance(msg_id, str):
             return
-        body = obj.get("m") or ""
-        edts = obj.get("edts") or int(time.time() * 1000)
-        for (kind, tkey, nat), row in self._rows.items():
+        try:
+            store_row = self._ui._client._store.lookup_message_by_id(msg_id)  # type: ignore[attr-defined]
+        except Exception:
+            store_row = None
+        if store_row is None:
+            return
+        peer = store_row.get("to_call") or store_row.get("from_call") or ""
+        target: TargetKey = ("dm", str(peer))
+        body = obj.get("m") or store_row.get("body") or ""
+        edts = obj.get("edts") or store_row.get("edit_ts") or int(time.time() * 1000)
+        for (kind, tkey, nat), msg_row in self._rows.items():
             if kind == "dm" and nat == msg_id:
-                row.body = body
-                row.edit_ts = int(edts)
+                msg_row.body = body
+                msg_row.edit_ts = int(edts)
                 if clear_delivered:
-                    row.delivered_ts = None
-                self._refresh_row_label(row)
+                    msg_row.delivered_ts = None
+                self._refresh_row_label(msg_row)
                 break
-        if self._ui._options.show_edits and not clear_delivered:
-            self._status_write(("yellow", f"[edited dm {msg_id}]"))
+        if self._status_visible:
+            self._status_write(
+                ("yellow", f"[edit] {self._fmt_target_label(target)} msg {store_row.get('lid')} edited")
+            )
 
     def _handle_post_edit(self, obj: dict, *, clear_delivered: bool = False) -> None:
         cid = obj.get("cid")
         ts = obj.get("ts")
-        if cid is None or ts is None:
+        if not isinstance(cid, int) or not isinstance(ts, int):
             return
-        body = obj.get("p") or ""
-        edts = obj.get("edts") or int(time.time() * 1000)
-        target = ("ch", str(int(cid)))
+        try:
+            store_row = self._ui._client._store.lookup_post(int(cid), int(ts))  # type: ignore[attr-defined]
+        except Exception:
+            store_row = None
+        if store_row is None:
+            return
+        target: TargetKey = ("ch", str(int(cid)))
         nat = str(int(ts))
-        for (kind, tkey, n), row in self._rows.items():
+        body = obj.get("p") or store_row.get("body") or ""
+        edts = obj.get("edts") or store_row.get("edit_ts") or int(time.time() * 1000)
+        for (kind, tkey, n), msg_row in self._rows.items():
             if kind == "ch" and tkey == target[1] and n == nat:
-                row.body = body
-                row.edit_ts = int(edts)
+                msg_row.body = body
+                msg_row.edit_ts = int(edts)
                 if clear_delivered:
-                    row.delivered_ts = None
-                self._refresh_row_label(row)
+                    msg_row.delivered_ts = None
+                self._refresh_row_label(msg_row)
                 break
-        if self._ui._options.show_edits and not clear_delivered:
-            self._status_write(("yellow", f"[edited post ch:{cid} ts:{ts}]"))
+        if self._status_visible:
+            self._status_write(
+                ("yellow", f"[edit] {self._fmt_target_label(target)} post {store_row.get('lid')} edited")
+            )
 
     # --- Reactions ---
 
@@ -3424,10 +3653,22 @@ class _UrwidApp:
     # --- Channel state ---
 
     async def _handle_cs(self, obj: dict) -> None:
-        cid = int(obj.get("cid", 0))
-        target = ("ch", str(cid))
+        cid = obj.get("cid")
+        subscribed = bool(obj.get("s"))
+        pc = obj.get("pc")
         self._invalidate_subscribed_cids()
-        self._refresh_target_label(target)
+        if cid is not None:
+            target: TargetKey = ("ch", str(int(cid)))
+            self._refresh_target_label(target)
+            name = self._channel_name(int(cid))
+            display = f"{int(cid)} #{name}" if name else str(int(cid))
+        else:
+            display = "channel"
+        verb = "Subscribed to" if subscribed else "Unsubscribed from"
+        if subscribed and isinstance(pc, int) and pc > 0:
+            self._status_write(f"{verb} {display} ({pc} historic posts on server)")
+        else:
+            self._status_write(f"{verb} {display}")
         self._refresh_footer()
 
     def _handle_pch(self, obj: dict) -> None:
@@ -3441,8 +3682,11 @@ class _UrwidApp:
             if not isinstance(cid, int) or not isinstance(pt, int):
                 continue
             ref = self._channel_ref(cid)
-            self._status_write(
-                ("yellow", f"[pch] {ref}: {pt} pending posts (use /unpause)")
+            self._write_to_active(
+                [
+                    ("yellow", f"[paused {ref}]"),
+                    f" {pt} pending posts — /unpause {cid} [N] to download",
+                ]
             )
 
     def _handle_user_connect(self, obj: dict) -> None:
@@ -3458,6 +3702,10 @@ class _UrwidApp:
         if call not in users:
             users.append(call)
         self._refresh_online_pane(users)
+        if self._status_visible:
+            self._status_write(
+                f"[user] {_fmt_user(call, self._ui._client.ham_name)} connected"
+            )
 
     def _handle_user_disconnect(self, obj: dict) -> None:
         # Same wire shape: field is ``c``. See ``_handle_user_connect``.
@@ -3466,16 +3714,32 @@ class _UrwidApp:
             return
         users = [u for u in self._online_items.keys() if u != call]
         self._refresh_online_pane(users)
+        if self._status_visible:
+            self._status_write(
+                f"[user] {_fmt_user(call, self._ui._client.ham_name)} disconnected"
+            )
 
     def _handle_delivery_timeout(self, obj: dict) -> None:
-        kind = obj.get("kind", "")
+        kind = obj.get("kind")
         lid = obj.get("lid")
-        is_edit = obj.get("is_edit", False)
-        suffix = " (edit)" if is_edit else ""
-        retry = "/retrydm" if kind == "dm" else "/retrypost"
-        self._status_error(
-            ("red", f"[timeout] no ack for {kind} lid {lid}{suffix} — {retry} {lid}")
-        )
+        ts_str = _fmt_ts_str(obj.get("ts")) if obj.get("ts") is not None else "[--]"
+        edit_tag = " (edit)" if obj.get("is_edit") else ""
+        if kind == "post":
+            cid = obj.get("cid")
+            ref = self._channel_ref(int(cid)) if isinstance(cid, int) else f"ch:{cid}"
+            line = (
+                "red",
+                f"[timeout] [{ref}] post {lid}{edit_tag} at {ts_str}. "
+                f"To resend: /retrypost {lid}",
+            )
+        else:
+            peer = obj.get("peer")
+            line = (
+                "red",
+                f"[timeout] [dm:{peer}] msg {lid}{edit_tag} at {ts_str}. "
+                f"To resend: /retrydm {lid}",
+            )
+        self._status_error(line)
 
     # ------------------------------------------------------------------
     # Top-level key handling.
@@ -3710,15 +3974,18 @@ class _UrwidApp:
         if step == "messages":
             try:
                 cols.focus_position = 1
-                # The centre Pile defaults focus to position 0 (the
-                # status holder) which isn't selectable when hidden, so
-                # Enter would land on it instead of reaching the
-                # message ListBox. Force focus onto the message-list
-                # placeholder (position 2) so keyboard navigation
-                # works as expected.
+                # The centre Pile defaults focus to position 0, which
+                # is either the status holder (non-selectable) or the
+                # thread header. Force focus onto the message-list
+                # placeholder so Enter reaches the row. Look it up by
+                # identity since its index shifts when the status pane
+                # is hidden.
                 if self._centre_pane is not None:
                     try:
-                        self._centre_pane.focus_position = 2
+                        for i, (w, _) in enumerate(self._centre_pane.contents):
+                            if w is self._centre_placeholder:
+                                self._centre_pane.focus_position = i
+                                break
                     except (IndexError, ValueError):
                         pass
             except (IndexError, ValueError):
