@@ -1008,6 +1008,30 @@ class SubscribeModal(_Modal):
         # Focus the input on stage=count
         if self._stage == "count" and self._count_input is not None:
             self._body_pile.focus_position = len(widgets) - 3  # the Edit position
+        self._refresh_shell_selectability()
+
+    def _refresh_shell_selectability(self) -> None:
+        # ``LineBox.__init__`` builds a ``Pile([top, middle, bottom])``
+        # where ``middle = Columns([lline, body, rline])``. Both that
+        # ``Pile`` and ``Columns`` cache ``_selectable`` from their
+        # contents at construction time and only recompute it when
+        # their own contents list is mutated. Our body Pile starts
+        # empty, so both caches latch to ``False`` — and
+        # ``Pile.keypress`` early-returns the key unchanged when
+        # ``self.selectable()`` is ``False``, so once we transition to
+        # ``stage=count`` the new ``Edit`` never sees keystrokes.
+        # Nudge them to recompute.
+        if self.shell is None:
+            return
+        try:
+            linebox = self.shell._w.original_widget  # AttrMap → LineBox
+            inner_pile = linebox._w  # Pile([top, middle, bottom])
+            for w, _opts in inner_pile.contents:
+                if isinstance(w, urwid.Columns):
+                    w._contents_modified()
+            inner_pile._contents_modified()
+        except (AttributeError, IndexError):
+            pass
 
     async def _kick_off_subscribe(self) -> None:
         try:

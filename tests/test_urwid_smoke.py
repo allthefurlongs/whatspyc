@@ -793,6 +793,50 @@ def test_subscribe_modal_confirm_stage(tmp_path: Path) -> None:
         store.close()
 
 
+def test_subscribe_modal_count_stage_accepts_typing(tmp_path: Path) -> None:
+    """Once the subscribe ack lands and the modal switches to the
+    count-prompt stage, digits typed at the shell must reach the Edit.
+
+    Regression: LineBox builds a Pile/Columns wrapper that caches
+    ``_selectable`` at construct time. Our body Pile starts empty
+    (non-selectable), so the cache latches False — and ``Pile.keypress``
+    early-returns the key unchanged when not selectable, swallowing
+    every digit before the Edit could see it.
+    """
+    ui, app, store = _make_app(tmp_path)
+    try:
+        async def do_subscribe() -> int:
+            return 7
+
+        async def drive() -> None:
+            modal = SubscribeModal(
+                cid=5,
+                ref="#lounge",
+                do_subscribe=do_subscribe,
+                default_count_for=lambda pc: min(10, pc),
+                skip_confirm=True,
+            )
+            modal.attach(app)
+            # Let _kick_off_subscribe complete and re-render.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert modal._stage == "count"
+            size = (60, 20)
+            modal.shell.render(size, focus=True)
+            assert modal.shell.keypress(size, "5") is None
+            assert modal.shell.keypress(size, "0") is None
+            assert modal._count_input is not None
+            assert modal._count_input.edit_text == "50"
+            assert modal.shell.keypress(size, "enter") is None
+            assert modal.future.done()
+            # Result is the typed value, capped at pc=7.
+            assert modal.future.result() == 7
+
+        asyncio.run(drive())
+    finally:
+        store.close()
+
+
 # ---------------------------------------------------------------------
 # Offline gating
 # ---------------------------------------------------------------------
