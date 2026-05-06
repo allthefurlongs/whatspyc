@@ -45,8 +45,6 @@ from textual.widgets import (
     ListView,
     RichLog,
     Static,
-    Tab,
-    Tabs,
 )
 from textual.widgets._footer import FooterKey
 
@@ -70,6 +68,100 @@ from whatspyc.wps.client import WpsClient
 
 TargetKey = tuple[str, str]  # ("ch", "5") or ("dm", "G7XYZ")
 RowKey = tuple[str, str, str]  # (kind, target_key, natural_key)
+
+
+class _TabBar(Horizontal):
+    """Lightweight Tabs replacement: a horizontal strip of Buttons with
+    an ``-active`` class on the currently-selected one.
+
+    Textual's ``Tabs`` widget animates an underline, watches focus, and
+    rebuilds bindings on every focus change — measurable cost on slow
+    hardware where the visual flourish isn't useful. This widget keeps
+    the visible affordance (a row of tab labels with the active one
+    highlighted) while skipping the heavier machinery: no underline,
+    no per-focus rebuild, no animations.
+
+    The bar itself is focusable so the App's pane-focus cycle can
+    target it as a single stop. ``on_focus`` forwards focus to the
+    active Button so ←/→ feel like Tabs' built-in navigation; ←/→
+    cycle the active tab and ``press()`` it (which posts the standard
+    ``Button.Pressed`` event so existing handlers keep working).
+    """
+
+    DEFAULT_CSS = """
+    _TabBar {
+        height: auto;
+        layout: horizontal;
+    }
+    _TabBar > Button {
+        height: 3;
+        min-width: 4;
+        border: none;
+        padding: 0 1;
+        background: $boost;
+        color: $text;
+    }
+    _TabBar > Button.-active {
+        background: $accent;
+        color: $text;
+        text-style: bold;
+    }
+    """
+
+    can_focus = True
+
+    def __init__(
+        self,
+        *children: Any,
+        active_id: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*children, **kwargs)
+        self._active_id = active_id
+
+    def on_mount(self) -> None:
+        if self._active_id is not None:
+            self.set_active(self._active_id)
+
+    def set_active(self, btn_id: str) -> None:
+        self._active_id = btn_id
+        for child in self.children:
+            if isinstance(child, Button):
+                if child.id == btn_id:
+                    child.add_class("-active")
+                else:
+                    child.remove_class("-active")
+
+    def _buttons(self) -> list[Button]:
+        return [c for c in self.children if isinstance(c, Button)]
+
+    def on_focus(self) -> None:
+        # Focus the active button so ←/→ work without an extra hop.
+        for b in self._buttons():
+            if b.id == self._active_id:
+                b.focus()
+                return
+        bs = self._buttons()
+        if bs:
+            bs[0].focus()
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key not in ("left", "right"):
+            return
+        bs = self._buttons()
+        if not bs:
+            return
+        try:
+            idx = next(i for i, b in enumerate(bs) if b.id == self._active_id)
+        except StopIteration:
+            idx = 0
+        delta = -1 if event.key == "left" else 1
+        new_btn = bs[(idx + delta) % len(bs)]
+        if new_btn.id is not None:
+            self.set_active(new_btn.id)
+        new_btn.focus()
+        new_btn.press()
+        event.stop()
 
 
 # ----------------------------------------------------------------------
@@ -710,14 +802,14 @@ class EmojiPrompt(ModalScreen[str | None]):
                 id="emoji-hint",
             )
             yield Input(id="emoji-search", placeholder="search emoji…")
-            yield Tabs(
-                *(Tab(label, id=f"gtab-{tid}") for tid, label, _ in _GROUP_TABS),
-                active="gtab-quick",
+            yield _TabBar(
+                *(Button(label, id=f"gtab-{tid}") for tid, label, _ in _GROUP_TABS),
+                active_id="gtab-quick",
                 id="emoji-group-tabs",
             )
             # Subgroup tab strip — populated lazily; hidden unless the
             # active group is People & Body.
-            yield Tabs(id="emoji-subgroup-tabs")
+            yield _TabBar(id="emoji-subgroup-tabs")
             with VerticalScroll(id="emoji-scroll"):
                 yield Grid(id="emoji-grid")
             yield Static("", id="emoji-focused-name")
@@ -728,7 +820,7 @@ class EmojiPrompt(ModalScreen[str | None]):
 
     async def on_mount(self) -> None:
         # Hide subgroup tabs until People & Body is selected.
-        self.query_one("#emoji-subgroup-tabs", Tabs).display = False
+        self.query_one("#emoji-subgroup-tabs", _TabBar).display = False
         await self._render_view()
         self.query_one("#emoji-search", Input).focus()
 
@@ -787,15 +879,19 @@ class EmojiPrompt(ModalScreen[str | None]):
     # Tab handling
     # ------------------------------------------------------------------
 
-    async def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-        event.stop()
-        tabs_id = event.tabs.id or ""
-        tab_id = event.tab.id or ""
-        if tabs_id == "emoji-group-tabs":
-            tid = tab_id.removeprefix("gtab-")
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        # Tab buttons live inside our two ``_TabBar``s; emoji-grid
+        # buttons fire a different code path. Stop the event either
+        # way so it can't bubble to the App.
+        btn_id = event.button.id or ""
+        if btn_id.startswith("gtab-"):
+            event.stop()
+            tid = btn_id.removeprefix("gtab-")
             if tid == self._active_tab and not self._search_active:
                 return
             self._active_tab = tid
+            group_bar = self.query_one("#emoji-group-tabs", _TabBar)
+            group_bar.set_active(btn_id)
             # Clearing search if the user explicitly picked a tab.
             if self._search_active:
                 self._search_active = False
@@ -805,7 +901,7 @@ class EmojiPrompt(ModalScreen[str | None]):
                     with inp.prevent(Input.Changed):
                         inp.value = ""
             group = _GROUP_BY_TAB_ID.get(tid, "")
-            sub_tabs = self.query_one("#emoji-subgroup-tabs", Tabs)
+            sub_tabs = self.query_one("#emoji-subgroup-tabs", _TabBar)
             if group == _SUBGROUPED_GROUP:
                 await self._populate_subgroup_tabs(group)
                 sub_tabs.display = True
@@ -813,8 +909,10 @@ class EmojiPrompt(ModalScreen[str | None]):
                 self._active_subgroup = ""
                 sub_tabs.display = False
             await self._render_view()
-        elif tabs_id == "emoji-subgroup-tabs":
-            sub = tab_id.removeprefix("stab-")
+            return
+        if btn_id.startswith("stab-"):
+            event.stop()
+            sub = btn_id.removeprefix("stab-")
             if sub == _slug(self._active_subgroup):
                 return
             # Resolve the slug back to its real subgroup name.
@@ -825,26 +923,34 @@ class EmojiPrompt(ModalScreen[str | None]):
                             self._active_subgroup = s
                             break
                     break
+            self.query_one("#emoji-subgroup-tabs", _TabBar).set_active(btn_id)
             await self._render_view()
+            return
+        # Emoji grid buttons — pick that emoji and dismiss.
+        if isinstance(event.button, _EmojiButton) and event.button.emoji:
+            event.stop()
+            self.dismiss(event.button.emoji)
 
     async def _populate_subgroup_tabs(self, group: str) -> None:
-        """Rebuild the subgroup Tabs strip for ``group``."""
-        sub_tabs = self.query_one("#emoji-subgroup-tabs", Tabs)
+        """Rebuild the subgroup tab bar for ``group``."""
+        sub_tabs = self.query_one("#emoji-subgroup-tabs", _TabBar)
         # Find the subgroups for this group.
         subs: list[str] = []
         for grp_name, sgs in catalog_groups():
             if grp_name == group:
                 subs = sgs
                 break
-        await sub_tabs.clear()
+        await sub_tabs.remove_children()
         if not subs:
             return
-        for s in subs:
-            await sub_tabs.add_tab(Tab(s, id=f"stab-{_slug(s)}"))
         # Pick first by default if not already a valid sub.
         if self._active_subgroup not in subs:
             self._active_subgroup = subs[0]
-        sub_tabs.active = f"stab-{_slug(self._active_subgroup)}"
+        active_btn_id = f"stab-{_slug(self._active_subgroup)}"
+        await sub_tabs.mount(
+            *(Button(s, id=f"stab-{_slug(s)}") for s in subs)
+        )
+        sub_tabs.set_active(active_btn_id)
 
     # ------------------------------------------------------------------
     # Search wiring
@@ -892,11 +998,6 @@ class EmojiPrompt(ModalScreen[str | None]):
             return
         text = event.value.strip()
         self.dismiss(text or None)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        event.stop()
-        if isinstance(event.button, _EmojiButton) and event.button.emoji:
-            self.dismiss(event.button.emoji)
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         widget = event.widget
@@ -1716,7 +1817,7 @@ class _WhatspycApp(App):
         self._w_online_header: Static | None = None
         self._w_msg_switcher: ContentSwitcher | None = None
         self._w_target_switcher: ContentSwitcher | None = None
-        self._w_tabs: Tabs | None = None
+        self._w_tabs: _TabBar | None = None
 
         # Online pane incremental-diff state. Keys are callsigns; each
         # value is the ``ListItem`` currently mounted for that user.
@@ -1733,6 +1834,24 @@ class _WhatspycApp(App):
         # activated. Avoids walking every row in every view on Ctrl+D.
         self._verbose_dirty: set[TargetKey] = set()
 
+        # Memoised set of subscribed cids. Lazy-loaded on first
+        # ``_is_subscribed`` call (which used to scan the full
+        # ``store.list_channels()`` result on every check — hot path
+        # via ``_target_label`` on every unread bump). Invalidated by
+        # ``_handle_cs`` on subscribe/unsubscribe acks and on
+        # ``_reconnected`` so a fresh link picks up any server-side
+        # drift. ``None`` means "not yet loaded".
+        self._subscribed_cids: set[int] | None = None
+
+        # Coalescing timer for ``he`` (ham-enquiry) events. The connect
+        # sequence emits a burst of these — each one fires a full
+        # online-pane diff plus a DM-target-label relabel for every
+        # mounted thread, which is quadratic in (hams × DMs) and
+        # noticeable on slow CPUs. ``_schedule_he_refresh`` arms the
+        # timer; subsequent ``he`` events while the timer is pending
+        # are no-ops so the burst collapses into one refresh.
+        self._he_refresh_pending: bool = False
+
     # ------------------------------------------------------------------
     # Compose / mount
     # ------------------------------------------------------------------
@@ -1741,9 +1860,10 @@ class _WhatspycApp(App):
         yield Header(show_clock=self._ui._show_clock)
         with Horizontal(id="main"):
             with Vertical(id="left"):
-                yield Tabs(
-                    Tab("Channels", id="tab-channels"),
-                    Tab("DMs", id="tab-dms"),
+                yield _TabBar(
+                    Button("Channels", id="tab-channels"),
+                    Button("DMs", id="tab-dms"),
+                    active_id="tab-channels",
                     id="tab-strip",
                 )
                 with ContentSwitcher(initial="channels", id="target-switcher"):
@@ -1752,7 +1872,7 @@ class _WhatspycApp(App):
                 yield Static("Online (0)", id="online-header")
                 yield ListView(id="online")
             with Vertical(id="right"):
-                yield RichLog(id="status", wrap=True, markup=True, highlight=True)
+                yield RichLog(id="status", wrap=True, markup=True, highlight=False)
                 yield Static("", id="thread-header")
                 with ContentSwitcher(initial="empty-msgs", id="message-switcher"):
                     yield Static(
@@ -1778,7 +1898,7 @@ class _WhatspycApp(App):
         self._w_online_header = self.query_one("#online-header", Static)
         self._w_msg_switcher = self.query_one("#message-switcher", ContentSwitcher)
         self._w_target_switcher = self.query_one("#target-switcher", ContentSwitcher)
-        self._w_tabs = self.query_one("#tab-strip", Tabs)
+        self._w_tabs = self.query_one("#tab-strip", _TabBar)
         self._apply_left_pane_width()
         self._populate_initial_target_lists()
         self._refresh_online_pane(self._ui._client.online_users())
@@ -1930,13 +2050,17 @@ class _WhatspycApp(App):
             return
         item.query_one(Static).update(self._target_label(target))
 
-    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-        if event.tab is None:
-            return
-        if event.tab.id == "tab-channels":
-            self.query_one("#target-switcher", ContentSwitcher).current = "channels"
-        elif event.tab.id == "tab-dms":
-            self.query_one("#target-switcher", ContentSwitcher).current = "dms"
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # Tab-strip buttons swap the target ContentSwitcher. Other Button
+        # presses (modal buttons, future widgets) are uninteresting here
+        # — fall through silently rather than ``event.stop()``-ing.
+        btn_id = event.button.id or ""
+        if btn_id in ("tab-channels", "tab-dms"):
+            if self._w_tabs is not None:
+                self._w_tabs.set_active(btn_id)
+            switcher = self._w_target_switcher
+            if switcher is not None:
+                switcher.current = "channels" if btn_id == "tab-channels" else "dms"
 
     async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if self._suppress_highlight:
@@ -2478,6 +2602,30 @@ class _WhatspycApp(App):
 
         header.update(f"Online ({len(wanted_norm)})")
 
+    def _schedule_he_refresh(self) -> None:
+        """Arm a short debounce timer for the post-``he`` repaint.
+
+        Connect-time bursts of ``he`` events would otherwise drive one
+        full online-pane diff + per-DM-target relabel + thread-header
+        refresh per arrival. Collapsing into a single deferred refresh
+        keeps the cost linear in (hams + DMs) instead of quadratic.
+        Subsequent calls while a refresh is pending are no-ops.
+        """
+        if self._he_refresh_pending:
+            return
+        self._he_refresh_pending = True
+        self.set_timer(0.05, self._do_he_refresh)
+
+    def _do_he_refresh(self) -> None:
+        self._he_refresh_pending = False
+        self._refresh_online_pane(self._ui._client.online_users())
+        seen: set[TargetKey] = set()
+        for tkey in list(self._unread.keys()) + list(self._views.keys()):
+            if tkey[0] == "dm" and tkey not in seen:
+                seen.add(tkey)
+                self._refresh_target_label(tkey)
+        self._refresh_thread_header()
+
     # ------------------------------------------------------------------
     # Status pane (Ctrl+S)
     # ------------------------------------------------------------------
@@ -2707,13 +2855,21 @@ class _WhatspycApp(App):
                 inp.placeholder = f"{kind}:{key}> "
 
     def _is_subscribed(self, cid: int) -> bool:
-        try:
-            for r in self._ui._client._store.list_channels():  # type: ignore[attr-defined]
-                if r["cid"] == cid:
-                    return bool(r["subscribed"])
-        except Exception:
-            return False
-        return False
+        cids = self._subscribed_cids
+        if cids is None:
+            try:
+                cids = {
+                    r["cid"]
+                    for r in self._ui._client._store.list_channels()  # type: ignore[attr-defined]
+                    if r.get("subscribed")
+                }
+            except Exception:
+                cids = set()
+            self._subscribed_cids = cids
+        return cid in cids
+
+    def _invalidate_subscribed_cids(self) -> None:
+        self._subscribed_cids = None
 
     def _maybe_print_paused_hint(self, cid: int) -> None:
         paused = self._ui._client.paused_channels().get(cid)
@@ -2952,13 +3108,7 @@ class _WhatspycApp(App):
         elif t == "o":
             self._refresh_online_pane(self._ui._client.online_users())
         elif t == "he":
-            self._refresh_online_pane(self._ui._client.online_users())
-            seen: set[TargetKey] = set()
-            for tkey in list(self._unread.keys()) + list(self._views.keys()):
-                if tkey[0] == "dm" and tkey not in seen:
-                    seen.add(tkey)
-                    self._refresh_target_label(tkey)
-            self._refresh_thread_header()
+            self._schedule_he_refresh()
         # Channel state / paused
         elif t == "cs":
             await self._handle_cs(obj)
@@ -3003,6 +3153,9 @@ class _WhatspycApp(App):
             self._write_to_active(line)
             if self._status_visible():
                 self._status_write(line)
+            # Server-side subscription state may have shifted across the
+            # link drop; rebuild the cache lazily on next consult.
+            self._invalidate_subscribed_cids()
         elif t == "_reconnect_giveup":
             line = (
                 f"[red][link][/] giving up after {obj.get('attempts')} "
@@ -3455,6 +3608,9 @@ class _WhatspycApp(App):
         cid = obj.get("cid")
         subscribed = bool(obj.get("s"))
         pc = obj.get("pc")
+        # Server confirmed a subscription state change — drop the cache so
+        # the next ``_is_subscribed`` reload picks up the new row.
+        self._invalidate_subscribed_cids()
         if cid is not None:
             name = self._channel_name(int(cid))
             label = f"{cid} #{name}" if name else f"{cid}"

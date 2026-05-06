@@ -134,6 +134,14 @@ class WpsClient:
 
         self._stream: AsyncByteStream | None = None
         self._online: set[str] = set()
+        # Memoised callsign -> resolved display name (or None when no row
+        # exists). Avoids a SQLite round trip per ``ham_name`` call from
+        # the TUI's render hot paths (every ``MessageRow.refresh_label``,
+        # every ``_refresh_online_pane`` entry). Invalidated per-key by
+        # ``_on_he`` when the row is rewritten and cleared on each
+        # ``_handshake`` so a fresh connect doesn't carry stale entries
+        # across a state-dir change.
+        self._ham_name_cache: dict[str, str | None] = {}
         # cid -> pending-post count from the most recent `pch` (server told us
         # the channel exceeds maxNewPostsToReturnPerChannelOnConnect; we need
         # to send `cu` to unpause and download).
@@ -168,6 +176,7 @@ class WpsClient:
         self._first_frame_seen = False
         # Fresh handshake → wait for the server's `o` payload to repopulate.
         self._online.clear()
+        self._ham_name_cache.clear()
         # Paused-channel and cs-ack-waiter state is per-connection: the
         # server's `pch` / `cs` replies only refer to *this* session.
         self._paused_channels.clear()
@@ -264,14 +273,22 @@ class WpsClient:
         protocol's ``uc`` / ``ud`` / ``o`` / ``m`` / ``cp`` events carry
         callsigns only, so UIs that want to show a name alongside a call
         have to look it up here.
+
+        Memoised in ``_ham_name_cache``. ``None`` is a valid cached
+        value (no row), so misses are detected via ``in`` rather than
+        a default. Cache entries are evicted per-callsign by ``_on_he``
+        and cleared wholesale on each ``_handshake``.
         """
         if not call:
             return None
-        row = self._store.lookup_ham(call)
-        if row is None:
-            return None
-        name = row.get("name")
-        return name or None
+        key = call.upper()
+        cache = self._ham_name_cache
+        if key in cache:
+            return cache[key]
+        row = self._store.lookup_ham(key)
+        name = (row.get("name") if row else None) or None
+        cache[key] = name
+        return name
 
     def paused_channels(self) -> dict[int, int]:
         """Channels the server flagged via ``pch`` as having too many new
@@ -1355,7 +1372,10 @@ class WpsClient:
         async def _on_he(o: dict) -> None:
             for h in o.get("h", []):
                 if isinstance(h, dict):
-                    self._store.upsert_ham(h.get("c", ""), h.get("n", ""), h.get("ts", 0))
+                    call = h.get("c", "")
+                    self._store.upsert_ham(call, h.get("n", ""), h.get("ts", 0))
+                    if call:
+                        self._ham_name_cache.pop(call.upper(), None)
 
         async def _on_online(o: dict) -> None:
             self._online = {c.upper() for c in o.get("o", []) if c}
