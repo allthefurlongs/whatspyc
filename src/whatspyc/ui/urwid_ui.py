@@ -1597,6 +1597,7 @@ class _UrwidApp:
 
         # Centre pane content switcher and thread header.
         self._centre_placeholder: urwid.WidgetPlaceholder | None = None
+        self._messages_box: urwid.LineBox | None = None
         self._centre_pane: urwid.Pile | None = None
         self._thread_header: urwid.Text | None = None
 
@@ -1744,12 +1745,18 @@ class _UrwidApp:
         self._centre_placeholder = urwid.WidgetPlaceholder(
             urwid.Filler(urwid.Text(("dim", "(no target — pick one from the left)")), valign="top")
         )
+        # LineBox frames the messages area so it visually matches the
+        # Textual sibling's ``#message-switcher { border: round $accent }``.
+        # Kept on ``self`` so ``_set_focus_step`` can find it by identity
+        # in ``_centre_pane.contents`` (the Pile holds the LineBox, not
+        # the placeholder, after wrapping).
+        self._messages_box = urwid.LineBox(self._centre_placeholder)
 
         centre_pane = urwid.Pile(
             [
                 ("weight", 1, self._status_holder),
                 ("pack", urwid.AttrMap(self._thread_header, "bold")),
-                ("weight", 5, self._centre_placeholder),
+                ("weight", 5, self._messages_box),
             ]
         )
         # Capture so the focus-step machinery can set
@@ -1769,14 +1776,34 @@ class _UrwidApp:
                 ("yellow", "[offline] read-only mode — browsing local store, no connection")
             )
 
-        # ----- Main split: left + centre -----
+        # ----- Main split: left + separator + centre -----
+        # Continuous vertical line column mirrors the Textual sibling's
+        # ``#left { border-right: solid $accent }``. SolidFill is non-
+        # selectable so keyboard focus skips over it; the explicit column
+        # means dividechars stays 0 (the separator IS the divider).
+        # NOTE: separator at index 1 shifts the centre column to index 2 —
+        # ``_get_focus_step`` / ``_set_focus_step`` reference position 2
+        # for "messages".
         left_width = self._compute_left_pane_width()
-        body = urwid.Columns(
+        body_columns = urwid.Columns(
             [
                 (left_width, urwid.AttrMap(left_pane, None)),
+                (1, urwid.AttrMap(urwid.SolidFill("│"), "border")),
                 ("weight", 1, urwid.AttrMap(centre_pane, None)),
             ],
-            dividechars=1,
+            dividechars=0,
+        )
+        # Full-width horizontal divider one row below the body Columns.
+        # Caps the vertical separator and the messages-LineBox bottom
+        # border at the same row — without it the SolidFill ``│`` (which
+        # paints its full cell height) reads as extending past the lower
+        # divider on the left pane, since ``─`` only paints the cell's
+        # vertical middle.
+        body = urwid.Pile(
+            [
+                ("weight", 1, body_columns),
+                ("pack", urwid.AttrMap(urwid.Divider("─"), "border")),
+            ]
         )
 
         # ----- Input -----
@@ -3928,14 +3955,17 @@ class _UrwidApp:
             return "input"
         if self._frame.focus_position == "footer":
             return "input"
-        # focus is on body (Columns).
+        # Body is a Pile [body_columns, bottom Divider]. Unwrap to the
+        # Columns the rest of this method reasons about.
         try:
-            cols = self._frame.contents["body"][0]
+            body = self._frame.contents["body"][0]
         except Exception:
             return "input"
+        cols = body.contents[0][0] if isinstance(body, urwid.Pile) else body
         if not isinstance(cols, urwid.Columns):
             return "input"
-        if cols.focus_position == 1:
+        # Body Columns: 0=left pane, 1=vertical separator, 2=centre pane.
+        if cols.focus_position == 2:
             return "messages"
         # Left column (the Pile). Inspect Pile.focus_position to narrow
         # down to tabs / targets.
@@ -3963,17 +3993,27 @@ class _UrwidApp:
         if step == "input":
             self._focus_input()
             return
-        # Body stops.
+        # Body stops. ``body`` is a Pile [body_columns, bottom Divider];
+        # unwrap to the inner Columns and pin the Pile's focus to the
+        # Columns so keys reach it.
         try:
             self._frame.focus_position = "body"
-            cols = self._frame.contents["body"][0]
+            body = self._frame.contents["body"][0]
         except Exception:
             return
+        if isinstance(body, urwid.Pile):
+            try:
+                body.focus_position = 0
+            except (IndexError, ValueError):
+                pass
+            cols = body.contents[0][0]
+        else:
+            cols = body
         if not isinstance(cols, urwid.Columns):
             return
         if step == "messages":
             try:
-                cols.focus_position = 1
+                cols.focus_position = 2
                 # The centre Pile defaults focus to position 0, which
                 # is either the status holder (non-selectable) or the
                 # thread header. Force focus onto the message-list
@@ -3983,7 +4023,7 @@ class _UrwidApp:
                 if self._centre_pane is not None:
                     try:
                         for i, (w, _) in enumerate(self._centre_pane.contents):
-                            if w is self._centre_placeholder:
+                            if w is self._messages_box:
                                 self._centre_pane.focus_position = i
                                 break
                     except (IndexError, ValueError):
