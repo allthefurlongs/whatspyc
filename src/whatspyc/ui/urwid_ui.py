@@ -2092,6 +2092,25 @@ class _UrwidApp:
         for t in list(self._target_items.keys()):
             self._refresh_target_label(t)
 
+    def _refresh_tab_labels(self) -> None:
+        # Sum unread per kind and badge the *inactive* tab so the user
+        # sees activity in the hidden list. The active tab stays plain
+        # — its per-target rows already show (N) badges of their own.
+        bar = self._left_tab_bar
+        if bar is None:
+            return
+        active = bar.active_id
+        ch_unread = sum(n for (k, _), n in self._unread.items() if k == "ch" and n)
+        dm_unread = sum(n for (k, _), n in self._unread.items() if k == "dm" and n)
+        ch_btn = bar._buttons.get("ch")
+        dm_btn = bar._buttons.get("dm")
+        if ch_btn is not None:
+            show = ch_unread if active != "ch" else 0
+            ch_btn.set_label(f"Channels ({show})" if show else "Channels")
+        if dm_btn is not None:
+            show = dm_unread if active != "dm" else 0
+            dm_btn.set_label(f"DMs ({show})" if show else "DMs")
+
     def _on_target_activate(self, target: TargetKey) -> None:
         kind, key = target
         if kind == "ch":
@@ -2120,6 +2139,7 @@ class _UrwidApp:
             self._target_switcher.original_widget = self._channels_listbox
         else:
             self._target_switcher.original_widget = self._dms_listbox
+        self._refresh_tab_labels()
 
     # ------------------------------------------------------------------
     # Centre pane / per-target message ListBox
@@ -2147,6 +2167,7 @@ class _UrwidApp:
         if self._unread.get(target):
             self._unread[target] = 0
             self._refresh_target_label(target)
+            self._refresh_tab_labels()
 
     def _refresh_thread_header(self, target: TargetKey | None = None) -> None:
         if self._thread_header is None:
@@ -3493,6 +3514,7 @@ class _UrwidApp:
         else:
             self._unread[target] = self._unread.get(target, 0) + 1
             self._refresh_target_label(target)
+            self._refresh_tab_labels()
 
     async def _handle_inbound_post(self, p: dict, *, batched: bool) -> None:
         cid = int(p.get("cid", 0))
@@ -3510,6 +3532,7 @@ class _UrwidApp:
         else:
             self._unread[target] = self._unread.get(target, 0) + 1
             self._refresh_target_label(target)
+            self._refresh_tab_labels()
 
     async def _handle_inbound_dm_batch(self, items: list[dict]) -> None:
         # Group by peer.
@@ -3534,6 +3557,7 @@ class _UrwidApp:
             else:
                 self._unread[target] = self._unread.get(target, 0) + len(msgs)
                 self._refresh_target_label(target)
+                self._refresh_tab_labels()
 
     async def _handle_inbound_post_batch(self, cid: int, items: list[dict]) -> None:
         target = ("ch", str(cid))
@@ -3550,6 +3574,7 @@ class _UrwidApp:
         else:
             self._unread[target] = self._unread.get(target, 0) + len(items)
             self._refresh_target_label(target)
+            self._refresh_tab_labels()
 
     def _build_row_from_wire(
         self,

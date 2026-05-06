@@ -2065,6 +2065,39 @@ class _WhatspycApp(App):
             return
         item.query_one(Static).update(self._target_label(target))
 
+    def _refresh_tab_labels(self) -> None:
+        # Sum unread per kind and badge the *inactive* tab so the user
+        # sees activity in the hidden list. The active tab stays plain
+        # — its per-target rows already show (N) badges of their own.
+        # ``Button.label`` is a reactive that re-renders but doesn't
+        # re-layout — so a label growing from "DMs" to "DMs (3)" keeps
+        # the button at its old width and silently clips the suffix.
+        # Force a layout pass on the tab bar after each update.
+        bar = self._w_tabs
+        if bar is None:
+            return
+        active = getattr(bar, "_active_id", None)
+        ch_unread = sum(n for (k, _), n in self._unread.items() if k == "ch" and n)
+        dm_unread = sum(n for (k, _), n in self._unread.items() if k == "dm" and n)
+        changed = False
+        for child in bar.children:
+            if not isinstance(child, Button):
+                continue
+            if child.id == "tab-channels":
+                show = ch_unread if active != "tab-channels" else 0
+                new_label = f"Channels ({show})" if show else "Channels"
+            elif child.id == "tab-dms":
+                show = dm_unread if active != "tab-dms" else 0
+                new_label = f"DMs ({show})" if show else "DMs"
+            else:
+                continue
+            if str(child.label) != new_label:
+                child.label = new_label
+                child.refresh(layout=True)
+                changed = True
+        if changed:
+            bar.refresh(layout=True)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         # Tab-strip buttons swap the target ContentSwitcher. Other Button
         # presses (modal buttons, future widgets) are uninteresting here
@@ -2076,6 +2109,7 @@ class _WhatspycApp(App):
             switcher = self._w_target_switcher
             if switcher is not None:
                 switcher.current = "channels" if btn_id == "tab-channels" else "dms"
+            self._refresh_tab_labels()
 
     async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if self._suppress_highlight:
@@ -2207,6 +2241,7 @@ class _WhatspycApp(App):
         # Activating clears the unread count.
         if self._unread.pop(target, 0):
             self._refresh_target_label(target)
+            self._refresh_tab_labels()
         self._refresh_thread_header(target)
 
     def _refresh_thread_header(self, target: TargetKey | None = None) -> None:
@@ -2352,7 +2387,8 @@ class _WhatspycApp(App):
         for rk in [k for k in self._rows if k[0] == kind and k[1] == key]:
             self._rows.pop(rk, None)
         self._history_exhausted.pop(target, None)
-        self._unread.pop(target, None)
+        if self._unread.pop(target, None):
+            self._refresh_tab_labels()
         self._mount_initial_history(target, lv)
 
     async def _load_older(self) -> None:
@@ -3262,6 +3298,7 @@ class _WhatspycApp(App):
                 # on activation.
                 self._unread[target] = self._unread.get(target, 0) + len(group)
                 self._refresh_target_label(target)
+                self._refresh_tab_labels()
                 continue
             # Active target: resolve store rows for each item once, then
             # bulk-fetch reactions for the whole group in one query
@@ -3314,6 +3351,7 @@ class _WhatspycApp(App):
         if active != target:
             self._unread[target] = self._unread.get(target, 0) + len(items)
             self._refresh_target_label(target)
+            self._refresh_tab_labels()
             return
         store_rows: list[dict] = []
         for p in items:
@@ -3357,6 +3395,7 @@ class _WhatspycApp(App):
             # row will be paged in from the store on activation.
             self._unread[target] = self._unread.get(target, 0) + 1
             self._refresh_target_label(target)
+            self._refresh_tab_labels()
             return
         # Active target → mount the row. Look up the persisted row from
         # the store (by id) so we get the same fields the verbose render
@@ -3394,6 +3433,7 @@ class _WhatspycApp(App):
         if active != target:
             self._unread[target] = self._unread.get(target, 0) + 1
             self._refresh_target_label(target)
+            self._refresh_tab_labels()
             return
         ts = p.get("ts")
         row = None
