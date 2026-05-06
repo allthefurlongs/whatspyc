@@ -68,7 +68,7 @@ async def test_handshake_sends_callsign_when_passthrough(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_handshake_skips_callsign_when_injected(tmp_path: Path) -> None:
-    """RHP / AX.25 transports advertise ``injects_callsign = True``: the
+    """RHP transports advertise ``injects_callsign = True``: the
     upstream node has already sent the callsign on the WPS-facing
     socket. Sending it again breaks the handshake — WPS treats the
     second copy as the first JSON frame and disconnects with the

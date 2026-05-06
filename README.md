@@ -2,17 +2,12 @@
 
 A terminal client for the [WhatsPac](http://whatspac.oarc.uk/) packet-radio
 chat service. Speaks the WPS application protocol over an AX.25 link reached
-either via XRouter / BPQ (using **RHP v2**) or directly via a KISS TNC.
+via XRouter / BPQ using **RHP v2**.
 
 What it does today:
 
 - RHP v2 transports: WebSocket (`ws://host:8086/rhp` for Xrouter,
   `:8008` for BPQ) and raw TCP with a 2-byte length prefix.
-- KISS transports: TCP (Direwolf / QtSoundModem-style) and serial, both
-  driven by an in-process AX.25 v2.2 connected-mode L2 state machine
-  (SABM/SABME/UA, I-frame N(S)/N(R) at modulo 8 or 128, RR/RNR/REJ/SREJ,
-  T1/T3/N2). Optional digipeater paths, optional PID-0x08 segmentation,
-  optional KISS ACKMODE (G8BPQ command 0x0C).
 - A `direct-tcp` transport that talks straight to a raw WPS daemon (port
   63001 by default) — handy for offline UI testing against the in-tree
   `tests/fake_wps.py` server.
@@ -132,7 +127,7 @@ You'll land in a prompt. Slash commands:
 | `/history [N]` | replay the last `N` historic messages/posts for the current target from the local store. Defaults to `history_backfill` if `N` is omitted. Output style follows the `verbose_history` session option (compact by default, verbose when set). The same backfill runs automatically each time you switch target. |
 | `/vhistory [N]` | one-shot **verbose** replay of the last `N` items for the current target. Always renders the verbose form (local id, timestamp, delivery state for outbound items, real-time-receipt latency for inbound items) regardless of `verbose_history`. Does not change the session option. |
 | `/set [NAME [VALUE]]` | view or change session-tunable options. `/set` lists every option with its current value and a one-line description; `/set NAME` shows just one; `/set NAME VALUE` updates it for the running session (does not persist — restart picks the config-file value back up). Values like `on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0` are all accepted for booleans. Known options: `show_acks`, `show_edits`, `verbose_history`, `delivery_timeout_s`, `emoji_search_debounce_ms`. Each option is also a top-level config key with the same name. |
-| `/quit` | clean disconnect (drops the local AX.25 link; the rest of the chain follows) |
+| `/quit` | clean disconnect (drops the RHP link; the rest of the chain follows) |
 
 # Configuration reference
 
@@ -149,8 +144,7 @@ The schema splits in two:
   multi-hop paths) a `connect_sequence` of node-prompt commands.
 
 Connection-specific keys (`transport`, `host`, `port`, `engine`,
-`radio_port`, `ax_level`, `remote`, `rhp_auth_*`, all the `kiss_*` keys,
-`digipeaters`, `ax25_modulo`, `ax25_segmentation`, `connect_sequence`)
+`radio_port`, `ax_level`, `remote`, `rhp_auth_*`, `connect_sequence`)
 **must** sit inside a `[[connect_profiles]]` block. Putting them at the
 top level is rejected at config-load time.
 
@@ -195,31 +189,22 @@ or the profile name to choose another.
 | field | type | default | meaning |
 | --- | --- | --- | --- |
 | `name` | string | *(required)* | Profile name. Referenced by `default_profile` and `--profile NAME`. |
-| `transport` | string | `"rhp-ws"` | `"rhp-ws"`, `"rhp-tcp"`, `"direct-tcp"`, `"kiss-tcp"`, `"kiss-serial"`. |
-| `host` | string | `"localhost"` | Hostname / IP for non-serial transports. |
-| `port` | int \| null | *(engine default)* | TCP/WS port. Engine-driven defaults apply unless you set this explicitly — see [Engine defaults](#engine-defaults). For RHP transports the engine resolves it; for `direct-tcp` and `kiss-tcp` it falls back to the transport default. |
-| `engine` | string | *(required for RHP)* | `"xrouter"`, `"bpq"`, or `"custom"`. **Required for `transport = "rhp-ws"` / `"rhp-tcp"`**, ignored for other transports. Drives the defaults for `port`, `radio_port`, `remote`, and the BPQ `SWITCH` connect step — see [Engine defaults](#engine-defaults). Use `"custom"` to opt out of all defaulting and configure every field manually. |
-| `radio_port` | int \| null | *(engine default)* | Radio-port index sent in the RHP `OPEN` message. Defaults to `1` for both `xrouter` and `bpq`. Serialized as a JSON string (`"1"`) on the wire, matching the production web client. `engine = "custom"` does not default it; `null` drops the field from the open. Ignored for `kiss-*`. |
-| `ax_level` | string | `"L2"` | RHP `pfam`: `"L2"` → `"ax25"` (raw AX.25 to the radio), `"L4"` → `"netrom"` (NET/ROM Layer 4). Ignored for `kiss-*`. |
+| `transport` | string | `"rhp-ws"` | `"rhp-ws"`, `"rhp-tcp"`, or `"direct-tcp"`. |
+| `host` | string | `"localhost"` | Hostname / IP. |
+| `port` | int \| null | *(engine default)* | TCP/WS port. Engine-driven defaults apply unless you set this explicitly — see [Engine defaults](#engine-defaults). For RHP transports the engine resolves it; for `direct-tcp` it falls back to the transport default. |
+| `engine` | string | *(required for RHP)* | `"xrouter"`, `"bpq"`, or `"custom"`. **Required for `transport = "rhp-ws"` / `"rhp-tcp"`**, ignored for `direct-tcp`. Drives the defaults for `port`, `radio_port`, `remote`, and the BPQ `SWITCH` connect step — see [Engine defaults](#engine-defaults). Use `"custom"` to opt out of all defaulting and configure every field manually. |
+| `radio_port` | int \| null | *(engine default)* | Radio-port index sent in the RHP `OPEN` message. Defaults to `1` for both `xrouter` and `bpq`. Serialized as a JSON string (`"1"`) on the wire, matching the production web client. `engine = "custom"` does not default it; `null` drops the field from the open. |
+| `ax_level` | string | `"L2"` | RHP `pfam`: `"L2"` → `"ax25"` (raw AX.25 to the radio), `"L4"` → `"netrom"` (NET/ROM Layer 4). |
 | `remote` | string | *(engine default)* | The AX.25 link-layer destination callsign. `engine = "bpq"` defaults this to `"SWITCH"` (BPQ's node command interface). Other engines default to `"WPS"`. Common values: `WPS`, `WPSDEV`, `MB7NPW-9`, `WTSPAC`, `SWITCH`. |
 | `connect_sequence` | array of `{cmd, val, timeout?}` | `[]` | Node-prompt commands run **before** the WPS handshake. Empty for direct-tcp or RHP routes that already land you at WPS. See [Connect script](#connect-script). |
 | `rhp_auth_user` | string \| null | `null` | RHP login if the host node requires it. Sends an `AUTH` message before `OPEN`. |
 | `rhp_auth_pass` | string \| null | `null` | RHP password. |
-| `kiss_device` | string \| null | `null` | Serial path for `kiss-serial` (e.g. `/dev/ttyUSB0`). **Required** when `transport = "kiss-serial"`. |
-| `kiss_baud` | int | `9600` | Serial line speed. Ignored for `kiss-tcp`. |
-| `kiss_port` | int | `0` | KISS sub-port byte (0–15). Use this when a multi-port TNC exposes more than one radio over the same KISS link. |
-| `kiss_ackmode` | bool | `false` | Enable the G8BPQ KISS ACKMODE extension (command `0x0C`). The TNC echoes a synthetic ACK once each frame is on-air, so the L2 starts T1 from real over-the-air time. |
-| `digipeaters` | list of strings | `[]` | AX.25 digi path between you and `remote`. Each entry `BASE[-SSID]`. Same chain rides on every I/S/U frame, including the SABM/SABME. KISS transports only. |
-| `ax25_modulo` | int | `8` | `8` or `128`. `128` opens with SABME (extended mode) and uses 7-bit N(S)/N(R) — bigger windows + SREJ. Auto-falls-back to SABM/modulo-8 if the peer FRMRs/DMs. KISS transports only. |
-| `ax25_segmentation` | bool | `false` | Enable AX.25 §4.3.3.2 PID-0x08 segmentation. KISS transports only. |
 
 Each of these profile fields also has a corresponding CLI flag
 (`--transport`, `--host`, `--port`, `--engine`, `--radio-port`,
-`--ax-level`, `--remote`, `--kiss-device`, `--kiss-baud`, `--kiss-port`,
-`--kiss-ackmode`/`--no-kiss-ackmode`, `--digipeaters`, `--ax25-modulo`,
-`--ax25-segmentation`/`--no-ax25-segmentation`) that lets you build an
-**ad-hoc profile** at the command line without touching the config file.
-RHP auth has no CLI flag — set those in the file only.
+`--ax-level`, `--remote`) that lets you build an **ad-hoc profile** at
+the command line without touching the config file. RHP auth has no CLI
+flag — set those in the file only.
 
 ### Engine defaults
 
@@ -242,8 +227,7 @@ need to talk to a non-standard host node and want to wire every field
 yourself. With `custom` and `transport = "rhp-ws"` you must set `port`
 explicitly.
 
-For `direct-tcp` and `kiss-*` transports `engine` is irrelevant and is
-ignored if set.
+For `direct-tcp` `engine` is irrelevant and is ignored if set.
 
 ### Connect script
 
@@ -304,16 +288,16 @@ match that ended the step.
 
 ### Disconnect on quit
 
-There is intentionally no scripted teardown. Closing the local AX.25 link
-to the entry node (which `/quit` does as part of `stream.close()`) drops
+There is intentionally no scripted teardown. Closing the RHP link to
+the entry node (which `/quit` does as part of `stream.close()`) drops
 that hop, and the rest of the AX.25 / NET-ROM chain tears down by
 ordinary protocol behaviour. Adding `B` / `BYE` per hop would be redundant
 and slow the close path down for no benefit.
 
 ### Reconnect behaviour
 
-When the link drops unexpectedly (TCP EOF, KISS read error, RHP
-disconnect, …) the default is to print `[link] disconnected` and end
+When the link drops unexpectedly (TCP EOF, RHP disconnect, …) the
+default is to print `[link] disconnected` and end
 the active session. The cli then prints `Disconnected from WPS.` and
 either re-shows the connection-profile picker (if that's how you
 landed on this profile in the first place) or asks
@@ -562,40 +546,6 @@ connect_sequence = [
 ]
 ```
 
-### KISS-TCP to Direwolf with the textual TUI and a digi path
-
-```toml
-my_call = "N0CALL"
-ui      = "textual"
-default_profile = "direwolf"
-
-[[connect_profiles]]
-name = "direwolf"
-transport = "kiss-tcp"
-host = "127.0.0.1"
-port = 8001
-remote = "MB7NPW-9"
-digipeaters = ["RELAY1", "RELAY2-7"]
-connect_sequence = [
-  { cmd = "C MB7NPW-9", val = "Connected to MB7NPW-9" },
-  { cmd = "C WPS",      val = "Connected to WPS" },
-]
-```
-
-### KISS-serial to a hardware TNC
-
-```toml
-my_call = "N0CALL"
-default_profile = "tnc"
-
-[[connect_profiles]]
-name = "tnc"
-transport = "kiss-serial"
-kiss_device = "/dev/ttyUSB0"
-kiss_baud = 9600
-remote = "MB7NPW-9"
-```
-
 ### RHP over plain TCP, with auth
 
 ```toml
@@ -634,12 +584,6 @@ connect_sequence = [
   { cmd = "C MB7NPW", val = "Connected to MB7NPW" },
   { cmd = "C WPS",    val = "Connected to WPS" },
 ]
-
-[[connect_profiles]]
-name = "tnc-emergency"
-transport = "kiss-serial"
-kiss_device = "/dev/ttyUSB0"
-remote = "MB7NPW-9"
 ```
 
 ## Default-port reference
@@ -655,8 +599,6 @@ default depends on `transport` and `engine`:
 | `rhp-tcp` | `xrouter` / `bpq` | 9000 |
 | `rhp-tcp` | `custom` | none — set `port` explicitly |
 | `direct-tcp` | *(n/a)* | 63001 (WPS native TCP port) |
-| `kiss-tcp` | *(n/a)* | 8001 |
-| `kiss-serial` | *(n/a)* | uses `kiss_device` instead of a port |
 
 ## State directory layout
 
@@ -686,24 +628,8 @@ right unit.
 
 ## Advanced (Python API only)
 
-A few link- and protocol-level knobs aren't surfaced as CLI flags / config
-keys — pass them when constructing `Ax25L2Stream` or `WpsClient` from
-Python:
-
-`Ax25L2Stream(...)` (in `whatspyc.transport.ax25_l2`):
-
-| kwarg | default | meaning |
-| --- | --- | --- |
-| `t1` | `10.0` s | Acknowledgement timeout. Drives retry / poll. |
-| `t3` | `300.0` s | Link-idle keepalive. Sends an RR P=1 to verify the peer. |
-| `n2` | `10` | Maximum retry count before declaring the link broken. |
-| `window` | `4` | I-frames in flight (max `7` modulo-8, max `127` modulo-128). |
-| `paclen` | `256` | Maximum I-frame information field. Larger user writes are split (or PID-0x08 segmented when `segmentation=True`). |
-| `connect_timeout` | `30.0` s | Overall SABM-to-UA wait at `open()`. |
-| `digipeaters` | `[]` | List of digipeater callsigns (`"DIGI1"`, `"DIGI2-7"`, ...) inserted between source and destination on every frame. |
-| `modulo` | `8` | `8` or `128`. Selects SABM vs SABME and the I/S-frame control-field width. Falls back to 8 on FRMR/DM in response to SABME. |
-| `segmentation` | `False` | Enable AX.25 §4.3.3.2 PID-0x08 segmentation/reassembly. |
-| `ackmode` | `False` | Defer T1 until KISS ACKMODE confirms each I-frame is on-air. Requires the lower (`KissTcpUI`/`KissSerialUI`) to be opened with `ackmode=True` too — `connect_stream(...)` does this for you. |
+A few protocol-level knobs aren't surfaced as CLI flags / config keys —
+pass them when constructing `WpsClient` from Python.
 
 `WpsClient(...)` (in `whatspyc.wps.client`):
 
@@ -818,7 +744,7 @@ explicitly.
 
 So you can exercise `/dm`, `/ch`, plain text, `/sub`, `/unsub`,
 `/editdm`, `/editpost`, `/react`, `/quit` against the same in-process
-state machine the real client uses, without needing RHP or a TNC.
+state machine the real client uses, without needing RHP.
 
 ## Multi-hop UI testing with `fake_node`
 
@@ -967,8 +893,7 @@ HopScriptError: node returned error token 'FAILURE' while waiting for
 pytest
 ```
 
-`tests/integration/` holds end-to-end tests: a KISS-TCP+L2 loopback, a
-fake-WPS direct-TCP smoke, and a fake-node-prompt + fake-WPS hop-script
-test (all always run); a remote-node smoke test gated on
-`WHATSPYC_INTEGRATION_HOST`.
+`tests/integration/` holds end-to-end tests: a fake-WPS direct-TCP
+smoke and a fake-node-prompt + fake-WPS hop-script test (both always
+run); a remote-node smoke test gated on `WHATSPYC_INTEGRATION_HOST`.
 

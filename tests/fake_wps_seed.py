@@ -177,8 +177,8 @@ def default_seed() -> SeedState:
             peer_name="Sarah",
             messages=[
                 ("in", "Pi build worked first time, thanks.", 7200),
-                ("out", "Great — KISS or AGW?", 7100),
-                ("in", "KISS over TCP, working a treat.", 7000),
+                ("out", "Great — got it talking to the node?", 7100),
+                ("in", "Yep, all green over RHP.", 7000),
             ],
         ),
     ]

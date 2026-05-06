@@ -200,8 +200,8 @@ class WpsClient:
             )
         if not self._stream.injects_callsign:
             # Direct TCP to the WPS daemon: client must send the callsign
-            # line itself. AX.25 paths (RHP, KISS connected-mode) skip
-            # this — the upstream node has already pre-sent it.
+            # line itself. RHP paths skip this — the upstream node has
+            # already pre-sent it on the WPS-facing socket.
             await self._stream.send(f"{self._my_call}\r\n".encode("utf-8"))
         record = self._store.connect_record(self._name, self._my_call, CLIENT_VERSION)
         # _send is not yet usable (connected event isn't set), so log
@@ -881,8 +881,8 @@ class WpsClient:
 
         Takes the wire dict (not bytes) so the application-protocol layer
         can be traced at DEBUG before compression — wire-level dumps
-        (websockets, RHP, KISS) only show the framed/compressed bytes,
-        which are unreadable for any frame that crosses the compression
+        (websockets, RHP) only show the framed/compressed bytes, which
+        are unreadable for any frame that crosses the compression
         threshold.
         """
         logger.debug("WPS> %s", json.dumps(obj, separators=(",", ":")))

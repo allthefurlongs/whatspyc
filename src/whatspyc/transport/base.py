@@ -1,7 +1,7 @@
 """Transport abstraction.
 
 A transport hides whichever wire protocol carries WPS bytes — RHP-over-TCP,
-RHP-over-WebSocket, or raw KISS — and presents a clean async byte-stream
+RHP-over-WebSocket, or direct TCP — and presents a clean async byte-stream
 interface to ``WpsClient``.
 """
 
@@ -22,7 +22,7 @@ class AsyncByteStream(abc.ABC):
     @abc.abstractmethod
     async def open(self) -> None:
         """Establish the underlying transport (connect TCP/WS, send AUTH/OPEN
-        for RHP, set up KISS port, etc.)."""
+        for RHP, etc.)."""
 
     @abc.abstractmethod
     async def send(self, data: bytes) -> None:
@@ -39,9 +39,9 @@ class AsyncByteStream(abc.ABC):
     @property
     def injects_callsign(self) -> bool:
         """True if the link already supplies WPS with the originating
-        callsign — e.g. an AX.25 host node opens the WPS-facing TCP
-        socket on our behalf and pre-sends the call. False (the default)
-        means the link is passthrough and ``WpsClient`` must send the
+        callsign — i.e. an RHP host node opens the WPS-facing TCP socket
+        on our behalf and pre-sends the call. False (the default) means
+        the link is passthrough and ``WpsClient`` must send the
         ``<CALL>\\r\\n`` line itself before the type-`c` JSON.
         """
         return False

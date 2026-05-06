@@ -4,9 +4,9 @@ WPS itself listens on TCP 63001 by default (direct, no RF). This transport
 is also the thing to point at the in-tree ``tests/fake_wps.py`` server for
 offline UI smoke testing.
 
-There is deliberately no RHP / KISS framing here: send writes go straight
-to the socket and recv reads return whatever bytes are available. The WPS
-codec layer does its own ``\\r\\n`` / compression framing on top.
+There is deliberately no RHP framing here: send writes go straight to the
+socket and recv reads return whatever bytes are available. The WPS codec
+layer does its own ``\\r\\n`` / compression framing on top.
 """
 
 from __future__ import annotations

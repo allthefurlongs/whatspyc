@@ -274,8 +274,8 @@ COMMANDS: dict[str, CommandHelp] = {
         usage="/quit",
         summary="Disconnect and exit cleanly.",
         details=(
-            "Closes the local AX.25 link to the entry node. The rest "
-            "of the chain tears down through normal protocol behaviour."
+            "Closes the RHP link to the entry node. The rest of the "
+            "chain tears down through normal protocol behaviour."
         ),
     ),
 }

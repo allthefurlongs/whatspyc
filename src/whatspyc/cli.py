@@ -20,8 +20,6 @@ from whatspyc import config as cfg_mod
 from whatspyc import log
 from whatspyc.config import ConnectProfile
 from whatspyc.store.store import SqliteStore
-from whatspyc.transport import kiss_serial as kiss_serial_mod
-from whatspyc.transport import kiss_tcp as kiss_tcp_mod
 from whatspyc.transport.base import AsyncByteStream
 from whatspyc.transport.direct_tcp import DirectTcpStream
 from whatspyc.transport.rhp_session import RhpConfig
@@ -97,40 +95,6 @@ def _build_stream_for(profile: ConnectProfile, my_call: str) -> AsyncByteStream:
         return RhpTcpStream(profile.host, port, rhp_cfg)
     if profile.transport == "direct-tcp":
         return DirectTcpStream(profile.host, port)
-    if profile.ax25_modulo not in (8, 128):
-        raise click.UsageError(
-            f"ax25_modulo must be 8 or 128 (got {profile.ax25_modulo!r})"
-        )
-    l2_kwargs: dict = {
-        "modulo": profile.ax25_modulo,
-        "segmentation": profile.ax25_segmentation,
-    }
-    if profile.transport == "kiss-tcp":
-        return kiss_tcp_mod.connect_stream(
-            profile.host,
-            port,
-            my_call,
-            profile.remote,
-            kiss_port=profile.kiss_port,
-            ackmode=profile.kiss_ackmode,
-            digipeaters=list(profile.digipeaters),
-            **l2_kwargs,
-        )
-    if profile.transport == "kiss-serial":
-        if not profile.kiss_device:
-            raise click.UsageError(
-                "kiss-serial transport needs --kiss-device or kiss_device in the profile"
-            )
-        return kiss_serial_mod.connect_stream(
-            profile.kiss_device,
-            profile.kiss_baud,
-            my_call,
-            profile.remote,
-            kiss_port=profile.kiss_port,
-            ackmode=profile.kiss_ackmode,
-            digipeaters=list(profile.digipeaters),
-            **l2_kwargs,
-        )
     raise click.UsageError(f"transport {profile.transport!r} not recognised")
 
 
@@ -157,13 +121,6 @@ def _adhoc_profile(
     radio_port: int | None,
     ax_level: str | None,
     remote: str | None,
-    kiss_device: str | None,
-    kiss_baud: int | None,
-    kiss_port: int | None,
-    kiss_ackmode: bool | None,
-    digipeaters: list[str] | None,
-    ax25_modulo: int | None,
-    ax25_segmentation: bool | None,
     hops: list[HopStep],
 ) -> ConnectProfile:
     """Build a one-shot profile from CLI flags + --hop entries."""
@@ -181,13 +138,6 @@ def _adhoc_profile(
         "radio_port": radio_port,
         "ax_level": ax_level,
         "remote": remote,
-        "kiss_device": kiss_device,
-        "kiss_baud": kiss_baud,
-        "kiss_port": kiss_port,
-        "kiss_ackmode": kiss_ackmode,
-        "digipeaters": digipeaters,
-        "ax25_modulo": ax25_modulo,
-        "ax25_segmentation": ax25_segmentation,
     }
     for k, v in flags.items():
         if v is not None:
@@ -314,9 +264,7 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
 )
 @click.option(
     "--transport",
-    type=click.Choice(
-        ["rhp-ws", "rhp-tcp", "direct-tcp", "kiss-serial", "kiss-tcp"]
-    ),
+    type=click.Choice(["rhp-ws", "rhp-tcp", "direct-tcp"]),
     default=None,
 )
 @click.option("--host", default=None)
@@ -332,30 +280,6 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
     default=None,
     help="Directory for the SQLite state DB (default: "
     "$XDG_DATA_HOME/whatspyc, i.e. ~/.local/share/whatspyc).",
-)
-@click.option("--kiss-device", default=None, help="Serial device for kiss-serial (e.g. /dev/ttyUSB0)")
-@click.option("--kiss-baud", type=int, default=None)
-@click.option("--kiss-port", type=int, default=None, help="KISS sub-port (0-15)")
-@click.option(
-    "--kiss-ackmode/--no-kiss-ackmode",
-    default=None,
-    help="Enable the KISS ACKMODE extension (G8BPQ command 0x0C). Off by default.",
-)
-@click.option(
-    "--digipeaters",
-    default=None,
-    help="Comma-separated AX.25 digipeater path (e.g. RELAY1,RELAY2-7). KISS transports only.",
-)
-@click.option(
-    "--ax25-modulo",
-    type=click.Choice(["8", "128"]),
-    default=None,
-    help="AX.25 sequence-number modulus. 8 is standard; 128 negotiates extended (SABME).",
-)
-@click.option(
-    "--ax25-segmentation/--no-ax25-segmentation",
-    default=None,
-    help="Enable AX.25 PID 0x08 segmentation/reassembly. Off by default.",
 )
 @click.option(
     "--ui",
@@ -386,8 +310,7 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
     "pane, line UI → stderr. 'pane' is rejected with --ui line.",
 )
 def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_port, ax_level,
-         my_call, name, remote, state_dir, kiss_device, kiss_baud, kiss_port, kiss_ackmode,
-         digipeaters, ax25_modulo, ax25_segmentation, ui_mode, log_level, log_file,
+         my_call, name, remote, state_dir, ui_mode, log_level, log_file,
          log_console) -> None:
     """Connect to a WhatsPac service and drop into an interactive prompt."""
     click.echo(
@@ -435,10 +358,6 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
     if effective_ui == "textual":
         _apply_textual_perf_env(c)
 
-    digi_list: list[str] | None = None
-    if digipeaters is not None:
-        digi_list = [d.strip() for d in digipeaters.split(",") if d.strip()]
-
     parsed_hops = _parse_hops(hops)
     adhoc_args = {
         "transport": transport,
@@ -448,13 +367,6 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
         "radio_port": radio_port,
         "ax_level": ax_level,
         "remote": remote,
-        "kiss_device": kiss_device,
-        "kiss_baud": kiss_baud,
-        "kiss_port": kiss_port,
-        "kiss_ackmode": kiss_ackmode,
-        "digipeaters": digi_list,
-        "ax25_modulo": int(ax25_modulo) if ax25_modulo is not None else None,
-        "ax25_segmentation": ax25_segmentation,
     }
     profile = _pick_profile(
         c,

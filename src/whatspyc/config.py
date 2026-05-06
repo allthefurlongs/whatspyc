@@ -47,13 +47,6 @@ _PROFILE_KEYS = frozenset(
         "remote",
         "rhp_auth_user",
         "rhp_auth_pass",
-        "kiss_device",
-        "kiss_baud",
-        "kiss_port",
-        "kiss_ackmode",
-        "digipeaters",
-        "ax25_modulo",
-        "ax25_segmentation",
         "connect_sequence",
     }
 )
@@ -101,7 +94,7 @@ class ConnectProfile:
     """One named path to a WPS service."""
 
     name: str
-    transport: str = "rhp-ws"  # "rhp-ws", "rhp-tcp", "kiss-serial", "kiss-tcp", "direct-tcp"
+    transport: str = "rhp-ws"  # "rhp-ws", "rhp-tcp", or "direct-tcp"
     host: str = "localhost"
     port: int | None = None
     engine: str | None = None  # "xrouter", "bpq", or "custom" — required for rhp-*
@@ -110,13 +103,6 @@ class ConnectProfile:
     remote: str = "WPS"
     rhp_auth_user: str | None = None
     rhp_auth_pass: str | None = None
-    kiss_device: str | None = None
-    kiss_baud: int = 9600
-    kiss_port: int = 0
-    kiss_ackmode: bool = False
-    digipeaters: list[str] = field(default_factory=list)
-    ax25_modulo: int = 8
-    ax25_segmentation: bool = False
     connect_script: list[HopStep] = field(default_factory=list)
 
 
@@ -251,8 +237,6 @@ def default_port(engine: str | None, transport: str) -> int | None:
         if engine == "bpq":
             return 8008
         return None
-    if transport == "kiss-tcp":
-        return 8001
     if transport == "direct-tcp":
         return 63001  # WPS native TCP port (matches tests/fake_wps.py)
     return None
@@ -540,22 +524,14 @@ def _parse_profile(entry: dict) -> ConnectProfile:
         "remote",
         "rhp_auth_user",
         "rhp_auth_pass",
-        "kiss_device",
     ):
         if k in entry:
             setattr(p, k, entry[k])
             user_supplied.add(k)
-    for k in ("port", "radio_port", "kiss_baud", "kiss_port", "ax25_modulo"):
+    for k in ("port", "radio_port"):
         if k in entry:
             setattr(p, k, entry[k])
             user_supplied.add(k)
-    for k in ("kiss_ackmode", "ax25_segmentation"):
-        if k in entry:
-            setattr(p, k, bool(entry[k]))
-            user_supplied.add(k)
-    if "digipeaters" in entry:
-        p.digipeaters = list(entry["digipeaters"])
-        user_supplied.add("digipeaters")
     if "connect_sequence" in entry:
         p.connect_script = [_parse_step(i, s) for i, s in enumerate(entry["connect_sequence"])]
         user_supplied.add("connect_script")
@@ -649,10 +625,10 @@ def resolve_engine_defaults(p: ConnectProfile, user_supplied: set[str]) -> None:
             p.radio_port = 1
         p.connect_script = _normalize_bpq_preamble(p.connect_script)
 
-    # Engine doesn't affect port for non-RHP transports, but default_port
-    # still has useful answers for kiss-tcp and direct-tcp. For "custom",
-    # leave port alone unless the transport has a non-engine-dependent
-    # default (rhp-tcp returns 9000 regardless).
+    # Engine doesn't affect port for direct-tcp, but default_port still has
+    # a useful answer for it. For "custom", leave port alone unless the
+    # transport has a non-engine-dependent default (rhp-tcp returns 9000
+    # regardless).
     if "port" not in user_supplied:
         port = default_port(engine, transport)
         if port is not None:

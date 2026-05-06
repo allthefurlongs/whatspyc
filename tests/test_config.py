@@ -29,9 +29,6 @@ engine = "xrouter"
 radio_port = 1
 ax_level = "L2"
 remote = "MB7NPW"
-digipeaters = ["RELAY1"]
-ax25_modulo = 128
-ax25_segmentation = true
 connect_sequence = [
   { cmd = "C MB7NPW", val = "Connected to MB7NPW", timeout = 30 },
   { cmd = "C WPS",    val = "Connected to WPS" },
@@ -53,9 +50,6 @@ def test_parse_full_sample() -> None:
 
     via = c.resolve_profile("via-mb7npw")
     assert via.engine == "xrouter"
-    assert via.ax25_modulo == 128
-    assert via.ax25_segmentation is True
-    assert via.digipeaters == ["RELAY1"]
     assert len(via.connect_script) == 2
     assert via.connect_script[0].cmd == "C MB7NPW"
     assert via.connect_script[0].val == "Connected to MB7NPW"
@@ -133,7 +127,6 @@ def test_connect_profile_dataclass_defaults() -> None:
     p = ConnectProfile(name="x")
     assert p.transport == "rhp-ws"
     assert p.connect_script == []
-    assert p.digipeaters == []
 
 
 def test_engine_required_for_rhp_transports() -> None:
