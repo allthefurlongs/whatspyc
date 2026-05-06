@@ -654,7 +654,6 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
             history_backfill=c.history_backfill,
             options=options,
             offline=True,
-            show_clock=c.textual_show_clock,
             cursor_blink=not c.low_power_mode,
         )
     elif c.ui == "urwid":
@@ -665,7 +664,6 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
             history_backfill=c.history_backfill,
             options=options,
             offline=True,
-            show_clock=c.textual_show_clock,
         )
     else:
         ui = LineUI(  # type: ignore[arg-type]
@@ -732,7 +730,6 @@ async def _connect_and_run_ui(
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
-            show_clock=c.textual_show_clock,
             cursor_blink=not c.low_power_mode,
         )
     elif c.ui == "urwid":
@@ -742,7 +739,6 @@ async def _connect_and_run_ui(
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
-            show_clock=c.textual_show_clock,
         )
     else:
         ui = LineUI(  # type: ignore[arg-type]

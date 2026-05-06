@@ -1618,9 +1618,6 @@ class _UrwidApp:
         # he debounce.
         self._he_alarm: Any = None
 
-        # Clock alarm.
-        self._clock_alarm: Any = None
-
         # Frame outer widget.
         self._frame: urwid.Frame | None = None
         self._frame_holder: urwid.WidgetPlaceholder | None = None
@@ -1663,18 +1660,11 @@ class _UrwidApp:
             self.render_event(ev)
         self._ui._pending.clear()
         self._drain_task = asyncio.create_task(self._drain_events())
-        if self._ui._show_clock:
-            self._schedule_clock()
 
         self._loop.start()
         try:
             await self._exit_future
         finally:
-            if self._clock_alarm is not None:
-                try:
-                    self._loop.remove_alarm(self._clock_alarm)
-                except Exception:
-                    pass
             if self._drain_task is not None:
                 self._drain_task.cancel()
                 try:
@@ -1858,15 +1848,11 @@ class _UrwidApp:
         my = self._ui._my_call or ""
         name = self._ui._client._name or ""
         offline = " · OFFLINE" if self._ui._offline else ""
-        clock = ""
-        if self._ui._show_clock:
-            clock = "    " + datetime.now().strftime("%H:%M:%S")
         return [
             ("header", f"whatspyc (v{__version__})"),
             ("header", f" — {my}"),
             ("header", f" · {name}" if name else ""),
             ("header_yellow", offline),
-            ("header_dim", clock),
         ]
 
     def _input_caption(self) -> list:
@@ -2153,9 +2139,9 @@ class _UrwidApp:
         return self._ui._target
 
     def _initial_load_count(self) -> int:
-        # The Textual code uses pane height; urwid doesn't expose layout
-        # height as easily before render. Fall back to history_backfill
-        # capped at 30 so a fresh switch isn't blank.
+        # Floor only — enough to avoid a blank pane between mount and
+        # the first render. Once the listbox renders, its real height
+        # is captured and ``_fill_pane_initial`` tops up to match.
         return max(self._ui._history_backfill, 10)
 
     def _mount_initial_history(
@@ -2327,7 +2313,9 @@ class _UrwidApp:
             return
         self._refresh_target_rows(target)
 
-    async def _load_older(self, target: TargetKey) -> None:
+    async def _load_older(
+        self, target: TargetKey, *, n: int | None = None
+    ) -> None:
         if self._history_exhausted.get(target):
             return
         walker = self._walkers.get(target)
@@ -2342,7 +2330,8 @@ class _UrwidApp:
         kind, key = target
         store = self._ui._client._store  # type: ignore[attr-defined]
         rows: list[dict] = []
-        n = self._ui._history_backfill or 10
+        if n is None:
+            n = self._ui._history_backfill or 10
         try:
             if kind == "dm":
                 rows = list(
@@ -2395,6 +2384,21 @@ class _UrwidApp:
                 walker.set_focus(walker.index(prev_top_row))
             except ValueError:
                 pass
+
+    async def _fill_pane_initial(self, target: TargetKey, height: int) -> None:
+        # Called once per target from _MessageListBox.render after the
+        # first paint, when the rendered (maxcol, maxrow) is known. Tops
+        # up the walker to the visible height so the pane opens already
+        # full when the local store has enough history.
+        if self._history_exhausted.get(target):
+            return
+        walker = self._walkers.get(target)
+        if walker is None:
+            return
+        deficit = height - len(walker)
+        if deficit <= 0:
+            return
+        await self._load_older(target, n=deficit)
 
     # ------------------------------------------------------------------
     # Online pane (incremental diff).
@@ -4057,22 +4061,6 @@ class _UrwidApp:
         except (IndexError, ValueError):
             pass
 
-    # ------------------------------------------------------------------
-    # Clock tick (header).
-    # ------------------------------------------------------------------
-
-    def _schedule_clock(self) -> None:
-        if self._loop is None:
-            return
-        self._clock_alarm = self._loop.set_alarm_in(1.0, self._tick_clock)
-
-    def _tick_clock(self, *_: Any) -> None:
-        if self._header_text is not None:
-            self._header_text.set_text(self._header_markup())
-        if self._loop is not None:
-            self._clock_alarm = self._loop.set_alarm_in(1.0, self._tick_clock)
-
-
 # ---------------------------------------------------------------------
 # Custom ListBox that hooks Enter on rows + up-at-top → load older.
 # ---------------------------------------------------------------------
@@ -4096,6 +4084,18 @@ class _MessageListBox(urwid.ListBox):
         super().__init__(body)
         self._app = app
         self._target = target
+        # One-shot: flips on the first render that has a real (maxcol,
+        # maxrow) so we top up to the visible height exactly once.
+        self._topup_scheduled = False
+
+    def render(self, size, focus=False):  # type: ignore[override]
+        canvas = super().render(size, focus)
+        if not self._topup_scheduled and len(size) >= 2 and size[1] > 0:
+            self._topup_scheduled = True
+            asyncio.create_task(
+                self._app._fill_pane_initial(self._target, size[1])
+            )
+        return canvas
 
     def keypress(self, size, key):  # type: ignore[override]
         if key == "enter":
@@ -4121,10 +4121,9 @@ class UrwidUI:
 
     ``offline=True`` puts the UI in read-only mode: the connect path
     skips ``client.open()`` and any send / edit / react / sub / unsub
-    is refused with a banner. ``show_clock`` toggles the header clock.
-    Note the ctor signature does **not** take Textual-only knobs like
-    ``cursor_blink`` — urwid has no compositor and no cursor-blink
-    redraws.
+    is refused with a banner. Note the ctor signature does **not**
+    take Textual-only knobs like ``cursor_blink`` — urwid has no
+    compositor and no cursor-blink redraws.
     """
 
     def __init__(
@@ -4136,7 +4135,6 @@ class UrwidUI:
         history_backfill: int = 3,
         options: SessionOptions | None = None,
         offline: bool = False,
-        show_clock: bool = True,
     ) -> None:
         self._client = client
         self._my_call = my_call.upper()
@@ -4144,7 +4142,6 @@ class UrwidUI:
         self._history_backfill = max(0, int(history_backfill))
         self._options = options or SessionOptions()
         self._offline = offline
-        self._show_clock = show_clock
         self._target: TargetKey | None = None
         self._pending: list[dict] = []
         self._app: _UrwidApp | None = None

@@ -74,7 +74,6 @@ def _make_app(
         history_backfill=3,
         options=options or SessionOptions(),
         offline=offline,
-        show_clock=True,
     )
     app = _UrwidApp(ui)
     ui._app = app
@@ -1138,7 +1137,7 @@ def test_dms_seeded_from_store_at_startup(tmp_path: Path) -> None:
     ui = UrwidUI(
         client, my_call="M0ABC",
         channels=[], history_backfill=3,
-        options=SessionOptions(), offline=True, show_clock=False,
+        options=SessionOptions(), offline=True,
     )
     app = _UrwidApp(ui)
     ui._app = app

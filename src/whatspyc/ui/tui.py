@@ -179,7 +179,6 @@ class TextualUI:
         history_backfill: int = 3,
         options: SessionOptions | None = None,
         offline: bool = False,
-        show_clock: bool = True,
         cursor_blink: bool = True,
     ) -> None:
         self._client = client
@@ -188,7 +187,6 @@ class TextualUI:
         self._history_backfill = max(0, int(history_backfill))
         self._options = options or SessionOptions()
         self._offline = offline
-        self._show_clock = show_clock
         self._cursor_blink = cursor_blink
         self._target: TargetKey | None = None
         self._pending: list[dict] = []
@@ -1859,7 +1857,7 @@ class _WhatspycApp(App):
     # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=self._ui._show_clock)
+        yield Header(show_clock=False)
         with Horizontal(id="main"):
             with Vertical(id="left"):
                 yield _TabBar(

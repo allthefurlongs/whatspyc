@@ -76,7 +76,6 @@ _LEGACY_TUI_KEYS = {
     "tui_fps": "textual_fps",
     "tui_animations": "textual_animations",
     "tui_smooth_scroll": "textual_smooth_scroll",
-    "tui_show_clock": "textual_show_clock",
     "tui_emoji_search_debounce_ms": "emoji_search_debounce_ms",
 }
 
@@ -214,11 +213,6 @@ class Config:
     # Disable sub-cell smooth scrolling (``TEXTUAL_SMOOTH_SCROLL=0``).
     # Restart-required. Textual-only.
     textual_smooth_scroll: bool = True
-    # Show the live clock in the Textual ``Header`` widget. The clock
-    # ticks once a second, which on slow hardware produces a visible
-    # compositor wake; turning it off gives the app one fewer reason
-    # to redraw at idle. Honoured by both textual and urwid backends.
-    textual_show_clock: bool = True
     # Coalesce EmojiPrompt search re-renders: wait this many ms after
     # the last keystroke before rebuilding the grid. ``0`` keeps the
     # historic per-keystroke behaviour. Session-mutable via
@@ -490,14 +484,6 @@ def parse(raw: dict) -> Config:
             )
         cfg.textual_smooth_scroll = v
         perf_user_supplied.add("textual_smooth_scroll")
-    if "textual_show_clock" in raw:
-        v = raw["textual_show_clock"]
-        if not isinstance(v, bool):
-            raise ValueError(
-                f"config: textual_show_clock must be a boolean, got {v!r}"
-            )
-        cfg.textual_show_clock = v
-        perf_user_supplied.add("textual_show_clock")
     if "emoji_search_debounce_ms" in raw:
         v = raw["emoji_search_debounce_ms"]
         if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 2000:
@@ -588,8 +574,8 @@ def resolve_low_power_defaults(cfg: Config, user_supplied: set[str]) -> None:
 
     The ``textual_*`` knobs only affect ``--ui textual``; urwid
     doesn't have equivalent costs (no FPS cap, no animations, no
-    smooth-scroll). ``textual_show_clock`` and
-    ``emoji_search_debounce_ms`` are honoured by both backends.
+    smooth-scroll). ``emoji_search_debounce_ms`` is honoured by both
+    backends.
 
     No-op when ``low_power_mode`` is ``False``.
     """
@@ -601,8 +587,6 @@ def resolve_low_power_defaults(cfg: Config, user_supplied: set[str]) -> None:
         cfg.textual_animations = False
     if "textual_smooth_scroll" not in user_supplied:
         cfg.textual_smooth_scroll = False
-    if "textual_show_clock" not in user_supplied:
-        cfg.textual_show_clock = False
     if "emoji_search_debounce_ms" not in user_supplied:
         cfg.emoji_search_debounce_ms = 300
 
