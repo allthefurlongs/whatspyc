@@ -29,8 +29,9 @@ What it does today:
 - Local SQLite store of every message/post/edit/emoji seen, used to feed
   delta timestamps into the connect handshake (so reconnects don't pull
   the whole history).
-- Two interactive front-ends: a `prompt_toolkit` line UI and a
-  multi-pane `textual` TUI with per-target message panes, in-place
+- Three interactive front-ends: a `prompt_toolkit` line UI and two
+  multi-pane TUIs — `textual` (rich, animated) and `urwid` (lighter on
+  slow hardware) — both with per-target message panes, in-place
   edit/ack updates, scroll-back paging from the local store, a modal
   message-action menu, and a live online-users pane.
 - Periodic keep-alives and (opt-in) automatic reconnect with exponential
@@ -130,7 +131,7 @@ You'll land in a prompt. Slash commands:
 | `/react ID 1f44d` | emoji reaction (unicode codepoint hex). `ID` is the local short id from the log; dispatches on the current target — DM target sends `mem` against the message lid, channel target sends `cpem` against the post lid. |
 | `/history [N]` | replay the last `N` historic messages/posts for the current target from the local store. Defaults to `history_backfill` if `N` is omitted. Output style follows the `verbose_history` session option (compact by default, verbose when set). The same backfill runs automatically each time you switch target. |
 | `/vhistory [N]` | one-shot **verbose** replay of the last `N` items for the current target. Always renders the verbose form (local id, timestamp, delivery state for outbound items, real-time-receipt latency for inbound items) regardless of `verbose_history`. Does not change the session option. |
-| `/set [NAME [VALUE]]` | view or change session-tunable options. `/set` lists every option with its current value and a one-line description; `/set NAME` shows just one; `/set NAME VALUE` updates it for the running session (does not persist — restart picks the config-file value back up). Values like `on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0` are all accepted for booleans. Known options: `show_acks`, `show_edits`, `verbose_history`, `delivery_timeout_s`, `tui_emoji_search_debounce_ms`. Each option is also a top-level config key with the same name. |
+| `/set [NAME [VALUE]]` | view or change session-tunable options. `/set` lists every option with its current value and a one-line description; `/set NAME` shows just one; `/set NAME VALUE` updates it for the running session (does not persist — restart picks the config-file value back up). Values like `on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0` are all accepted for booleans. Known options: `show_acks`, `show_edits`, `verbose_history`, `delivery_timeout_s`, `emoji_search_debounce_ms`. Each option is also a top-level config key with the same name. |
 | `/quit` | clean disconnect (drops the local AX.25 link; the rest of the chain follows) |
 
 # Configuration reference
@@ -159,7 +160,7 @@ top level is rejected at config-load time.
 | --- | --- | --- | --- | --- |
 | `my_call` | `--my-call` | string | *(required)* | Your callsign — `BASE[-SSID]`, base must be 1–6 alphanumerics including at least one digit, SSID 0–15. The server strips the SSID before storing. **Required**, in either the file or via the flag. |
 | `name` | `--name` | string | *(required)* | Display name in the type-`c` connect record. **Required**, in either the file or via the flag. |
-| `ui` | `--ui` | string | `"line"` | `"line"` (prompt_toolkit) or `"tui"` (textual multi-pane — see [TUI key bindings](#tui-key-bindings) below). |
+| `ui` | `--ui` | string | `"line"` | One of `"line"` (prompt_toolkit single-line REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. The legacy value `"tui"` was renamed to `"textual"` when the urwid backend was added; the parser refuses the old value with a migration error. |
 | `state_dir` | `--state-dir` | path | `$XDG_DATA_HOME/whatspyc` (i.e. `~/.local/share/whatspyc`) | Directory holding `state.sqlite3`. Created if missing. |
 | `default_profile` | *(none)* | string \| null | `null` | Name of a configured profile to preselect in the picker / use under `--no-prompt`. Must match one of the `[[connect_profiles]]` names — typos are caught at config-load time. |
 | `history_backfill` | *(none)* | int | `3` | How many historic messages (DM target) or posts (channel target) to replay from the local SQLite store each time you switch target. The same count is the default for `/history` when no explicit count is given. Set to `0` to disable the auto-replay. |
@@ -173,14 +174,14 @@ top level is rejected at config-load time.
 | `log_level` | `--log-level` | string | `WARNING` | Python logging level (`CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `NOTSET`, case-insensitive). Resolution order: `--log-level` > `log_level` config key > `WHATSPYC_LOG` env var > built-in `WARNING`. |
 | `log_file` | `--log-file` | path \| null | `null` | Append log records to this file. Additive — the console sink (see `log_console`) is unaffected, so any combination of file + console + neither is valid. The parent directory is created if missing. CLI flag wins over the config key; no env var. |
 | `log_console` | `--log-console` | string | `"auto"` | Where the console-shaped log sink writes. Independent of `log_file`. Values: `"auto"` → status pane in TUI, stderr in line UI; `"stderr"` → always stderr (corrupts the TUI surface — opt-in only); `"pane"` → status pane (TUI only; line UI is **rejected** at startup); `"off"` → no console sink, file only (or silent if `log_file` is unset). In pane mode, `WARNING` and below appear in the pane (yellow for warnings); `ERROR`+ auto-shows the pane if it's hidden. |
-| `low_power_mode` | *(none)* | bool | `false` | Bundled "run on slow hardware" preset. When `true`, fills in any unset `tui_*` knob with a low-cost default: `tui_fps = 15`, `tui_animations = false`, `tui_smooth_scroll = false`, `tui_show_clock = false`, `tui_emoji_search_debounce_ms = 300`. Per-knob explicit settings always win over the preset, so `low_power_mode = true` plus `tui_fps = 30` runs at 30 FPS while still picking up the rest of the preset. Restart required (the underlying knobs all are). |
-| `tui_fps` | *(none)* | int (1–60) | `60` | Frame-rate cap for the Textual driver. Sets `TEXTUAL_FPS` before app startup. Drop to 30 / 15 on slow hardware to cut idle CPU. **Restart required** — Textual reads the env var once during `App.__init__`. |
-| `tui_animations` | *(none)* | bool | `true` | Disable Textual's animations (sets `TEXTUAL_ANIMATIONS=0`). Saves cycles on slow terminals where eased transitions look janky anyway. **Restart required.** |
-| `tui_smooth_scroll` | *(none)* | bool | `true` | Disable sub-cell smooth scrolling (sets `TEXTUAL_SMOOTH_SCROLL=0`). Lower CPU for the same useful behaviour on character-cell terminals. **Restart required.** |
-| `tui_show_clock` | *(none)* | bool | `true` | Show the live clock in the Textual `Header`. The clock ticks once a second, which on slow hardware produces a visible per-second compositor wake; turning it off gives the app one fewer reason to redraw at idle. |
-| `tui_emoji_search_debounce_ms` | *(none)* | int (0–2000) | `200` | Coalesce EmojiPrompt search re-renders: wait this many ms after the last keystroke before rebuilding the grid. `0` keeps the historic per-keystroke behaviour. Toggleable per session via `/set tui_emoji_search_debounce_ms N`. |
+| `low_power_mode` | *(none)* | bool | `false` | Bundled "run on slow hardware" preset. When `true`, fills in any unset perf knob with a low-cost default: `textual_fps = 15`, `textual_animations = false`, `textual_smooth_scroll = false`, `textual_show_clock = false`, `emoji_search_debounce_ms = 300`. Per-knob explicit settings always win over the preset. The `textual_*` knobs only affect `--ui textual`; urwid has no equivalent costs (no FPS cap, no animations, no compositor) so `low_power_mode` is a no-op there other than the `textual_show_clock` and `emoji_search_debounce_ms` settings, which both backends honour. Restart required (the underlying knobs all are). |
+| `textual_fps` | *(none)* | int (1–60) | `60` | Frame-rate cap for the Textual driver. Sets `TEXTUAL_FPS` before app startup. Drop to 30 / 15 on slow hardware to cut idle CPU. Textual-only. **Restart required** — Textual reads the env var once during `App.__init__`. (Renamed from `tui_fps`.) |
+| `textual_animations` | *(none)* | bool | `true` | Disable Textual's animations (sets `TEXTUAL_ANIMATIONS=0`). Saves cycles on slow terminals where eased transitions look janky anyway. Textual-only. **Restart required.** (Renamed from `tui_animations`.) |
+| `textual_smooth_scroll` | *(none)* | bool | `true` | Disable sub-cell smooth scrolling (sets `TEXTUAL_SMOOTH_SCROLL=0`). Lower CPU for the same useful behaviour on character-cell terminals. Textual-only. **Restart required.** (Renamed from `tui_smooth_scroll`.) |
+| `textual_show_clock` | *(none)* | bool | `true` | Show the live clock in the header. On Textual the `Header` widget ticks once a second, which on slow hardware produces a visible per-second compositor wake; turning it off gives the app one fewer reason to redraw at idle. Honoured by both Textual and urwid backends (urwid uses a `set_alarm_in` tick). (Renamed from `tui_show_clock`.) |
+| `emoji_search_debounce_ms` | *(none)* | int (0–2000) | `200` | Coalesce EmojiPrompt search re-renders: wait this many ms after the last keystroke before rebuilding the grid. `0` keeps the historic per-keystroke behaviour. Toggleable per session via `/set emoji_search_debounce_ms N`. Honoured by both Textual and urwid backends. (Renamed from `tui_emoji_search_debounce_ms`.) |
 
-> **Slow-hardware shortcut:** drop `low_power_mode = true` at the top of `~/.config/whatspyc/config.toml` and restart. That's the same as setting all five `tui_*` keys to their preset values, but with one knob to remember.
+> **Slow-hardware shortcut:** drop `low_power_mode = true` at the top of `~/.config/whatspyc/config.toml` and restart. That's the same as setting all five preset keys to their preset values, but with one knob to remember. For the lightest experience use `--ui urwid` together with `low_power_mode = true`.
 
 ## Connect profiles
 
@@ -386,14 +387,35 @@ each hop on its own line; type `q` to quit without connecting.
 
 ## TUI key bindings
 
-The textual TUI (`--ui tui` or `ui = "tui"` in config) is a
-multi-pane interface built on [Textual](https://textual.textualize.io/).
+There are two multi-pane TUI backends, selected via `--ui`:
+
+- `--ui textual` (or `ui = "textual"` in config) — built on
+  [Textual](https://textual.textualize.io/). Rich, animated, cursor
+  blink, CSS, virtual DOM. Reads the `textual_*` perf knobs.
+- `--ui urwid` (or `ui = "urwid"` in config) — built on
+  [urwid](https://urwid.org/). Lighter on slow hardware: no compositor,
+  no animations, no cursor-blink redraws. Same panes, slash commands,
+  and key bindings as the Textual backend, with rendering that's
+  cheaper at idle.
+
+Pick the backend that fits your terminal and CPU. The slash commands
+are the same for both, and so are the key bindings below — except for
+the `textual_*` perf knobs (`textual_fps` etc.), which are Textual-only.
+
+The urwid backend deliberately uses a different set of Ctrl-bindings
+than Textual to avoid collisions with the terminal/tty layer:
+`Ctrl+X` for quit (Textual: `Ctrl+Q`), `Ctrl+L` for the status pane
+(Textual: `Ctrl+S`), `F1` for help (Textual: `Ctrl+H`). `Ctrl+S` /
+`Ctrl+Q` are XOFF / XON flow control on most terminals (and can be
+intercepted by tmux / screen / ssh sessions); `Ctrl+H` is backspace.
+The Textual backend papers over those collisions with its own
+keymap; urwid takes the simpler route of using safer keys.
 
 Layout:
 
 ```
 ┌─Header───────────────────────────────────────────┐
-├Tabs───┬─Status pane (Ctrl+S, hidden by default)──┤
+├Tabs───┬─Status pane (Ctrl+L, hidden by default)──┤
 │Ch DM  ├───────────────────────────────────────────┤
 ├───────┤ Per-target message ListView              │
 │ch list│  (arrow-key selectable, auto-loads older │
@@ -407,20 +429,22 @@ Layout:
 └Footer─────────────────────────────────────────────┘
 ```
 
-| Key | Action |
-| --- | --- |
-| `Tab` / `Shift+Tab` | Cycle focus: input → message list → tab strip → target list → online list |
-| `Esc` | Return focus to the input box |
-| `← / →` (in tab strip) | Switch between Channels and DMs |
-| `↑ / ↓` (in a list) | Navigate items |
-| `↑` at top of message list | Auto-load the next older page from the local store |
-| `Enter` (in target list) | Pin target as the send target, focus input |
-| `Enter` (in message list) | Open action menu — Edit / Resend / React (Edit & Resend disabled for messages you didn't send) |
-| `Ctrl+H` | Modal help screen — key bindings + slash commands |
-| `Ctrl+D` | Toggle detailed (verbose) render — live re-renders every mounted row. Note: `Ctrl+V` is reserved by most terminals for paste, so this is `Ctrl+D`. |
-| `Ctrl+S` | Toggle the status pane — chronological log of acks, edits, and link events |
-| `Ctrl+E` | Searchable, tabbed emoji picker — opens the same modal used for reactions. Tabs select a CLDR group (`★ Quick`, Smileys, People, Animals, Food, Travel, Activity, Objects, Symbols, Flags); People has a second tab strip for subgroups. Type into the search box to filter the full catalogue across every group, ↑↓←→ inside the grid, PgUp/PgDn to page, Home/End for ends, Enter to insert |
-| `Ctrl+C` / `Ctrl+Q` | Quit |
+| Key | textual | urwid | Action |
+| --- | --- | --- | --- |
+| `Tab` / `Shift+Tab` | ✓ | ✓ | Cycle focus: input → message list → tab strip → target list → online list |
+| `Esc` | ✓ | ✓ | Return focus to the input box |
+| `← / →` (in tab strip) | ✓ | ✓ | Switch between Channels and DMs |
+| `↑ / ↓` (in a list) | ✓ | ✓ | Navigate items |
+| `↑` at top of message list | ✓ | ✓ | Auto-load the next older page from the local store |
+| `Enter` (in target list) | ✓ | ✓ | Pin target as the send target, focus input |
+| `Enter` (in message list) | ✓ | ✓ | Open action menu — Edit / Resend / React (Edit & Resend disabled for messages you didn't send) |
+| `Ctrl+H` (textual) / `F1` (both) | ✓ | ✓ | Modal help screen — key bindings + slash commands |
+| `Ctrl+D` | ✓ | ✓ | Toggle detailed (verbose) render — live re-renders every mounted row |
+| `Ctrl+S` (textual) / `Ctrl+L` (urwid) | ✓ | ✓ | Toggle the status pane — chronological log of acks, edits, and link events |
+| `Ctrl+E` | ✓ | ✓ | Searchable, tabbed emoji picker — opens the same modal used for reactions. Tabs select a CLDR group (`★ Quick`, Smileys, People, Animals, Food, Travel, Activity, Objects, Symbols, Flags); People has a second tab strip for subgroups. Type into the search box to filter the full catalogue across every group, ↑↓←→ inside the grid, PgUp/PgDn to page, Home/End for ends, Enter to insert |
+| `Ctrl+O` | ✓ | ✓ | Open the Settings modal |
+| `Ctrl+U` | ✓ | ✓ | Unsubscribe from the active channel (with confirm) |
+| `Ctrl+C` / `Ctrl+Q` (textual) / `Ctrl+X` (urwid) | ✓ | ✓ | Quit (with confirm) |
 
 Behaviour:
 
@@ -429,7 +453,7 @@ Behaviour:
   duplicate `[EDITED]` line). When an `mr` / `cpr` ack arrives for
   one of your sends, the row gets a `✓` (compact mode) or
   `Delivered in Xs` (verbose mode) suffix.
-- **Status pane (Ctrl+S).** Hidden by default. When open, every ack
+- **Status pane (Ctrl+S in textual / Ctrl+L in urwid).** Hidden by default. When open, every ack
   and edit also lands in a chronological log at the top of the
   centre pane. The message-row tick is updated regardless of whether
   this pane is visible.
@@ -543,7 +567,7 @@ connect_sequence = [
 
 ```toml
 my_call = "N0CALL"
-ui      = "tui"
+ui      = "textual"
 default_profile = "direwolf"
 
 [[connect_profiles]]
@@ -724,7 +748,7 @@ port = 63001
 whatspyc --my-call N0CALL --name Tester --state-dir /tmp/whatspyc-fake
 
 # …or with the textual TUI
-whatspyc --my-call N0CALL --name Tester --ui tui --state-dir /tmp/whatspyc-fake
+whatspyc --my-call N0CALL --name Tester --ui textual --state-dir /tmp/whatspyc-fake
 ```
 
 …or skip the config and pass everything on the CLI:

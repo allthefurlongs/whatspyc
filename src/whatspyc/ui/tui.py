@@ -2703,7 +2703,7 @@ class _WhatspycApp(App):
         self._open_settings_modal()
 
     def action_insert_emoji(self) -> None:
-        debounce = self._ui._options.tui_emoji_search_debounce_ms
+        debounce = self._ui._options.emoji_search_debounce_ms
 
         async def _run() -> None:
             picked = await self.push_screen_wait(EmojiPrompt(debounce_ms=debounce))
@@ -3733,7 +3733,7 @@ class _WhatspycApp(App):
     async def _do_react(self, row: MessageRow) -> None:
         if self._refuse_offline("reacting"):
             return
-        debounce = self._ui._options.tui_emoji_search_debounce_ms
+        debounce = self._ui._options.emoji_search_debounce_ms
         emoji = await self.push_screen_wait(EmojiPrompt(debounce_ms=debounce))
         if not emoji:
             return

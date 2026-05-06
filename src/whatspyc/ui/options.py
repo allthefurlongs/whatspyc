@@ -2,9 +2,9 @@
 
 Each option has a registry entry (``_OptionSpec``) describing how to parse
 a string value and how to render the current value. ``SessionOptions``
-stores the live state and is shared by both ``LineUI`` and ``TextualUI``
-via the constructor — so a ``/set`` from either UI updates the same
-object.
+stores the live state and is shared by ``LineUI``, ``TextualUI`` and
+``UrwidUI`` via the constructor — so a ``/set`` from any UI updates the
+same object.
 
 The defaults come from the user's config file (top-level keys), so the
 same name doubles as a config key. ``/set`` only changes the running
@@ -101,13 +101,13 @@ _SPECS: dict[str, _OptionSpec] = {
         parse=_parse_positive_int,
         format=_format_int,
     ),
-    "tui_emoji_search_debounce_ms": _OptionSpec(
-        name="tui_emoji_search_debounce_ms",
+    "emoji_search_debounce_ms": _OptionSpec(
+        name="emoji_search_debounce_ms",
         description=(
             "Milliseconds to wait after the last keystroke before "
-            "rebuilding the EmojiPrompt grid. 0 = rebuild on every "
-            "keystroke (historic behaviour). Higher values smooth "
-            "typing on slow hardware."
+            "rebuilding the EmojiPrompt grid (textual + urwid backends). "
+            "0 = rebuild on every keystroke (historic behaviour). Higher "
+            "values smooth typing on slow hardware."
         ),
         parse=_parse_nonneg_int,
         format=_format_int,
@@ -130,13 +130,13 @@ class SessionOptions:
         show_edits: bool = True,
         verbose_history: bool = False,
         delivery_timeout_s: int = 60,
-        tui_emoji_search_debounce_ms: int = 200,
+        emoji_search_debounce_ms: int = 200,
     ) -> None:
         self.show_acks = show_acks
         self.show_edits = show_edits
         self.verbose_history = verbose_history
         self.delivery_timeout_s = delivery_timeout_s
-        self.tui_emoji_search_debounce_ms = tui_emoji_search_debounce_ms
+        self.emoji_search_debounce_ms = emoji_search_debounce_ms
 
     @classmethod
     def names(cls) -> list[str]:

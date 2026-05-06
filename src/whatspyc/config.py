@@ -65,6 +65,21 @@ VALID_LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET")
 
 VALID_LOG_CONSOLES = ("auto", "stderr", "pane", "off")
 
+VALID_UI_VALUES = ("line", "textual", "urwid")
+
+# Legacy ``tui_*`` keys renamed during the urwid-backend addition. Map old
+# → new so ``parse()`` can raise a clear migration error rather than
+# silently ignoring stale config. ``"tui"`` itself was the user-facing
+# value of the ``ui`` key; renamed to ``"textual"`` since the new
+# ``"urwid"`` backend is also a TUI.
+_LEGACY_TUI_KEYS = {
+    "tui_fps": "textual_fps",
+    "tui_animations": "textual_animations",
+    "tui_smooth_scroll": "textual_smooth_scroll",
+    "tui_show_clock": "textual_show_clock",
+    "tui_emoji_search_debounce_ms": "emoji_search_debounce_ms",
+}
+
 
 @dataclass
 class ChannelInfo:
@@ -116,7 +131,7 @@ class Config:
     my_call: str | None = None
     name: str | None = None
     state_dir: Path = field(default_factory=lambda: _default_state_dir())
-    ui: str = "line"  # "line" or "tui"
+    ui: str = "line"  # "line" or "textual" or "urwid"
     default_profile: str | None = None
     # How many historic messages/posts to replay from the local store when
     # the user switches target. Live arrivals only ever show up after
@@ -162,8 +177,9 @@ class Config:
     delivery_timeout_s: int = 60
     # Where Python logging writes. ``None`` keeps the default basicConfig
     # destination (stderr); a path routes records to a file (and creates
-    # the parent dir if missing). Useful with ``--ui tui`` where any
-    # stderr write would corrupt the full-screen surface.
+    # the parent dir if missing). Useful with ``--ui textual`` /
+    # ``--ui urwid`` where any stderr write would corrupt the full-screen
+    # surface.
     log_file: Path | None = None
     # Default log level. ``None`` defers to the ``WHATSPYC_LOG`` env var
     # and ultimately the hardcoded ``WARNING`` default in ``log.setup``,
@@ -177,35 +193,37 @@ class Config:
     log_console: str = "auto"
     # ----- TUI performance knobs -----
     # Bundled "run on slow hardware" preset. When ``True`` and the
-    # individual ``tui_*`` knobs below are still at their dataclass
+    # individual ``textual_*`` knobs below are still at their dataclass
     # defaults, ``resolve_low_power_defaults`` overrides them with a
     # documented preset (15 FPS, no animations, no smooth scroll, no
     # header clock, longer emoji-search debounce). Per-knob explicit
     # settings always win — the preset only fills in what the user
-    # didn't already pin.
+    # didn't already pin. Most of the preset only affects the textual
+    # backend; ``--ui urwid`` ignores fps / animations / smooth-scroll
+    # because urwid has no equivalent costs.
     low_power_mode: bool = False
     # Frame-rate cap for the Textual driver. Threaded into
     # ``TEXTUAL_FPS`` env var before ``App.run`` so it must be set in
     # config (or via shell env), not at runtime — Textual reads the
-    # var once during ``App.__init__``.
-    tui_fps: int = 60
+    # var once during ``App.__init__``. Textual-only.
+    textual_fps: int = 60
     # Disable Textual's animations (``TEXTUAL_ANIMATIONS=0``). Saves
     # cycles on slow terminals where the easing transitions look
-    # janky anyway.
-    tui_animations: bool = True
+    # janky anyway. Textual-only.
+    textual_animations: bool = True
     # Disable sub-cell smooth scrolling (``TEXTUAL_SMOOTH_SCROLL=0``).
-    # Restart-required.
-    tui_smooth_scroll: bool = True
+    # Restart-required. Textual-only.
+    textual_smooth_scroll: bool = True
     # Show the live clock in the Textual ``Header`` widget. The clock
     # ticks once a second, which on slow hardware produces a visible
     # compositor wake; turning it off gives the app one fewer reason
-    # to redraw at idle.
-    tui_show_clock: bool = True
+    # to redraw at idle. Honoured by both textual and urwid backends.
+    textual_show_clock: bool = True
     # Coalesce EmojiPrompt search re-renders: wait this many ms after
     # the last keystroke before rebuilding the grid. ``0`` keeps the
     # historic per-keystroke behaviour. Session-mutable via
-    # ``/set tui_emoji_search_debounce_ms``.
-    tui_emoji_search_debounce_ms: int = 200
+    # ``/set emoji_search_debounce_ms``. Cross-backend (both TUIs use it).
+    emoji_search_debounce_ms: int = 200
     connect_profiles: list[ConnectProfile] = field(default_factory=list)
     channels: list[ChannelInfo] = field(default_factory=list)
 
@@ -316,9 +334,37 @@ def parse(raw: dict) -> Config:
             "\"…\"` to pick it on startup."
         )
 
-    for k in ("my_call", "name", "ui", "default_profile"):
+    # Catch legacy ``tui_*`` keys before any other parsing so the user
+    # gets one clear error pointing at every renamed knob in their
+    # config rather than discovering them one at a time across runs.
+    legacy = sorted(_LEGACY_TUI_KEYS.keys() & raw.keys())
+    if legacy:
+        renames = ", ".join(f"{k!r} → {_LEGACY_TUI_KEYS[k]!r}" for k in legacy)
+        raise ValueError(
+            "config: the following keys were renamed when the urwid UI "
+            "backend was added: "
+            + renames
+            + ". Update ~/.config/whatspyc/config.toml accordingly."
+        )
+
+    for k in ("my_call", "name", "default_profile"):
         if k in raw:
             setattr(cfg, k, raw[k])
+    if "ui" in raw:
+        v = raw["ui"]
+        if v == "tui":
+            raise ValueError(
+                "config: ui = \"tui\" was renamed to \"textual\" when the "
+                "urwid backend was added (so the choice is unambiguous "
+                "between the two TUIs). Update "
+                "~/.config/whatspyc/config.toml."
+            )
+        if not isinstance(v, str) or v not in VALID_UI_VALUES:
+            raise ValueError(
+                f"config: ui {v!r} is not one of "
+                f"{', '.join(VALID_UI_VALUES)}"
+            )
+        cfg.ui = v
     if "state_dir" in raw:
         cfg.state_dir = Path(raw["state_dir"])
     if "history_backfill" in raw:
@@ -420,47 +466,47 @@ def parse(raw: dict) -> Config:
                 f"config: low_power_mode must be a boolean, got {v!r}"
             )
         cfg.low_power_mode = v
-    if "tui_fps" in raw:
-        v = raw["tui_fps"]
+    if "textual_fps" in raw:
+        v = raw["textual_fps"]
         if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 60:
             raise ValueError(
-                f"config: tui_fps must be an integer in [1, 60], got {v!r}"
+                f"config: textual_fps must be an integer in [1, 60], got {v!r}"
             )
-        cfg.tui_fps = v
-        perf_user_supplied.add("tui_fps")
-    if "tui_animations" in raw:
-        v = raw["tui_animations"]
+        cfg.textual_fps = v
+        perf_user_supplied.add("textual_fps")
+    if "textual_animations" in raw:
+        v = raw["textual_animations"]
         if not isinstance(v, bool):
             raise ValueError(
-                f"config: tui_animations must be a boolean, got {v!r}"
+                f"config: textual_animations must be a boolean, got {v!r}"
             )
-        cfg.tui_animations = v
-        perf_user_supplied.add("tui_animations")
-    if "tui_smooth_scroll" in raw:
-        v = raw["tui_smooth_scroll"]
+        cfg.textual_animations = v
+        perf_user_supplied.add("textual_animations")
+    if "textual_smooth_scroll" in raw:
+        v = raw["textual_smooth_scroll"]
         if not isinstance(v, bool):
             raise ValueError(
-                f"config: tui_smooth_scroll must be a boolean, got {v!r}"
+                f"config: textual_smooth_scroll must be a boolean, got {v!r}"
             )
-        cfg.tui_smooth_scroll = v
-        perf_user_supplied.add("tui_smooth_scroll")
-    if "tui_show_clock" in raw:
-        v = raw["tui_show_clock"]
+        cfg.textual_smooth_scroll = v
+        perf_user_supplied.add("textual_smooth_scroll")
+    if "textual_show_clock" in raw:
+        v = raw["textual_show_clock"]
         if not isinstance(v, bool):
             raise ValueError(
-                f"config: tui_show_clock must be a boolean, got {v!r}"
+                f"config: textual_show_clock must be a boolean, got {v!r}"
             )
-        cfg.tui_show_clock = v
-        perf_user_supplied.add("tui_show_clock")
-    if "tui_emoji_search_debounce_ms" in raw:
-        v = raw["tui_emoji_search_debounce_ms"]
+        cfg.textual_show_clock = v
+        perf_user_supplied.add("textual_show_clock")
+    if "emoji_search_debounce_ms" in raw:
+        v = raw["emoji_search_debounce_ms"]
         if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 2000:
             raise ValueError(
-                "config: tui_emoji_search_debounce_ms must be an integer "
+                "config: emoji_search_debounce_ms must be an integer "
                 f"in [0, 2000], got {v!r}"
             )
-        cfg.tui_emoji_search_debounce_ms = v
-        perf_user_supplied.add("tui_emoji_search_debounce_ms")
+        cfg.emoji_search_debounce_ms = v
+        perf_user_supplied.add("emoji_search_debounce_ms")
     resolve_low_power_defaults(cfg, perf_user_supplied)
 
     if "channels" in raw:
@@ -535,25 +581,30 @@ def resolve_low_power_defaults(cfg: Config, user_supplied: set[str]) -> None:
     """Apply the ``low_power_mode`` preset in place.
 
     When ``cfg.low_power_mode`` is ``True``, override each of the
-    ``tui_*`` performance knobs the user did **not** explicitly set
-    with a preset tuned for slow hardware. The convention mirrors
+    TUI performance knobs the user did **not** explicitly set with a
+    preset tuned for slow hardware. The convention mirrors
     ``resolve_engine_defaults`` — ``user_supplied`` carries the
     keys the caller already pinned, and we never overwrite those.
+
+    The ``textual_*`` knobs only affect ``--ui textual``; urwid
+    doesn't have equivalent costs (no FPS cap, no animations, no
+    smooth-scroll). ``textual_show_clock`` and
+    ``emoji_search_debounce_ms`` are honoured by both backends.
 
     No-op when ``low_power_mode`` is ``False``.
     """
     if not cfg.low_power_mode:
         return
-    if "tui_fps" not in user_supplied:
-        cfg.tui_fps = 15
-    if "tui_animations" not in user_supplied:
-        cfg.tui_animations = False
-    if "tui_smooth_scroll" not in user_supplied:
-        cfg.tui_smooth_scroll = False
-    if "tui_show_clock" not in user_supplied:
-        cfg.tui_show_clock = False
-    if "tui_emoji_search_debounce_ms" not in user_supplied:
-        cfg.tui_emoji_search_debounce_ms = 300
+    if "textual_fps" not in user_supplied:
+        cfg.textual_fps = 15
+    if "textual_animations" not in user_supplied:
+        cfg.textual_animations = False
+    if "textual_smooth_scroll" not in user_supplied:
+        cfg.textual_smooth_scroll = False
+    if "textual_show_clock" not in user_supplied:
+        cfg.textual_show_clock = False
+    if "emoji_search_debounce_ms" not in user_supplied:
+        cfg.emoji_search_debounce_ms = 300
 
 
 def resolve_engine_defaults(p: ConnectProfile, user_supplied: set[str]) -> None:

@@ -30,29 +30,31 @@ from whatspyc.transport.rhp_ws import RhpWebSocketStream
 from whatspyc.ui.line import LineUI
 from whatspyc.ui.options import SessionOptions
 from whatspyc.ui.tui import TextualUI
+from whatspyc.ui.urwid_ui import UrwidUI
 from whatspyc.wps.client import WpsClient
 from whatspyc.wps.connect_seq import ConnectSequence
 from whatspyc.wps.hop_script import HopScriptError, HopStep
 
 
-def _apply_tui_perf_env(c: cfg_mod.Config) -> None:
-    """Translate ``tui_*`` config keys into Textual env vars.
+def _apply_textual_perf_env(c: cfg_mod.Config) -> None:
+    """Translate ``textual_*`` config keys into Textual env vars.
 
     Textual reads ``TEXTUAL_FPS`` / ``TEXTUAL_ANIMATIONS`` /
     ``TEXTUAL_SMOOTH_SCROLL`` once during ``App.__init__``, so we have
     to set them before any Textual code runs (i.e. before ``run_async``
     or even ``App()``). Caller is responsible for only invoking this
-    when the effective UI is the TUI.
+    when the effective UI is ``textual`` — these env vars are
+    Textual-specific and ignored by the urwid backend.
 
     ``os.environ.setdefault`` so a power user's shell-set value still
     wins over the config — the config knob is the "if I haven't set it
     in my shell" default.
     """
-    if c.tui_fps != 60:
-        os.environ.setdefault("TEXTUAL_FPS", str(c.tui_fps))
-    if not c.tui_animations:
+    if c.textual_fps != 60:
+        os.environ.setdefault("TEXTUAL_FPS", str(c.textual_fps))
+    if not c.textual_animations:
         os.environ.setdefault("TEXTUAL_ANIMATIONS", "0")
-    if not c.tui_smooth_scroll:
+    if not c.textual_smooth_scroll:
         os.environ.setdefault("TEXTUAL_SMOOTH_SCROLL", "0")
 
 
@@ -355,7 +357,15 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
     default=None,
     help="Enable AX.25 PID 0x08 segmentation/reassembly. Off by default.",
 )
-@click.option("--ui", "ui_mode", type=click.Choice(["line", "tui"]), default=None)
+@click.option(
+    "--ui",
+    "ui_mode",
+    type=click.Choice(["line", "textual", "urwid"]),
+    default=None,
+    help="UI backend. line = prompt_toolkit REPL; textual = Textual full-"
+    "screen multi-pane; urwid = urwid full-screen multi-pane (lighter on "
+    "slow hardware).",
+)
 @click.option(
     "--log-level",
     default=None,
@@ -372,8 +382,8 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
     "--log-console",
     type=click.Choice(["auto", "stderr", "pane", "off"]),
     default=None,
-    help="Console log sink. 'auto' (default): TUI → status pane, line UI "
-    "→ stderr. 'pane' is rejected with --ui line.",
+    help="Console log sink. 'auto' (default): textual/urwid UI → status "
+    "pane, line UI → stderr. 'pane' is rejected with --ui line.",
 )
 def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_port, ax_level,
          my_call, name, remote, state_dir, kiss_device, kiss_baud, kiss_port, kiss_ackmode,
@@ -392,12 +402,13 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
     # log.setup) > hardcoded WARNING. log_file has no env var.
     effective_ui = ui_mode or c.ui
     effective_console = log_console or c.log_console
+    _is_full_screen_ui = effective_ui in ("textual", "urwid")
     if effective_console == "auto":
-        effective_console = "pane" if effective_ui == "tui" else "stderr"
-    elif effective_console == "pane" and effective_ui != "tui":
+        effective_console = "pane" if _is_full_screen_ui else "stderr"
+    elif effective_console == "pane" and not _is_full_screen_ui:
         raise click.UsageError(
-            "log_console = 'pane' requires --ui tui (the line UI has no "
-            "status pane to write to)."
+            "log_console = 'pane' requires --ui textual or --ui urwid "
+            "(the line UI has no status pane to write to)."
         )
     log.setup(
         level=log_level or c.log_level,
@@ -419,10 +430,10 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
     if not c.name:
         raise click.UsageError("--name is required (or set in ~/.config/whatspyc/config.toml)")
     # Translate TUI perf config keys into TEXTUAL_* env vars before any
-    # Textual code runs. Skipped for the line UI — those env vars only
-    # affect Textual's driver.
-    if effective_ui == "tui":
-        _apply_tui_perf_env(c)
+    # Textual code runs. Skipped for line and urwid UIs — those env
+    # vars only affect Textual's driver.
+    if effective_ui == "textual":
+        _apply_textual_perf_env(c)
 
     digi_list: list[str] | None = None
     if digipeaters is not None:
@@ -633,9 +644,9 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
         show_edits=c.show_edits,
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
-        tui_emoji_search_debounce_ms=c.tui_emoji_search_debounce_ms,
+        emoji_search_debounce_ms=c.emoji_search_debounce_ms,
     )
-    if c.ui == "tui":
+    if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]
             client,
             my_call=c.my_call,
@@ -643,8 +654,18 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
             history_backfill=c.history_backfill,
             options=options,
             offline=True,
-            show_clock=c.tui_show_clock,
+            show_clock=c.textual_show_clock,
             cursor_blink=not c.low_power_mode,
+        )
+    elif c.ui == "urwid":
+        ui = UrwidUI(  # type: ignore[arg-type]
+            client,
+            my_call=c.my_call,
+            channels=c.channels,
+            history_backfill=c.history_backfill,
+            options=options,
+            offline=True,
+            show_clock=c.textual_show_clock,
         )
     else:
         ui = LineUI(  # type: ignore[arg-type]
@@ -702,17 +723,26 @@ async def _connect_and_run_ui(
         show_edits=c.show_edits,
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
-        tui_emoji_search_debounce_ms=c.tui_emoji_search_debounce_ms,
+        emoji_search_debounce_ms=c.emoji_search_debounce_ms,
     )
-    if c.ui == "tui":
+    if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]
             client,
             my_call=c.my_call,
             channels=c.channels,
             history_backfill=c.history_backfill,
             options=options,
-            show_clock=c.tui_show_clock,
+            show_clock=c.textual_show_clock,
             cursor_blink=not c.low_power_mode,
+        )
+    elif c.ui == "urwid":
+        ui = UrwidUI(  # type: ignore[arg-type]
+            client,
+            my_call=c.my_call,
+            channels=c.channels,
+            history_backfill=c.history_backfill,
+            options=options,
+            show_clock=c.textual_show_clock,
         )
     else:
         ui = LineUI(  # type: ignore[arg-type]

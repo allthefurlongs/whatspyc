@@ -16,6 +16,7 @@ dependencies = [
     "pyserial-asyncio>=0.6",
     "prompt_toolkit>=3.0.43",
     "textual>=0.60",
+    "urwid>=2.6",
     "emoji>=2.10",
 ]
 
