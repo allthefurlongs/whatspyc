@@ -264,3 +264,85 @@ def test_emoji_prompt_debounce_coalesces_rapid_keystrokes(tmp_path: Path) -> Non
             store.close()
 
     asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# Chronological insertion of late arrivals
+# ----------------------------------------------------------------------
+
+
+def test_late_arriving_dm_inserts_in_timestamp_order(tmp_path: Path) -> None:
+    """A DM whose ts is older than rows already mounted must slot
+    into the correct chronological position, not append at the end."""
+
+    async def _run() -> None:
+        ui, store = _make_ui(tmp_path)
+        try:
+            app = _WhatspycApp(ui)
+            ui._app = app
+            async with app.run_test() as pilot:
+                target = ("dm", "M0FOO")
+                await app._switch_centre_to(target)
+                await pilot.pause()
+
+                for ts in (100, 200, 300):
+                    await app._dispatch_event(
+                        {"t": "m", "_id": f"{ts}-M0FOO", "fc": "M0FOO",
+                         "tc": "M0ABC", "ts": ts, "m": f"msg{ts}"}
+                    )
+                await pilot.pause()
+                # Late arrival between 100 and 200.
+                await app._dispatch_event(
+                    {"t": "m", "_id": "150-M0FOO", "fc": "M0FOO",
+                     "tc": "M0ABC", "ts": 150, "m": "late"}
+                )
+                # Older than everything.
+                await app._dispatch_event(
+                    {"t": "m", "_id": "50-M0FOO", "fc": "M0FOO",
+                     "tc": "M0ABC", "ts": 50, "m": "very late"}
+                )
+                await pilot.pause()
+
+                lv = app.query_one(f"#{app._views[target]}", ListView)
+                rows = [c for c in lv.children if isinstance(c, MessageRow)]
+                assert [r.ts for r in rows] == [50, 100, 150, 200, 300]
+                assert [r.body for r in rows] == [
+                    "very late", "msg100", "late", "msg200", "msg300",
+                ]
+        finally:
+            store.close()
+
+    asyncio.run(_run())
+
+
+def test_late_arriving_post_inserts_in_timestamp_order(tmp_path: Path) -> None:
+    """Symmetric to the DM case but for channel posts."""
+
+    async def _run() -> None:
+        ui, store = _make_ui(tmp_path)
+        try:
+            app = _WhatspycApp(ui)
+            ui._app = app
+            async with app.run_test() as pilot:
+                target = ("ch", "5")
+                await app._switch_centre_to(target)
+                await pilot.pause()
+
+                for ts in (1000, 2000, 3000):
+                    await app._dispatch_event(
+                        {"t": "cp", "cid": 5, "ts": ts, "fc": "M0FOO",
+                         "p": f"post{ts}"}
+                    )
+                await app._dispatch_event(
+                    {"t": "cp", "cid": 5, "ts": 1500, "fc": "M0FOO",
+                     "p": "late"}
+                )
+                await pilot.pause()
+
+                lv = app.query_one(f"#{app._views[target]}", ListView)
+                rows = [c for c in lv.children if isinstance(c, MessageRow)]
+                assert [r.ts for r in rows] == [1000, 1500, 2000, 3000]
+        finally:
+            store.close()
+
+    asyncio.run(_run())

@@ -2294,6 +2294,38 @@ class _UrwidApp:
         except Exception:
             return []
 
+    def _chronological_insert_index(
+        self,
+        walker: urwid.SimpleFocusListWalker,
+        new_row: _MessageRow,
+    ) -> int | None:
+        """Index at which to insert ``new_row`` to keep MessageRows
+        sorted by ``ts``, or ``None`` to append at the end.
+
+        Edits don't reach this path — ``_mount_row`` early-returns on
+        natural-key collision — so the sort key is always the
+        original ``ts``. Non-MessageRow walker entries (if any) keep
+        their relative position; same-``ts`` arrivals tie-break by
+        arrival order via ``<=``.
+        """
+        if new_row.ts is None:
+            return None
+        last_dated = -1
+        for i in range(len(walker) - 1, -1, -1):
+            w = walker[i]
+            if isinstance(w, _MessageRow) and w.ts is not None:
+                last_dated = i
+                break
+        if last_dated == -1:
+            return None
+        if walker[last_dated].ts <= new_row.ts:
+            return None
+        for i in range(last_dated - 1, -1, -1):
+            w = walker[i]
+            if isinstance(w, _MessageRow) and w.ts is not None and w.ts <= new_row.ts:
+                return i + 1
+        return 0
+
     def _mount_row(
         self,
         target: TargetKey,
@@ -2318,7 +2350,11 @@ class _UrwidApp:
         )
         self._rows[rkey] = msg_row
         if append:
-            walker.append(msg_row)
+            insert_at = self._chronological_insert_index(walker, msg_row)
+            if insert_at is None:
+                walker.append(msg_row)
+            else:
+                walker.insert(insert_at, msg_row)
         else:
             walker.insert(0, msg_row)
         if not defer_scroll and append and walker:

@@ -543,6 +543,93 @@ def test_inbound_post_to_active_channel_mounts_row(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------
+# Chronological insertion of late arrivals
+# ---------------------------------------------------------------------
+
+
+def test_late_arriving_dm_inserts_in_timestamp_order(tmp_path: Path) -> None:
+    """A DM whose ts is older than rows already mounted must slot
+    into the correct chronological position, not append at the end."""
+    ui, app, store = _make_app(tmp_path)
+    try:
+        async def _run() -> None:
+            ui._target = ("dm", "M0FOO")
+            await app._switch_centre_to(("dm", "M0FOO"))
+            # Mount three DMs in order: ts=100, 200, 300.
+            for ts in (100, 200, 300):
+                await app._dispatch_event(
+                    {"t": "m", "_id": f"{ts}-M0FOO", "fc": "M0FOO",
+                     "tc": "M0ABC", "ts": ts, "m": f"msg{ts}"}
+                )
+            # Now a late arrival with ts=150 — must land between
+            # ts=100 and ts=200.
+            await app._dispatch_event(
+                {"t": "m", "_id": "150-M0FOO", "fc": "M0FOO",
+                 "tc": "M0ABC", "ts": 150, "m": "late"}
+            )
+            # And one older than everything (ts=50) — must land at the top.
+            await app._dispatch_event(
+                {"t": "m", "_id": "50-M0FOO", "fc": "M0FOO",
+                 "tc": "M0ABC", "ts": 50, "m": "very late"}
+            )
+        asyncio.run(_run())
+        walker = app._walkers[("dm", "M0FOO")]
+        rows = [w for w in walker if isinstance(w, _MessageRow)]
+        assert [r.ts for r in rows] == [50, 100, 150, 200, 300]
+        assert [r.body for r in rows] == [
+            "very late", "msg100", "late", "msg200", "msg300",
+        ]
+    finally:
+        store.close()
+
+
+def test_late_arriving_post_inserts_in_timestamp_order(tmp_path: Path) -> None:
+    """Symmetric to the DM case but for channel posts."""
+    ui, app, store = _make_app(tmp_path)
+    try:
+        async def _run() -> None:
+            ui._target = ("ch", "5")
+            await app._switch_centre_to(("ch", "5"))
+            for ts in (1000, 2000, 3000):
+                await app._dispatch_event(
+                    {"t": "cp", "cid": 5, "ts": ts, "fc": "M0FOO",
+                     "p": f"post{ts}"}
+                )
+            # Late arrival between 1000 and 2000.
+            await app._dispatch_event(
+                {"t": "cp", "cid": 5, "ts": 1500, "fc": "M0FOO",
+                 "p": "late"}
+            )
+        asyncio.run(_run())
+        walker = app._walkers[("ch", "5")]
+        rows = [w for w in walker if isinstance(w, _MessageRow)]
+        assert [r.ts for r in rows] == [1000, 1500, 2000, 3000]
+    finally:
+        store.close()
+
+
+def test_in_order_dm_still_appends(tmp_path: Path) -> None:
+    """Common case: when the new DM's ts >= the current last row's
+    ts, it appends. (Sanity check the fast path.)"""
+    ui, app, store = _make_app(tmp_path)
+    try:
+        async def _run() -> None:
+            ui._target = ("dm", "M0FOO")
+            await app._switch_centre_to(("dm", "M0FOO"))
+            for ts in (100, 200, 300):
+                await app._dispatch_event(
+                    {"t": "m", "_id": f"{ts}-M0FOO", "fc": "M0FOO",
+                     "tc": "M0ABC", "ts": ts, "m": f"msg{ts}"}
+                )
+        asyncio.run(_run())
+        walker = app._walkers[("dm", "M0FOO")]
+        rows = [w for w in walker if isinstance(w, _MessageRow)]
+        assert [r.ts for r in rows] == [100, 200, 300]
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------
 # Edit + ack flows
 # ---------------------------------------------------------------------
 

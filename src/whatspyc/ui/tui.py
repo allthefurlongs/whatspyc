@@ -2482,6 +2482,42 @@ class _WhatspycApp(App):
             return []
         return []
 
+    def _chronological_insert_index(
+        self, lv: ListView, new_row: MessageRow
+    ) -> int | None:
+        """Index at which to mount ``new_row`` so MessageRows stay
+        sorted by ``ts``, or ``None`` to append at the end.
+
+        Edits (``med``/``cped``) don't reach this path — ``_mount_row``
+        early-returns on natural-key collision — so the sort key is
+        always the original ``ts``. Non-MessageRow children (status
+        lines from ``_write_to_active``) keep their relative position;
+        we only re-order MessageRows. Same-``ts`` arrivals tie-break by
+        arrival order via ``<=`` (newcomer goes after the existing).
+        """
+        if new_row.ts is None:
+            return None
+        children = lv.children
+        # Walk past any trailing status lines to find the actual
+        # newest dated row.
+        last_dated = -1
+        for i in range(len(children) - 1, -1, -1):
+            c = children[i]
+            if isinstance(c, MessageRow) and c.ts is not None:
+                last_dated = i
+                break
+        if last_dated == -1:
+            return None
+        if children[last_dated].ts <= new_row.ts:
+            # In order — append (lands after any trailing status lines).
+            return None
+        # Out of order. Walk back to find the slot.
+        for i in range(last_dated - 1, -1, -1):
+            c = children[i]
+            if isinstance(c, MessageRow) and c.ts is not None and c.ts <= new_row.ts:
+                return i + 1
+        return 0
+
     def _mount_row(
         self,
         target: TargetKey,
@@ -2501,7 +2537,11 @@ class _WhatspycApp(App):
             # Capture stickiness BEFORE the append so a fresh row doesn't
             # itself push us off the bottom and break the check.
             was_at_bottom = lv.is_vertical_scroll_end
-            lv.append(new_row)
+            insert_before = self._chronological_insert_index(lv, new_row)
+            if insert_before is None:
+                lv.append(new_row)
+            else:
+                lv.mount(new_row, before=insert_before)
             # ``defer_scroll`` lets a caller batch-mounting many rows
             # (e.g. ``_mount_initial_history``) suppress per-row scroll
             # scheduling and emit one ``scroll_end`` at the end of the
