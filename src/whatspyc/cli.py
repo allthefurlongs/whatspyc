@@ -644,6 +644,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
             options=options,
             offline=True,
             show_clock=c.tui_show_clock,
+            cursor_blink=not c.low_power_mode,
         )
     else:
         ui = LineUI(  # type: ignore[arg-type]
@@ -711,6 +712,7 @@ async def _connect_and_run_ui(
             history_backfill=c.history_backfill,
             options=options,
             show_clock=c.tui_show_clock,
+            cursor_blink=not c.low_power_mode,
         )
     else:
         ui = LineUI(  # type: ignore[arg-type]

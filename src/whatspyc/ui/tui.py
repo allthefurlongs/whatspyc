@@ -180,6 +180,7 @@ class TextualUI:
         options: SessionOptions | None = None,
         offline: bool = False,
         show_clock: bool = True,
+        cursor_blink: bool = True,
     ) -> None:
         self._client = client
         self._my_call = my_call.upper()
@@ -188,6 +189,7 @@ class TextualUI:
         self._options = options or SessionOptions()
         self._offline = offline
         self._show_clock = show_clock
+        self._cursor_blink = cursor_blink
         self._target: TargetKey | None = None
         self._pending: list[dict] = []
         self._app: _WhatspycApp | None = None
@@ -1879,11 +1881,18 @@ class _WhatspycApp(App):
                         "[dim]Pick a channel or DM on the left to start. Use the mouse, or tab to change pane focus with the keyboard.[/]",
                         id="empty-msgs",
                     )
-        yield Input(
+        # ``cursor_blink`` isn't a ctor kwarg on this Textual version —
+        # it's a reactive on the class. Set it on the instance before
+        # yield; the timer is built in Input.on_mount and reads the
+        # reactive's current value, so a False here means the timer
+        # starts paused (no per-tick refresh).
+        inp = Input(
             placeholder=f"{self._ui._my_call}> ",
             id="input",
             select_on_focus=False,
         )
+        inp.cursor_blink = self._ui._cursor_blink
+        yield inp
         yield StaticFooter()
 
     async def on_mount(self) -> None:
