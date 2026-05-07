@@ -230,11 +230,12 @@ def launch(
 
 
 def _fmt_ts(ts: int | float | None) -> str:
+    # Rich doesn't accept bare `gray`/`grey`; use the numbered shade.
     ms = ts_to_ms(ts)
     if ms is None:
-        return "[gray]\\[--][/]"
+        return "[grey50]\\[--][/]"
     dt = datetime.datetime.fromtimestamp(ms / 1000)
-    return f"[gray]\\[{dt.strftime('%Y-%m-%d %H:%M:%S')}][/]"
+    return f"[grey50]\\[{dt.strftime('%Y-%m-%d %H:%M:%S')}][/]"
 
 
 def _fmt_duration_ms(ms: int | float) -> str:
@@ -356,7 +357,11 @@ def _render_row(
             edts_str = datetime.datetime.fromtimestamp(edts_ms / 1000).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
-            edit_marker = f" [gray]\\[Edited {edts_str}][/]"
+            # `grey50` (Rich doesn't accept bare `gray`/`grey`). Appended
+            # outside the `[dim]` wrap below so the marker stays at a
+            # stable shade even when the row is dim-pending — otherwise
+            # it would render as dim-grey on a dim-grey body and vanish.
+            edit_marker = f" [grey50]\\[Edited {edts_str}][/]"
 
     if verbose:
         head = f"ID: {lid} - {_fmt_ts(ts)}"
@@ -370,14 +375,14 @@ def _render_row(
             delivery_timeout_s=delivery_timeout_s,
         )
         if status:
-            head = f"{head} - [gray]{status}[/]"
-        line = f"{head} - {actor}: {body}{edit_marker}"
+            head = f"{head} - [grey50]{status}[/]"
+        line = f"{head} - {actor}: {body}"
     else:
-        line = f"{_fmt_ts(ts)} {actor}: {body}{edit_marker}"
+        line = f"{_fmt_ts(ts)} {actor}: {body}"
 
     if is_mine and delivered_ts is None:
         line = f"[dim]{line}[/]"
-    return line + _render_reactions(reactions or [])
+    return line + edit_marker + _render_reactions(reactions or [])
 
 
 # ----------------------------------------------------------------------

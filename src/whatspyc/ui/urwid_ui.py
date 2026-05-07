@@ -100,6 +100,11 @@ PALETTE: list[tuple[str, ...]] = [
     ("dim_ham", "dark gray", ""),
     ("dim_ts", "dark gray", ""),
     ("dim_default", "dark gray", ""),
+    # `[Edited <ts>]` suffix. Uses a separate, non-dim shade so the
+    # marker stays visible on outbound-pending rows where every other
+    # span collapses to dark gray (`dim_default`/`dim_ts`/`dim_ham` all
+    # resolve to the same colour and would otherwise hide the marker).
+    ("edited", "light gray", ""),
     # ----- Focus variants for every attr that can appear in a row -----
     # Same trick as the header bar: the row's outer ``AttrMap`` has a
     # ``focus_map`` dict that re-maps each named attr to its
@@ -119,6 +124,9 @@ PALETTE: list[tuple[str, ...]] = [
     ("focus_dim_ham", "dark gray", "light gray"),
     ("focus_dim_ts", "dark gray", "light gray"),
     ("focus_dim_default", "dark gray", "light gray"),
+    # focus bg is `light gray`, so the non-focus `light gray` fg would
+    # vanish — flip to `dark gray` for the focused variant.
+    ("focus_edited", "dark gray", "light gray"),
 ]
 
 
@@ -143,6 +151,7 @@ FOCUS_MAP: dict[Any, str] = {
     "dim_ham": "focus_dim_ham",
     "dim_ts": "focus_dim_ts",
     "dim_default": "focus_dim_default",
+    "edited": "focus_edited",
 }
 
 
@@ -311,9 +320,11 @@ def _render_row_markup(
             edts_str = datetime.fromtimestamp(edts_ms / 1000).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
-            parts.append(
-                ("dim_ts" if ts_attr_dim else "ts", f" [Edited {edts_str}]")
-            )
+            # Always `edited` (light gray); never the row's dim variant.
+            # On a pending outbound row every other span collapses to
+            # `dark gray`, so a dim marker would be invisible against
+            # the dim body — see palette comment on `("edited", ...)`.
+            parts.append(("edited", f" [Edited {edts_str}]"))
     parts.extend(_reactions_markup(reactions or []))
     return parts
 
