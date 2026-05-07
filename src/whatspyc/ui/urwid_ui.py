@@ -3375,10 +3375,12 @@ class _UrwidApp:
         t = obj.get("t")
         if t == "m":
             await self._handle_inbound_dm(obj, batched=False)
+            self._maybe_bell()
         elif t == "mb":
             await self._handle_inbound_dm_batch(obj.get("m") or [])
         elif t == "cp":
             await self._handle_inbound_post(obj, batched=False)
+            self._maybe_bell()
         elif t == "cpb":
             await self._handle_inbound_post_batch(int(obj.get("cid")), obj.get("p") or [])
         elif t == "mr":
@@ -3493,6 +3495,26 @@ class _UrwidApp:
         self._ui.exit_reason = "terminal"
         if self._exit_future is not None and not self._exit_future.done():
             self._exit_future.set_result(None)
+
+    def _maybe_bell(self) -> None:
+        """Ring the terminal bell when ``bell_on_activity`` is on.
+
+        urwid has no built-in bell, so we write the BEL byte through
+        the screen's output file directly. Real-time DM/post arrivals
+        only — batch frames (mb/cpb) bypass this so a fresh connect
+        doesn't fire a flurry of beeps for the backlog.
+        """
+        if not self._ui._options.bell_on_activity:
+            return
+        if self._loop is None:
+            return
+        try:
+            self._loop.screen.write("\a")
+            flush = getattr(self._loop.screen, "flush", None)
+            if flush is not None:
+                flush()
+        except Exception:
+            pass
 
     # --- Inbound DM / post handlers ---
 

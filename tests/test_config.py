@@ -682,6 +682,24 @@ def test_verbose_history_default_and_override() -> None:
         cfg_mod.parse({"verbose_history": 1})
 
 
+def test_bell_on_activity_default_and_override() -> None:
+    """Default is True (matches the web client's notify-on-arrival
+    behaviour); booleans pass through; non-bools rejected."""
+    c = cfg_mod.parse({})
+    assert c.bell_on_activity is True
+
+    c2 = cfg_mod.parse(tomllib.loads("bell_on_activity = false\n"))
+    assert c2.bell_on_activity is False
+
+    c3 = cfg_mod.parse(tomllib.loads("bell_on_activity = true\n"))
+    assert c3.bell_on_activity is True
+
+    with pytest.raises(ValueError, match="bell_on_activity"):
+        cfg_mod.parse({"bell_on_activity": "yes"})
+    with pytest.raises(ValueError, match="bell_on_activity"):
+        cfg_mod.parse({"bell_on_activity": 1})
+
+
 def test_delivery_timeout_s_default_and_override() -> None:
     """Default is 60s; positive ints pass through; non-positive / non-int rejected."""
     c = cfg_mod.parse({})

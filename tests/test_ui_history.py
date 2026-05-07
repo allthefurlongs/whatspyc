@@ -931,6 +931,59 @@ def test_render_event_acks_hidden_when_show_acks_off(tmp_path: Path, capsys) -> 
     store.close()
 
 
+def test_bell_on_activity_fires_on_realtime_dm_and_post(tmp_path: Path, capsys) -> None:
+    """With bell_on_activity=True, real-time `m` and `cp` events emit
+    a BEL byte (`\\x07`) to stdout — what the terminal does with it
+    (audible / visual / nothing) is up to the user's emulator config.
+    Batch frames (`mb` / `cpb`) deliberately stay silent so connect-
+    time backlog doesn't beep N times in a row."""
+    ui, store = _make_ui(tmp_path, options=SessionOptions(bell_on_activity=True))
+
+    ui.render_event({"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "hi", "ts": 1000})
+    assert "\a" in capsys.readouterr().out
+
+    ui.render_event({"t": "cp", "cid": 5, "fc": "M0FOO", "p": "post", "ts": 2000})
+    assert "\a" in capsys.readouterr().out
+
+    # Batch frames are silent: a connect-time mb/cpb shouldn't fire a
+    # flurry of beeps for backlog.
+    ui.render_event(
+        {"t": "mb", "m": [{"fc": "M0FOO", "tc": "M0ABC", "m": "old", "ts": 500}]}
+    )
+    assert "\a" not in capsys.readouterr().out
+    ui.render_event(
+        {"t": "cpb", "cid": 5, "p": [{"fc": "M0FOO", "p": "old", "ts": 500}]}
+    )
+    assert "\a" not in capsys.readouterr().out
+    store.close()
+
+
+def test_bell_on_activity_silent_when_off(tmp_path: Path, capsys) -> None:
+    """`/set bell_on_activity off` (or config) — no BEL byte is emitted
+    regardless of the event type."""
+    ui, store = _make_ui(tmp_path, options=SessionOptions(bell_on_activity=False))
+    ui.render_event({"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "hi", "ts": 1000})
+    ui.render_event({"t": "cp", "cid": 5, "fc": "M0FOO", "p": "post", "ts": 2000})
+    assert "\a" not in capsys.readouterr().out
+    store.close()
+
+
+def test_set_bell_on_activity_toggles_at_runtime(tmp_path: Path, capsys) -> None:
+    """`/set bell_on_activity off` then `on` flips the running session —
+    no restart needed, the flag is read on every event."""
+    ui, store = _make_ui(tmp_path, options=SessionOptions(bell_on_activity=False))
+    asyncio.run(ui._handle_command("/set bell_on_activity on"))
+    capsys.readouterr()
+    ui.render_event({"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "hi", "ts": 1000})
+    assert "\a" in capsys.readouterr().out
+
+    asyncio.run(ui._handle_command("/set bell_on_activity off"))
+    capsys.readouterr()
+    ui.render_event({"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "again", "ts": 1100})
+    assert "\a" not in capsys.readouterr().out
+    store.close()
+
+
 def test_set_no_args_lists_settings(tmp_path: Path, capsys) -> None:
     """`/set` (no args) prints every option's current value with its
     description so the user can discover what's tunable without running

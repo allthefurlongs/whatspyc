@@ -55,11 +55,13 @@ class LineUI:
         t = obj.get("t")
         if t == "m":
             self._render_dm(obj)
+            self._maybe_bell()
         elif t == "mb":
             for m in obj.get("m", []):
                 self._render_dm(m)
         elif t == "cp":
             self._render_post(obj.get("cid"), obj)
+            self._maybe_bell()
         elif t == "cpb":
             cid = obj.get("cid")
             for p in obj.get("p", []):
@@ -130,6 +132,20 @@ class LineUI:
             # than "ack received".
             print(self._fmt_delivery_timeout(obj))
         # other types: ignore in line UI
+
+    def _maybe_bell(self) -> None:
+        """Ring the terminal bell when ``bell_on_activity`` is on.
+
+        prompt_toolkit's ``patch_stdout`` will route the BEL byte
+        through its renderer; the byte is non-printing so it doesn't
+        disturb the visible buffer — the terminal emulator translates
+        it to whatever (audible / visual / nothing) the user has
+        configured.
+        """
+        if not self._options.bell_on_activity:
+            return
+        sys.stdout.write("\a")
+        sys.stdout.flush()
 
     def _signal_terminal_link_loss(self) -> None:
         """Mark the session as ended due to an unrecoverable disconnect and

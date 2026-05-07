@@ -112,6 +112,15 @@ _SPECS: dict[str, _OptionSpec] = {
         parse=_parse_nonneg_int,
         format=_format_int,
     ),
+    "bell_on_activity": _OptionSpec(
+        name="bell_on_activity",
+        description=(
+            "Ring the terminal bell on every real-time DM (m) or "
+            "channel post (cp). Batch arrivals (mb/cpb) do not ring."
+        ),
+        parse=_parse_bool,
+        format=_format_bool,
+    ),
 }
 
 
@@ -131,12 +140,14 @@ class SessionOptions:
         verbose_history: bool = False,
         delivery_timeout_s: int = 60,
         emoji_search_debounce_ms: int = 200,
+        bell_on_activity: bool = True,
     ) -> None:
         self.show_acks = show_acks
         self.show_edits = show_edits
         self.verbose_history = verbose_history
         self.delivery_timeout_s = delivery_timeout_s
         self.emoji_search_debounce_ms = emoji_search_debounce_ms
+        self.bell_on_activity = bell_on_activity
 
     @classmethod
     def names(cls) -> list[str]:

@@ -3161,11 +3161,13 @@ class _WhatspycApp(App):
         # DM / batched DM
         if t == "m":
             await self._handle_inbound_dm(obj, batched=False)
+            self._maybe_bell()
         elif t == "mb":
             await self._handle_inbound_dm_batch(list(obj.get("m", [])))
         # Post / batched post
         elif t == "cp":
             await self._handle_inbound_post(obj, batched=False)
+            self._maybe_bell()
         elif t == "cpb":
             cid = obj.get("cid")
             if cid is None:
@@ -3267,6 +3269,16 @@ class _WhatspycApp(App):
             self._status_error(f"[red][error][/] {obj.get('exc')}")
         elif t == "_delivery_timeout":
             self._handle_delivery_timeout(obj)
+
+    def _maybe_bell(self) -> None:
+        """Ring the terminal bell when ``bell_on_activity`` is on.
+
+        Real-time DM/post arrivals only — batch frames (mb/cpb) bypass
+        this so a fresh connect against an active peer doesn't fire a
+        flurry of beeps for the backlog.
+        """
+        if self._ui._options.bell_on_activity:
+            self.bell()
 
     async def _handle_inbound_dm_batch(self, items: list[dict]) -> None:
         """Process a wire ``mb`` (batch DM) payload.

@@ -557,6 +557,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
         emoji_search_debounce_ms=c.emoji_search_debounce_ms,
+        bell_on_activity=c.bell_on_activity,
     )
     if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]
@@ -634,6 +635,7 @@ async def _connect_and_run_ui(
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
         emoji_search_debounce_ms=c.emoji_search_debounce_ms,
+        bell_on_activity=c.bell_on_activity,
     )
     if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]

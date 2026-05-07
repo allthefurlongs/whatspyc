@@ -164,6 +164,15 @@ class Config:
     # The web client has no equivalent automatic timeout (its "resend"
     # is a manual button); this is a whatspyc-specific knob.
     delivery_timeout_s: int = 60
+    # Ring the terminal bell (BEL, 0x07) on every real-time inbound DM
+    # (`m`) and channel post (`cp`). Most terminals translate BEL into
+    # either an audible beep or a "visual bell" flash depending on the
+    # user's terminal settings — so the effect is whatever the user
+    # already configured terminal-wide. Batch arrivals (`mb`/`cpb` —
+    # connect-time backlog and `/sub` post pulls) do **not** ring;
+    # otherwise a fresh connect against a busy peer would fire dozens
+    # of beeps in a row. Toggleable per session via ``/set bell``.
+    bell_on_activity: bool = True
     # Where Python logging writes. ``None`` keeps the default basicConfig
     # destination (stderr); a path routes records to a file (and creates
     # the parent dir if missing). Useful with ``--ui textual`` /
@@ -426,6 +435,13 @@ def parse(raw: dict) -> Config:
                 f"got {v!r}"
             )
         cfg.delivery_timeout_s = v
+    if "bell_on_activity" in raw:
+        v = raw["bell_on_activity"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"config: bell_on_activity must be a boolean, got {v!r}"
+            )
+        cfg.bell_on_activity = v
     if "log_file" in raw:
         v = raw["log_file"]
         if not isinstance(v, str) or not v:
