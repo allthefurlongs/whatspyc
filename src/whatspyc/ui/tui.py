@@ -333,12 +333,13 @@ def _render_row(
     verbose: bool,
     ham_name: Callable[[str | None], str | None],
     delivery_timeout_s: int,
+    show_edits: bool = True,
     reactions: list[dict] | None = None,
 ) -> str:
     """Build a Rich-marked-up line for a single message/post.
 
-    Compact: ``[ts] <Name, CALL>: body [EDITED if edited] [CALL EMOJI]...``
-    Verbose: ``ID: lid - [ts] - <status> - <Name, CALL>: body [EDITED] [CALL EMOJI]...``
+    Compact: ``[ts] <Name, CALL>: body [Edited <edts>] [CALL EMOJI]...``
+    Verbose: ``ID: lid - [ts] - <status> - <Name, CALL>: body [Edited <edts>] [CALL EMOJI]...``
 
     Outbound rows we sent but haven't seen an ack for are dimmed; the dim
     clears once `delivered_ts` is set (live `mr`/`cpr` ack, or already
@@ -348,7 +349,14 @@ def _render_row(
     """
     actor = _fmt_call(from_call, ham_name)
     is_mine = (from_call or "").upper() == my_call
-    edit_marker = " [bold][EDITED][/]" if edit_ts else ""
+    edit_marker = ""
+    if show_edits and edit_ts:
+        edts_ms = ts_to_ms(edit_ts)
+        if edts_ms is not None:
+            edts_str = datetime.datetime.fromtimestamp(edts_ms / 1000).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            edit_marker = f" [gray]\\[Edited {edts_str}][/]"
 
     if verbose:
         head = f"ID: {lid} - {_fmt_ts(ts)}"
@@ -443,6 +451,7 @@ class MessageRow(ListItem):
         verbose: bool,
         ham_name: Callable[[str | None], str | None],
         delivery_timeout_s: int,
+        show_edits: bool = True,
     ) -> None:
         # Verbose-mode delivery status depends on wall-clock time
         # (the "Delivering... → NOT DELIVERED" flip) for outbound
@@ -468,6 +477,7 @@ class MessageRow(ListItem):
                 self.realtime,
                 self.lid,
                 verbose,
+                show_edits,
                 my_call,
                 delivery_timeout_s,
                 tuple(
@@ -491,6 +501,7 @@ class MessageRow(ListItem):
             verbose=verbose,
             ham_name=ham_name,
             delivery_timeout_s=delivery_timeout_s,
+            show_edits=show_edits,
             reactions=self.reactions,
         )
         self._render_key = key
@@ -2597,6 +2608,7 @@ class _WhatspycApp(App):
             verbose=self._ui._options.verbose_history,
             ham_name=self._ui._client.ham_name,
             delivery_timeout_s=self._ui._options.delivery_timeout_s,
+            show_edits=self._ui._options.show_edits,
         )
 
     def _refresh_active_rows(self) -> None:
@@ -4196,7 +4208,7 @@ class _WhatspycApp(App):
         def on_change(name: str, old: Any, new: Any) -> None:
             if name == "delivery_timeout_s":
                 self._ui._client.set_delivery_timeout_s(new)
-            if name == "verbose_history":
+            if name in ("verbose_history", "show_edits"):
                 active = self._active_target()
                 self._verbose_dirty = {t for t in self._views if t != active}
                 self._refresh_active_rows()

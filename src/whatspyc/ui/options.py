@@ -76,9 +76,9 @@ _SPECS: dict[str, _OptionSpec] = {
     "show_edits": _OptionSpec(
         name="show_edits",
         description=(
-            "Render an [EDITED] line when a real-time DM/post edit "
-            "arrives (med/cped). Connect-batch edits (medb/cpedb) "
-            "always update silently regardless."
+            "Mark edited DMs/posts with a grey [Edited <ts>] suffix "
+            "(textual/urwid in-place; line UI emits a separate [EDITED] "
+            "line on real-time med/cped). Off → row updates silently."
         ),
         parse=_parse_bool,
         format=_format_bool,

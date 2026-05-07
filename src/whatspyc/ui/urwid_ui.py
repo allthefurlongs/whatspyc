@@ -265,6 +265,7 @@ def _render_row_markup(
     verbose: bool,
     ham_name: Callable[[str | None], str | None],
     delivery_timeout_s: int,
+    show_edits: bool = True,
     reactions: list[dict] | None = None,
 ) -> list:
     """Build a urwid markup list for a single message/post.
@@ -281,10 +282,6 @@ def _render_row_markup(
     actor = _call_markup(from_call, ham_name, dim=pending)
     body_attr = "dim_default" if pending else "default"
     ts_attr_dim = pending
-    # Edits are not flagged with a marker in the row — the row simply
-    # shows the current body and the new ``edit_ts`` is reflected in
-    # the verbose-mode timestamp. The Textual UI renders ``[EDITED]``;
-    # we deliberately drop it here.
     parts: list = []
     if verbose:
         head: list = [(body_attr, f"ID: {lid} - "), _ts_text(ts, dim=ts_attr_dim)]
@@ -308,6 +305,15 @@ def _render_row_markup(
         parts.append((body_attr, " "))
         parts.append(actor)
         parts.append((body_attr, f": {body}"))
+    if show_edits and edit_ts:
+        edts_ms = ts_to_ms(edit_ts)
+        if edts_ms is not None:
+            edts_str = datetime.fromtimestamp(edts_ms / 1000).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            parts.append(
+                ("dim_ts" if ts_attr_dim else "ts", f" [Edited {edts_str}]")
+            )
     parts.extend(_reactions_markup(reactions or []))
     return parts
 
@@ -617,6 +623,7 @@ class _MessageRow(urwid.WidgetWrap):
         verbose: bool,
         ham_name: Callable[[str | None], str | None],
         delivery_timeout_s: int,
+        show_edits: bool = True,
     ) -> None:
         is_pending_outbound = (
             verbose
@@ -631,6 +638,7 @@ class _MessageRow(urwid.WidgetWrap):
         if not is_pending_outbound:
             key = (
                 verbose,
+                show_edits,
                 self.body,
                 self.ts,
                 self.edit_ts,
@@ -658,6 +666,7 @@ class _MessageRow(urwid.WidgetWrap):
             verbose=verbose,
             ham_name=ham_name,
             delivery_timeout_s=delivery_timeout_s,
+            show_edits=show_edits,
             reactions=self.reactions,
         )
         self._text.set_text(markup)
@@ -2368,6 +2377,7 @@ class _UrwidApp:
             verbose=self._ui._options.verbose_history,
             ham_name=self._ui._client.ham_name,
             delivery_timeout_s=self._ui._options.delivery_timeout_s,
+            show_edits=self._ui._options.show_edits,
         )
         self._rows[rkey] = msg_row
         if append:
@@ -2388,6 +2398,7 @@ class _UrwidApp:
             verbose=self._ui._options.verbose_history,
             ham_name=self._ui._client.ham_name,
             delivery_timeout_s=self._ui._options.delivery_timeout_s,
+            show_edits=self._ui._options.show_edits,
         )
 
     def _refresh_target_rows(self, target: TargetKey) -> None:
@@ -2466,6 +2477,7 @@ class _UrwidApp:
                 verbose=self._ui._options.verbose_history,
                 ham_name=self._ui._client.ham_name,
                 delivery_timeout_s=self._ui._options.delivery_timeout_s,
+                show_edits=self._ui._options.show_edits,
             )
             self._rows[rkey] = msg_row
             walker.insert(0, msg_row)
@@ -2882,7 +2894,7 @@ class _UrwidApp:
 
     def _open_settings_modal(self) -> None:
         def on_change(name: str, old: Any, new: Any) -> None:
-            if name == "verbose_history":
+            if name in ("verbose_history", "show_edits"):
                 # Same dirty-set mechanic as the textual backend.
                 active = self._active_target()
                 self._verbose_dirty = {t for t in self._views if t != active}
