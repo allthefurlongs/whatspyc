@@ -2074,8 +2074,6 @@ class _UrwidApp:
             self._dms_walker.clear()
         self._target_items.clear()
         self._populate_initial_target_lists()
-        if self._header_text is not None:
-            self._header_text.set_text(self._header_markup())
         if self._loop is not None:
             try:
                 self._loop.draw_screen()
@@ -2107,9 +2105,6 @@ class _UrwidApp:
         self._status_error(
             ("yellow", "[offline] read-only mode — browsing local store, no connection")
         )
-        # Refresh the header so the OFFLINE marker shows.
-        if self._header_text is not None:
-            self._header_text.set_text(self._header_markup())
 
     async def _run_connect_modal(
         self, profile: ConnectProfile, *, banner: str | None
@@ -2456,24 +2451,19 @@ class _UrwidApp:
         self._frame_holder = urwid.WidgetPlaceholder(self._frame)
 
     def _header_markup(self) -> list:
-        # Each span uses a ``header_*`` variant so the dark-blue bar
-        # background extends through the entire header. Plain
-        # ``bold`` / ``yellow`` / ``dim`` would show on the default
-        # terminal background instead, leaving gaps in the bar.
-        my = self._ui._my_call or ""
-        # Session-driven mode starts with no client until the
-        # bootstrap connect succeeds — the header has to render
-        # behind the connect modal during that window. Fall back to
-        # an empty name; a later refresh will pick up the real one.
-        client = self._ui._client
-        name = getattr(client, "_name", "") if client is not None else ""
-        offline = " · OFFLINE" if self._ui._offline else ""
+        # Single span on the dark-blue bar — matches the textual UI's
+        # one-line title. Earlier versions interpolated the user's
+        # callsign / name / an OFFLINE marker after the version, which
+        # rendered fine in plain xterms but corrupted under screen
+        # (stale attrs leaking past the trailing span). The status
+        # pane already announces offline mode, so nothing here needs
+        # to vary at runtime.
         return [
-            ("header", f"whatspyc (v{__version__})"),
-            ("header", f" — {my}"),
-            ("header", f" · {name}" if name else ""),
-            ("header_yellow", offline),
-            ("header_dim", " — Recommended GUI client: http://whatspac.oarc.uk/"),
+            (
+                "header",
+                f"whatspyc (v{__version__}) text-only WhatsPac Client"
+                " - Recommended GUI Client: http://whatspac.oarc.uk/",
+            ),
         ]
 
     def _input_caption(self) -> list:
