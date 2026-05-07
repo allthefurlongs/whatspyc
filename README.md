@@ -154,7 +154,7 @@ top level is rejected at config-load time.
 | --- | --- | --- | --- | --- |
 | `my_call` | `--my-call` | string | *(required)* | Your callsign — `BASE[-SSID]`, base must be 1–6 alphanumerics including at least one digit, SSID 0–15. The SSID is used as the AX.25 source for the RHP link, but stripped before anything inside the WPS application layer (connect record, message `fc`/`tc`, reaction attribution, self-call comparisons), matching the server's own SSID-strip on the callsign-line handshake. **Required**, in either the file or via the flag. |
 | `name` | `--name` | string | *(required)* | Display name in the type-`c` connect record. **Required**, in either the file or via the flag. |
-| `ui` | `--ui` | string | `"line"` | One of `"line"` (prompt_toolkit single-line REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. The legacy value `"tui"` was renamed to `"textual"` when the urwid backend was added; the parser refuses the old value with a migration error. |
+| `ui` | `--ui` | string | `"line"` | One of `"line"` (prompt_toolkit single-line REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. |
 | `state_dir` | `--state-dir` | path | `$XDG_DATA_HOME/whatspyc` (i.e. `~/.local/share/whatspyc`) | Directory holding `state.sqlite3`. Created if missing. |
 | `default_profile` | *(none)* | string \| null | `null` | Name of a configured profile to preselect in the picker / use under `--no-prompt`. Must match one of the `[[connect_profiles]]` names — typos are caught at config-load time. |
 | `history_backfill` | *(none)* | int | `3` | How many historic messages (DM target) or posts (channel target) to replay from the local SQLite store each time you switch target. The same count is the default for `/history` when no explicit count is given. Set to `0` to disable the auto-replay. |
@@ -170,10 +170,10 @@ top level is rejected at config-load time.
 | `log_file` | `--log-file` | path \| null | `null` | Append log records to this file. Additive — the console sink (see `log_console`) is unaffected, so any combination of file + console + neither is valid. The parent directory is created if missing. CLI flag wins over the config key; no env var. |
 | `log_console` | `--log-console` | string | `"auto"` | Where the console-shaped log sink writes. Independent of `log_file`. Values: `"auto"` → status pane in TUI, stderr in line UI; `"stderr"` → always stderr (corrupts the TUI surface — opt-in only); `"pane"` → status pane (TUI only; line UI is **rejected** at startup); `"off"` → no console sink, file only (or silent if `log_file` is unset). In pane mode, `WARNING` and below appear in the pane (yellow for warnings); `ERROR`+ auto-shows the pane if it's hidden. |
 | `low_power_mode` | *(none)* | bool | `false` | Bundled "run on slow hardware" preset. When `true`, fills in any unset perf knob with a low-cost default: `textual_fps = 15`, `textual_animations = false`, `textual_smooth_scroll = false`, `emoji_search_debounce_ms = 300`. Per-knob explicit settings always win over the preset. The `textual_*` knobs only affect `--ui textual`; urwid has no equivalent costs (no FPS cap, no animations, no compositor) so `low_power_mode` is a no-op there other than the `emoji_search_debounce_ms` setting, which both backends honour. Restart required (the underlying knobs all are). |
-| `textual_fps` | *(none)* | int (1–60) | `60` | Frame-rate cap for the Textual driver. Sets `TEXTUAL_FPS` before app startup. Drop to 30 / 15 on slow hardware to cut idle CPU. Textual-only. **Restart required** — Textual reads the env var once during `App.__init__`. (Renamed from `tui_fps`.) |
-| `textual_animations` | *(none)* | bool | `true` | Disable Textual's animations (sets `TEXTUAL_ANIMATIONS=0`). Saves cycles on slow terminals where eased transitions look janky anyway. Textual-only. **Restart required.** (Renamed from `tui_animations`.) |
-| `textual_smooth_scroll` | *(none)* | bool | `true` | Disable sub-cell smooth scrolling (sets `TEXTUAL_SMOOTH_SCROLL=0`). Lower CPU for the same useful behaviour on character-cell terminals. Textual-only. **Restart required.** (Renamed from `tui_smooth_scroll`.) |
-| `emoji_search_debounce_ms` | *(none)* | int (0–2000) | `200` | Coalesce EmojiPrompt search re-renders: wait this many ms after the last keystroke before rebuilding the grid. `0` keeps the historic per-keystroke behaviour. Toggleable per session via `/set emoji_search_debounce_ms N`. Honoured by both Textual and urwid backends. (Renamed from `tui_emoji_search_debounce_ms`.) |
+| `textual_fps` | *(none)* | int (1–60) | `60` | Frame-rate cap for the Textual driver. Sets `TEXTUAL_FPS` before app startup. Drop to 30 / 15 on slow hardware to cut idle CPU. Textual-only. **Restart required** — Textual reads the env var once during `App.__init__`. |
+| `textual_animations` | *(none)* | bool | `true` | Disable Textual's animations (sets `TEXTUAL_ANIMATIONS=0`). Saves cycles on slow terminals where eased transitions look janky anyway. Textual-only. **Restart required.** |
+| `textual_smooth_scroll` | *(none)* | bool | `true` | Disable sub-cell smooth scrolling (sets `TEXTUAL_SMOOTH_SCROLL=0`). Lower CPU for the same useful behaviour on character-cell terminals. Textual-only. **Restart required.** |
+| `emoji_search_debounce_ms` | *(none)* | int (0–2000) | `200` | Coalesce EmojiPrompt search re-renders: wait this many ms after the last keystroke before rebuilding the grid. `0` means re-render on every keystroke. Toggleable per session via `/set emoji_search_debounce_ms N`. Honoured by both Textual and urwid backends. |
 
 > **Slow-hardware shortcut:** drop `low_power_mode = true` at the top of `~/.config/whatspyc/config.toml` and restart. That's the same as setting all four preset keys to their preset values, but with one knob to remember. For the lightest experience use `--ui urwid` together with `low_power_mode = true`.
 
@@ -621,13 +621,9 @@ lookups arrive. Safe to delete for a clean reset — the next connect
 re-syncs from the server.
 
 On first open, the store performs a one-shot migration that rewrites
-ms-magnitude DM `ts` values (and the matching `last_message` cursor)
-back to the wire unit (seconds). Earlier whatspyc versions sent DMs
-with `ts` in milliseconds, which inflated the local cursor enough that
-the server's `ts > lm` filter then rejected every legitimate
-seconds-based DM on later reconnects (the "0 new DMs" symptom). The
-migration is a no-op on fresh databases and on databases already in the
-right unit.
+any ms-magnitude DM `ts` values (and the matching `last_message`
+cursor) back to the wire unit (seconds). No-op on fresh databases and
+on databases already in the right unit.
 
 ## Advanced (Python API only)
 
