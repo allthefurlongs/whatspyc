@@ -988,6 +988,78 @@ async def test_resend_message_reuses_original_id_and_ts(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_message_with_reply_id_emits_r_field(tmp_path: Path) -> None:
+    """``reply_id`` becomes the wire ``r`` field on the outgoing ``m``
+    frame and is mirrored into the local store row."""
+    client, store, stream = await _make_connected_client(tmp_path)
+    msg_id = await client.send_message(
+        "M0FOO", "answering", reply_id="100-M0FOO"
+    )
+    m_frames = [f for f in stream.sent if b'"t":"m"' in f]
+    assert any(b'"r":"100-M0FOO"' in f for f in m_frames)
+    row = store.lookup_message_by_id(msg_id)
+    assert row is not None and row["reply_id"] == "100-M0FOO"
+    await client.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_post_with_reply_emits_rts_and_rfc(tmp_path: Path) -> None:
+    """``reply_ts`` + ``reply_from`` populate the wire ``rts`` and ``rfc``
+    fields on the outgoing ``cp`` frame and are mirrored locally."""
+    client, store, stream = await _make_connected_client(tmp_path)
+    ts = await client.post(
+        5, "responding here", reply_ts=1_700_000_000_000, reply_from="m0foo"
+    )
+    cp_frames = [f for f in stream.sent if b'"t":"cp"' in f]
+    assert any(b'"rts":1700000000000' in f for f in cp_frames)
+    # reply_from is upper-cased before going on the wire so it matches
+    # peer renders that use the canonical callsign form.
+    assert any(b'"rfc":"M0FOO"' in f for f in cp_frames)
+    row = store.lookup_post(5, ts)
+    assert row is not None
+    assert row["reply_ts"] == 1_700_000_000_000
+    assert row["reply_from"] == "M0FOO"
+    await client.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_resend_message_preserves_reply_id(tmp_path: Path) -> None:
+    """A re-send of an unedited reply re-emits ``r`` from the stored
+    row so the parent attribution is preserved in the wire frame."""
+    client, store, stream = await _make_connected_client(tmp_path)
+    msg_id = await client.send_message(
+        "M0FOO", "answering", reply_id="100-M0FOO"
+    )
+    original = list(stream.sent)
+    await client.resend_message(msg_id)
+    new_frames = stream.sent[len(original):]
+    m_frames = [f for f in new_frames if b'"t":"m"' in f]
+    assert len(m_frames) == 1
+    assert b'"r":"100-M0FOO"' in m_frames[0]
+    await client.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_resend_post_preserves_reply_attribution(tmp_path: Path) -> None:
+    client, store, stream = await _make_connected_client(tmp_path)
+    ts = await client.post(
+        5, "responding", reply_ts=1_700_000_000_000, reply_from="M0FOO"
+    )
+    original = list(stream.sent)
+    await client.resend_post(5, ts)
+    new_frames = stream.sent[len(original):]
+    cp_frames = [f for f in new_frames if b'"t":"cp"' in f]
+    assert len(cp_frames) == 1
+    assert b'"rts":1700000000000' in cp_frames[0]
+    assert b'"rfc":"M0FOO"' in cp_frames[0]
+    await client.close()
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_resend_message_unknown_id_raises(tmp_path: Path) -> None:
     client, store, stream = await _make_connected_client(tmp_path)
     with pytest.raises(ValueError, match="no local message"):

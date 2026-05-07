@@ -53,7 +53,7 @@ from whatspyc import log as log_mod
 from whatspyc.config import ChannelInfo, ConnectProfile
 from whatspyc.ui import emoji_for_display
 from whatspyc.ui import help as help_data
-from whatspyc.ui import ts_to_ms
+from whatspyc.ui import resolve_reply_meta, ts_to_ms
 from whatspyc.ui.emoji_catalog import (
     EmojiEntry,
     build_catalog,
@@ -350,6 +350,29 @@ def _render_reactions(reactions: list[dict]) -> str:
     return " " + " ".join(parts)
 
 
+def _reply_prefix_markup(meta: dict | None) -> str:
+    """Light-yellow Rich markup for the reply preview, or ``""``.
+
+    Mirrors :func:`whatspyc.ui.reply_prefix_text` but wraps the entire
+    bracket span in ``[yellow]…[/]`` so the reply attribution stands
+    out from the body. The brackets themselves need a leading
+    backslash escape (Rich treats ``[`` as a tag opener).
+    """
+    if not meta:
+        return ""
+    call = meta.get("call")
+    if meta.get("in_db") and meta.get("snippet"):
+        body = meta["snippet"]
+        inner = f"Reply To {call}: {body}" if call else f"Reply To: {body}"
+    else:
+        inner = (
+            f"Reply To {call}: <msg not in db>"
+            if call
+            else "Reply To: <msg not in db>"
+        )
+    return rf"[yellow]\[{inner}][/] "
+
+
 def _render_row(
     *,
     kind: str,
@@ -367,6 +390,7 @@ def _render_row(
     delivery_timeout_s: int,
     show_edits: bool = True,
     reactions: list[dict] | None = None,
+    reply_meta: dict | None = None,
 ) -> str:
     """Build a Rich-marked-up line for a single message/post.
 
@@ -394,6 +418,7 @@ def _render_row(
             # it would render as dim-grey on a dim-grey body and vanish.
             edit_marker = f" [grey50]\\[Edited {edts_str}][/]"
 
+    reply_pref = _reply_prefix_markup(reply_meta)
     if verbose:
         head = f"ID: {lid} - {_fmt_ts(ts)}"
         status = _verbose_status(
@@ -407,9 +432,9 @@ def _render_row(
         )
         if status:
             head = f"{head} - [grey50]{status}[/]"
-        line = f"{head} - {actor}: {body}"
+        line = f"{head} - {actor}: {reply_pref}{body}"
     else:
-        line = f"{_fmt_ts(ts)} {actor}: {body}"
+        line = f"{_fmt_ts(ts)} {actor}: {reply_pref}{body}"
 
     if is_mine and delivered_ts is None:
         line = f"[dim]{line}[/]"
@@ -451,6 +476,9 @@ class MessageRow(ListItem):
         realtime: int | None = None,
         lid: int | None = None,
         reactions: list[dict] | None = None,
+        reply_id: str | None = None,
+        reply_ts: int | None = None,
+        reply_from: str | None = None,
     ) -> None:
         # Keep a direct reference to the Static so refresh_label can
         # update it without going through query_one — query_one only
@@ -468,6 +496,9 @@ class MessageRow(ListItem):
         self.received_ts = received_ts
         self.realtime = realtime
         self.lid = lid
+        self.reply_id = reply_id
+        self.reply_ts = reply_ts
+        self.reply_from = reply_from
         # `[{emoji, callsign, emoji_ts}, ...]` — populated from the
         # store on mount and mutated in place by inbound mem/cpem
         # handlers. The outbound react path writes through to the
@@ -488,6 +519,7 @@ class MessageRow(ListItem):
         ham_name: Callable[[str | None], str | None],
         delivery_timeout_s: int,
         show_edits: bool = True,
+        reply_meta: dict | None = None,
     ) -> None:
         # Verbose-mode delivery status depends on wall-clock time
         # (the "Delivering... → NOT DELIVERED" flip) for outbound
@@ -504,6 +536,15 @@ class MessageRow(ListItem):
         if is_pending_outbound:
             key: tuple | None = None
         else:
+            reply_sig = (
+                (
+                    bool(reply_meta.get("in_db")),
+                    reply_meta.get("call"),
+                    reply_meta.get("snippet"),
+                )
+                if reply_meta
+                else None
+            )
             key = (
                 self.body,
                 self.ts,
@@ -520,6 +561,7 @@ class MessageRow(ListItem):
                     (r.get("emoji"), r.get("callsign"))
                     for r in self.reactions
                 ),
+                reply_sig,
             )
             if key == self._render_key:
                 return
@@ -539,6 +581,7 @@ class MessageRow(ListItem):
             delivery_timeout_s=delivery_timeout_s,
             show_edits=show_edits,
             reactions=self.reactions,
+            reply_meta=reply_meta,
         )
         self._render_key = key
         self._static.update(text)
@@ -650,10 +693,19 @@ class ActionMenu(ModalScreen[str | None]):
     }
     """
 
-    def __init__(self, *, allow_edit: bool, allow_resend: bool) -> None:
+    def __init__(
+        self,
+        *,
+        allow_edit: bool,
+        allow_resend: bool,
+        allow_view_reply: bool = False,
+        allow_reply: bool = True,
+    ) -> None:
         super().__init__()
         self._allow_edit = allow_edit
         self._allow_resend = allow_resend
+        self._allow_view_reply = allow_view_reply
+        self._allow_reply = allow_reply
 
     def compose(self) -> ComposeResult:
         items: list[ListItem] = []
@@ -662,6 +714,12 @@ class ActionMenu(ModalScreen[str | None]):
         if self._allow_resend:
             items.append(ListItem(Static("Resend"), id="action-resend"))
         items.append(ListItem(Static("React"), id="action-react"))
+        if self._allow_reply:
+            items.append(ListItem(Static("Reply"), id="action-reply"))
+        if self._allow_view_reply:
+            items.append(
+                ListItem(Static("View Full Reply-To"), id="action-view-reply")
+            )
         with Vertical(id="menu-pane"):
             yield Static("[bold]Action[/]")
             yield ListView(*items, id="menu-list")
@@ -677,10 +735,52 @@ class ActionMenu(ModalScreen[str | None]):
         event.stop()
         item_id = event.item.id or ""
         if item_id.startswith("action-"):
+            # Strip the prefix to recover the bare action name
+            # (e.g. ``action-view-reply`` → ``view-reply``).
             self.dismiss(item_id[len("action-"):])
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class ReplyToModal(ModalScreen[None]):
+    """Read-only modal showing the full body of a reply's parent row.
+
+    Opened from ``ActionMenu`` ("View Full Reply-To") when the parent
+    is in the local store. Renders the parent in the standard row
+    layout (timestamp, name + call, body) so the user sees exactly
+    what they'd see in the thread view, just lifted into a modal.
+    Esc dismisses.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss", "Close")]
+
+    DEFAULT_CSS = """
+    ReplyToModal {
+        align: center middle;
+    }
+    #reply-pane {
+        width: 80%;
+        max-width: 100;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    #reply-body {
+        margin: 1 0;
+    }
+    """
+
+    def __init__(self, *, header: str, body_markup: str) -> None:
+        super().__init__()
+        self._header = header
+        self._body_markup = body_markup
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="reply-pane"):
+            yield Static(self._header, id="reply-header")
+            yield Static(self._body_markup, id="reply-body", markup=True)
+            yield Static("[dim]Esc to close[/]")
 
 
 QUICK_REACT_EMOJI: tuple[str, ...] = (
@@ -2096,6 +2196,12 @@ class _WhatspycApp(App):
         # body for an in-progress edit instead of a fresh send.
         self._pending_edit: dict | None = None
 
+        # When set, the next plain-text submit is sent as a reply to the
+        # row identified by the dict — same shape as ``_pending_edit``,
+        # plus a ``parent_call`` field used for the input-prompt label.
+        # Esc cancels reply mode without sending.
+        self._pending_reply: dict | None = None
+
         # Re-entrancy guard for the quit-confirm modal so a second Ctrl+Q
         # while the prompt is already up is a no-op.
         self._quit_confirm_open = False
@@ -2828,6 +2934,9 @@ class _WhatspycApp(App):
             realtime=row.get("realtime"),
             lid=row.get("lid"),
             reactions=reactions,
+            reply_id=row.get("reply_id") or row.get("r"),
+            reply_ts=row.get("reply_ts") or row.get("rts"),
+            reply_from=row.get("reply_from") or row.get("rfc"),
         )
 
     def _lookup_reactions(
@@ -2929,7 +3038,30 @@ class _WhatspycApp(App):
             ham_name=self._ui._client.ham_name,
             delivery_timeout_s=self._ui._options.delivery_timeout_s,
             show_edits=self._ui._options.show_edits,
+            reply_meta=self._reply_meta_for_row(row),
         )
+
+    def _reply_meta_for_row(self, row: MessageRow) -> dict | None:
+        """Resolve a MessageRow's reply metadata against the live store.
+
+        Skipped (returns ``None``) when the row has no reply fields, so
+        non-reply rows pay no DB cost. Re-evaluated on each refresh —
+        a row that initially showed "<msg not in db>" picks up the real
+        snippet as soon as the parent arrives and a refresh happens.
+        """
+        if (
+            row.reply_id is None
+            and row.reply_ts is None
+            and row.reply_from is None
+        ):
+            return None
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        proxy = {
+            "reply_id": row.reply_id,
+            "reply_ts": row.reply_ts,
+            "reply_from": row.reply_from,
+        }
+        return resolve_reply_meta(store, row.kind, row.tkey, proxy)
 
     def _refresh_active_rows(self) -> None:
         """Refresh only rows belonging to the currently-active target.
@@ -3147,6 +3279,19 @@ class _WhatspycApp(App):
     # ------------------------------------------------------------------
 
     def action_focus_input(self) -> None:
+        # Esc also cancels an in-progress reply: the pending state is
+        # cleared and the prompt restored before refocusing the input.
+        # Edits don't get the same treatment — leaving them in flight
+        # is consistent with the existing behaviour where the user can
+        # alter or finish them at their own pace.
+        if self._pending_reply is not None:
+            self._pending_reply = None
+            self._refresh_prompt()
+            try:
+                inp = self.query_one("#input", Input)
+                inp.value = ""
+            except Exception:
+                pass
         if self._w_input is not None:
             self._w_input.focus()
 
@@ -3473,20 +3618,44 @@ class _WhatspycApp(App):
             kind = self._pending_edit["kind"]
             inp.placeholder = f"editing {kind}> "
             return
-        if self._ui._target is None:
-            inp.placeholder = f"{self._ui._my_call}> "
-        else:
-            kind, key = self._ui._target
-            if kind == "ch":
-                try:
-                    cid = int(key)
-                except ValueError:
-                    inp.placeholder = f"{key}> "
-                else:
-                    name = self._channel_name(cid)
-                    inp.placeholder = f"{cid} #{name}> " if name else f"{cid}> "
-            else:
-                inp.placeholder = f"{kind}:{key}> "
+        # Reply mode: surface the parent's call and the cancel hint in
+        # the placeholder so the user sees what they're replying to.
+        # Format mirrors a normal target prompt — `<target> (REPLY TO:
+        # CALL, Esc cancel reply)> `. The reply's destination target
+        # (the *parent row's* target) is used here, not the pinned
+        # ``_ui._target`` — the two can differ when the user browses
+        # one thread while having another pinned for plain sends.
+        if self._pending_reply:
+            parent_call = self._pending_reply.get("parent_call") or ""
+            base = self._target_prompt_base(
+                (self._pending_reply["kind"], self._pending_reply["target_key"])
+            )
+            inp.placeholder = (
+                f"{base} (REPLY TO: {parent_call}, Esc cancel reply)> "
+            )
+            return
+        inp.placeholder = f"{self._target_prompt_base()}> "
+
+    def _target_prompt_base(self, target: TargetKey | None = None) -> str:
+        """The bare prompt label (no trailing ``"> "``) for ``target``.
+
+        ``target=None`` (the default) uses the pinned ``_ui._target``;
+        callers in reply mode pass the reply's own target so the
+        prompt reflects where the reply will land.
+        """
+        if target is None:
+            target = self._ui._target
+        if target is None:
+            return self._ui._my_call
+        kind, key = target
+        if kind == "ch":
+            try:
+                cid = int(key)
+            except ValueError:
+                return key
+            name = self._channel_name(cid)
+            return f"{cid} #{name}" if name else str(cid)
+        return f"{kind}:{key}"
 
     def _is_subscribed(self, cid: int) -> bool:
         cids = self._subscribed_cids
@@ -4013,6 +4182,7 @@ class _WhatspycApp(App):
                 "ts": m.get("ts"),
                 "edit_ts": m.get("edts"),
                 "lid": None,
+                "reply_id": m.get("r"),
             }
         lv = await self._ensure_message_view(target)
         with self._batch_mutate():
@@ -4045,6 +4215,8 @@ class _WhatspycApp(App):
                 "ts": ts,
                 "edit_ts": p.get("edts"),
                 "lid": None,
+                "reply_ts": p.get("rts"),
+                "reply_from": p.get("rfc"),
             }
         lv = await self._ensure_message_view(target)
         with self._batch_mutate():
@@ -4370,10 +4542,19 @@ class _WhatspycApp(App):
 
     def _open_action_menu(self, row: MessageRow) -> None:
         is_mine = (row.from_call or "").upper() == self._ui._my_call
+        reply_meta = self._reply_meta_for_row(row)
+        # Only offer "View Full Reply-To" when the parent is actually
+        # in the local store; with no parent there's nothing to show
+        # beyond the snippet that's already inline in the row.
+        allow_view_reply = bool(reply_meta and reply_meta.get("in_db"))
 
         async def _run() -> None:
             action = await self.push_screen_wait(
-                ActionMenu(allow_edit=is_mine, allow_resend=is_mine)
+                ActionMenu(
+                    allow_edit=is_mine,
+                    allow_resend=is_mine,
+                    allow_view_reply=allow_view_reply,
+                )
             )
             if action is None:
                 return
@@ -4383,8 +4564,106 @@ class _WhatspycApp(App):
                 await self._do_resend(row)
             elif action == "react":
                 await self._do_react(row)
+            elif action == "reply":
+                await self._begin_reply(row)
+            elif action == "view-reply":
+                await self._do_view_reply(row, reply_meta)
 
         self.run_worker(_run(), exclusive=False)
+
+    async def _begin_reply(self, row: MessageRow) -> None:
+        """Enter reply mode for ``row``.
+
+        The reply's destination is the *row's* target — not the pinned
+        ``_ui._target``, which can differ when the user is browsing a
+        different thread than the one they last pinned. Stashes the
+        parent's identity on ``self._pending_reply`` so the next
+        plain-text submit becomes a reply; ``_refresh_prompt`` reads
+        ``_pending_reply["target_key"]`` to label the prompt.
+        """
+        if self._refuse_offline("replying"):
+            return
+        # Enforce the same posting preconditions as a plain send so the
+        # reply isn't silently swallowed: paused channel, unsubscribed
+        # channel, or the read-only #announcements channel all bail.
+        if row.kind == "ch":
+            cid = int(row.tkey)
+            name = self._channel_name(cid)
+            if name and name.lower() == "announcements":
+                self._write_to_active("[Users cannot post to #announcements]")
+                return
+            if not self._is_subscribed(cid):
+                self._write_to_active(self._unsubscribed_send_hint(cid))
+                return
+            paused = self._ui._client.paused_channels().get(cid)
+            if paused:
+                self._write_to_active(self._paused_hint(cid, paused))
+                return
+        self._pending_reply = {
+            "kind": row.kind,
+            "target_key": row.tkey,
+            "natural_key": row.natural_key,
+            "parent_call": (row.from_call or "").upper(),
+            "parent_ts": row.ts,
+        }
+        self._refresh_prompt()
+        try:
+            inp = self.query_one("#input", Input)
+            inp.value = ""
+            inp.focus()
+        except Exception:
+            pass
+
+    async def _do_view_reply(
+        self, row: MessageRow, reply_meta: dict | None
+    ) -> None:
+        if not reply_meta or not reply_meta.get("parent"):
+            return
+        parent = reply_meta["parent"]
+        parent_kind = row.kind
+        # Reactions on the parent so its modal render matches what the
+        # user would see in the thread.
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        try:
+            if parent_kind == "dm":
+                reactions = list(store.list_message_emojis(parent.get("id") or ""))
+            else:
+                reactions = list(
+                    store.list_post_emojis(
+                        int(parent.get("channel_id") or 0),
+                        int(parent.get("ts") or 0),
+                    )
+                )
+        except Exception:
+            reactions = []
+        body_markup = _render_row(
+            kind=parent_kind,
+            from_call=parent.get("from_call") or "",
+            body=parent.get("body") or "",
+            ts=parent.get("ts"),
+            edit_ts=parent.get("edit_ts"),
+            delivered_ts=parent.get("delivered_ts"),
+            received_ts=parent.get("received_ts"),
+            realtime=parent.get("realtime"),
+            lid=parent.get("lid"),
+            my_call=self._ui._my_call,
+            verbose=self._ui._options.verbose_history,
+            ham_name=self._ui._client.ham_name,
+            delivery_timeout_s=self._ui._options.delivery_timeout_s,
+            show_edits=self._ui._options.show_edits,
+            reactions=reactions,
+            reply_meta=None,
+        )
+        if parent_kind == "dm":
+            header = f"[bold]Reply-to message from {parent.get('from_call') or ''}[/]"
+        else:
+            cid = parent.get("channel_id")
+            name = self._channel_name(int(cid)) if isinstance(cid, int) else None
+            label = f"ch:{cid} #{name}" if name else f"ch:{cid}"
+            header = f"[bold]Reply-to post in {label}[/]"
+        await self.push_screen_wait(
+            ReplyToModal(header=header, body_markup=body_markup)
+        )
 
     async def _begin_edit(self, row: MessageRow) -> None:
         if self._refuse_offline("editing"):
@@ -4455,6 +4734,9 @@ class _WhatspycApp(App):
         if self._pending_edit is not None:
             await self._consume_pending_edit(text)
             return
+        if self._pending_reply is not None:
+            await self._consume_pending_reply(text)
+            return
         if not text:
             return
         try:
@@ -4514,6 +4796,67 @@ class _WhatspycApp(App):
                     )
         except Exception as exc:
             self._status_error(f"[red][error][/] {exc}")
+
+    async def _consume_pending_reply(self, text: str) -> None:
+        """Send a reply using the pending parent context, then exit
+        reply mode.
+
+        Empty text dismisses without sending — same shape as the edit
+        flow. After the wire send, the row is mounted locally just like
+        a plain send (the server only echoes acks back to the sender).
+        """
+        reply = self._pending_reply
+        self._pending_reply = None
+        self._refresh_prompt()
+        if reply is None or not text:
+            return
+        if self._refuse_offline("replying"):
+            return
+        c = self._ui._client
+        try:
+            if reply["kind"] == "dm":
+                # ``natural_key`` for DMs is the parent's _id; use it as
+                # the wire ``r`` field.
+                msg_id = await c.send_message(
+                    reply["target_key"], text, reply_id=reply["natural_key"]
+                )
+                try:
+                    ts_seconds = int(msg_id.split("-", 1)[0]) // 1000
+                except (ValueError, AttributeError):
+                    ts_seconds = int(time.time())
+                await self._handle_inbound_dm(
+                    {
+                        "_id": msg_id,
+                        "fc": self._ui._my_call,
+                        "tc": reply["target_key"].upper(),
+                        "m": text,
+                        "ts": ts_seconds,
+                        "r": reply["natural_key"],
+                    },
+                    batched=False,
+                )
+            else:
+                cid = int(reply["target_key"])
+                parent_ts = int(reply["natural_key"])
+                ts = await c.post(
+                    cid,
+                    text,
+                    reply_ts=parent_ts,
+                    reply_from=reply["parent_call"],
+                )
+                await self._handle_inbound_post(
+                    {
+                        "cid": cid,
+                        "fc": self._ui._my_call,
+                        "ts": ts,
+                        "p": text,
+                        "rts": parent_ts,
+                        "rfc": reply["parent_call"],
+                    },
+                    batched=False,
+                )
+        except ValueError as exc:
+            self._status_error(f"[yellow][{exc}][/]")
 
     async def _consume_pending_edit(self, text: str) -> None:
         edit = self._pending_edit

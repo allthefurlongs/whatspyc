@@ -203,6 +203,37 @@ COMMANDS: dict[str, CommandHelp] = {
             "Refused on rows you didn't send."
         ),
     ),
+    "/replydm": CommandHelp(
+        name="/replydm",
+        usage="/replydm ID text...",
+        summary="Send a DM that replies to a previous DM.",
+        details=(
+            "Sends a direct message that references an existing DM as "
+            "the parent. ID is the local short id (SQLite rowid) of the "
+            "row being replied to — the same lid /editdm and /retrydm "
+            "take. Everything after ID is the body of the new DM.\n"
+            "\n"
+            "Internally the parent's server `_id` (`{ts}-{fc}`) is "
+            "carried on the wire as the new message's `r` field, per "
+            "the WPS protocol. The reply is sent to whichever side of "
+            "the original conversation isn't us."
+        ),
+    ),
+    "/replypost": CommandHelp(
+        name="/replypost",
+        usage="/replypost ID text...",
+        summary="Post a channel reply to a previous post.",
+        details=(
+            "Posts a new channel post that references an existing post "
+            "as the parent. ID is the local short id (SQLite rowid) of "
+            "the row being replied to. Everything after ID is the body "
+            "of the new post.\n"
+            "\n"
+            "The reply is sent to the same channel as the parent, with "
+            "the parent's `ts` and `fc` carried as `rts` and `rfc` per "
+            "the WPS protocol."
+        ),
+    ),
     "/react": CommandHelp(
         name="/react",
         usage="/react ID CODEPOINT",

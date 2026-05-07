@@ -40,7 +40,12 @@ from whatspyc import log as log_mod
 
 _log = logging.getLogger(__name__)
 from whatspyc.config import ChannelInfo, ConnectProfile
-from whatspyc.ui import emoji_for_display, emoji_to_wire, ts_to_ms
+from whatspyc.ui import (
+    emoji_for_display,
+    emoji_to_wire,
+    resolve_reply_meta,
+    ts_to_ms,
+)
 from whatspyc.ui import help as help_data
 from whatspyc.ui.emoji_catalog import (
     EmojiEntry,
@@ -139,6 +144,10 @@ PALETTE: list[tuple[str, ...]] = [
     # span collapses to dark gray (`dim_default`/`dim_ts`/`dim_ham` all
     # resolve to the same colour and would otherwise hide the marker).
     ("edited", "light gray", ""),
+    # `[Reply To CALL: ...]` prefix on rows that are replies. urwid's
+    # `yellow` is the bright/light yellow on most terminals; `brown`
+    # would be the duller variant.
+    ("reply", "yellow", ""),
     # ----- Focus variants for every attr that can appear in a row -----
     # Same trick as the header bar: the row's outer ``AttrMap`` has a
     # ``focus_map`` dict that re-maps each named attr to its
@@ -161,6 +170,7 @@ PALETTE: list[tuple[str, ...]] = [
     # focus bg is `light gray`, so the non-focus `light gray` fg would
     # vanish — flip to `dark gray` for the focused variant.
     ("focus_edited", "dark gray", "light gray"),
+    ("focus_reply", "brown", "light gray"),
 ]
 
 
@@ -186,6 +196,7 @@ FOCUS_MAP: dict[Any, str] = {
     "dim_ts": "focus_dim_ts",
     "dim_default": "focus_dim_default",
     "edited": "focus_edited",
+    "reply": "focus_reply",
 }
 
 
@@ -321,6 +332,25 @@ def _reactions_markup(reactions: list[dict] | None) -> list:
     return parts
 
 
+def _reply_prefix_text(meta: dict | None) -> str:
+    """Plain-text reply prefix — same content as the line UI's, used as
+    the body of the urwid ``("reply", ...)`` markup span. Includes the
+    trailing space so the body text is visually separated."""
+    if not meta:
+        return ""
+    call = meta.get("call")
+    if meta.get("in_db") and meta.get("snippet"):
+        body = meta["snippet"]
+        inner = f"Reply To {call}: {body}" if call else f"Reply To: {body}"
+    else:
+        inner = (
+            f"Reply To {call}: <msg not in db>"
+            if call
+            else "Reply To: <msg not in db>"
+        )
+    return f"[{inner}] "
+
+
 def _render_row_markup(
     *,
     kind: str,
@@ -338,6 +368,7 @@ def _render_row_markup(
     delivery_timeout_s: int,
     show_edits: bool = True,
     reactions: list[dict] | None = None,
+    reply_meta: dict | None = None,
 ) -> list:
     """Build a urwid markup list for a single message/post.
 
@@ -354,6 +385,7 @@ def _render_row_markup(
     body_attr = "dim_default" if pending else "default"
     ts_attr_dim = pending
     parts: list = []
+    reply_text = _reply_prefix_text(reply_meta)
     if verbose:
         head: list = [(body_attr, f"ID: {lid} - "), _ts_text(ts, dim=ts_attr_dim)]
         status = _verbose_status(
@@ -370,12 +402,18 @@ def _render_row_markup(
         parts.extend(head)
         parts.append((body_attr, " - "))
         parts.append(actor)
-        parts.append((body_attr, f": {body}"))
+        parts.append((body_attr, ": "))
+        if reply_text:
+            parts.append(("reply", reply_text))
+        parts.append((body_attr, body))
     else:
         parts.append(_ts_text(ts, dim=ts_attr_dim))
         parts.append((body_attr, " "))
         parts.append(actor)
-        parts.append((body_attr, f": {body}"))
+        parts.append((body_attr, ": "))
+        if reply_text:
+            parts.append(("reply", reply_text))
+        parts.append((body_attr, body))
     if show_edits and edit_ts:
         edts_ms = ts_to_ms(edit_ts)
         if edts_ms is not None:
@@ -667,6 +705,9 @@ class _MessageRow(urwid.WidgetWrap):
         realtime: int | None = None,
         lid: int | None = None,
         reactions: list[dict] | None = None,
+        reply_id: str | None = None,
+        reply_ts: int | None = None,
+        reply_from: str | None = None,
     ) -> None:
         self.kind = kind
         self.tkey = target_key
@@ -680,6 +721,9 @@ class _MessageRow(urwid.WidgetWrap):
         self.realtime = realtime
         self.lid = lid
         self.reactions: list[dict] = list(reactions or [])
+        self.reply_id = reply_id
+        self.reply_ts = reply_ts
+        self.reply_from = reply_from
         self._render_key: tuple | None = None
         self._text = urwid.Text("", wrap="space")
         # ``focus_map`` is a dict so the highlight covers attribute-
@@ -697,6 +741,7 @@ class _MessageRow(urwid.WidgetWrap):
         ham_name: Callable[[str | None], str | None],
         delivery_timeout_s: int,
         show_edits: bool = True,
+        reply_meta: dict | None = None,
     ) -> None:
         is_pending_outbound = (
             verbose
@@ -706,6 +751,15 @@ class _MessageRow(urwid.WidgetWrap):
         )
         reactions_signature = tuple(
             (r.get("emoji"), r.get("callsign")) for r in self.reactions
+        )
+        reply_sig = (
+            (
+                bool(reply_meta.get("in_db")),
+                reply_meta.get("call"),
+                reply_meta.get("snippet"),
+            )
+            if reply_meta
+            else None
         )
         key: tuple | None = None
         if not is_pending_outbound:
@@ -722,6 +776,7 @@ class _MessageRow(urwid.WidgetWrap):
                 self.from_call.upper(),
                 reactions_signature,
                 bool(self.from_call and self.from_call.upper() == my_call and self.delivered_ts is None),
+                reply_sig,
             )
             if key == self._render_key:
                 return
@@ -741,6 +796,7 @@ class _MessageRow(urwid.WidgetWrap):
             delivery_timeout_s=delivery_timeout_s,
             show_edits=show_edits,
             reactions=self.reactions,
+            reply_meta=reply_meta,
         )
         self._text.set_text(markup)
         self._render_key = key  # None if uncacheable
@@ -996,12 +1052,21 @@ class ActionMenu(_Modal):
     # ``min_height=4`` on small terminals (the 6% relative height in
     # ``overlay_size`` rounds to 1 on a 24-row terminal) and the
     # bottom-most row — React — falls outside the visible window.
-    overlay_min_height = 6
+    overlay_min_height = 7
 
-    def __init__(self, *, allow_edit: bool, allow_resend: bool) -> None:
+    def __init__(
+        self,
+        *,
+        allow_edit: bool,
+        allow_resend: bool,
+        allow_view_reply: bool = False,
+        allow_reply: bool = True,
+    ) -> None:
         super().__init__()
         self._allow_edit = allow_edit
         self._allow_resend = allow_resend
+        self._allow_view_reply = allow_view_reply
+        self._allow_reply = allow_reply
 
     def build(self) -> urwid.Widget:
         rows: list[urwid.Widget] = []
@@ -1017,12 +1082,59 @@ class ActionMenu(_Modal):
         rows.append(make("Edit",   "edit",   enabled=self._allow_edit))
         rows.append(make("Resend", "resend", enabled=self._allow_resend))
         rows.append(make("React",  "react",  enabled=True))
+        if self._allow_reply:
+            rows.append(make("Reply", "reply", enabled=True))
+        if self._allow_view_reply:
+            rows.append(
+                make("View Full Reply-To", "view-reply", enabled=True)
+            )
         listbox = urwid.ListBox(urwid.SimpleFocusListWalker(rows))
-        return urwid.BoxAdapter(listbox, height=4)
+        return urwid.BoxAdapter(listbox, height=len(rows) + 1)
 
     @property
     def overlay_size(self) -> tuple[int, str, int]:
-        return 30, "middle", 6
+        # Width 30 fits "View Full Reply-To"; height grows with the
+        # number of optional rows currently present.
+        height = 6
+        if self._allow_reply:
+            height += 1
+        if self._allow_view_reply:
+            height += 1
+        return 30, "middle", height
+
+
+class ReplyToModal(_Modal):
+    """Read-only modal showing the parent of a reply row.
+
+    Mirrors :class:`ui.tui.ReplyToModal`: a single rendered line for
+    the parent post/DM, presented in the same format the user would
+    see in the thread (timestamp, name + call, body, edit marker,
+    reactions). Esc dismisses.
+    """
+
+    title = "Reply-to"
+
+    def __init__(self, *, header: str, body_markup: list) -> None:
+        super().__init__()
+        self._header = header
+        self._body_markup = body_markup
+
+    def build(self) -> urwid.Widget:
+        rows: list[urwid.Widget] = [
+            urwid.Text(self._header),
+            urwid.Divider(),
+            urwid.Text(self._body_markup),
+            urwid.Divider(),
+            urwid.Text(("dim", "Esc to close")),
+        ]
+        listbox = urwid.ListBox(urwid.SimpleFocusListWalker(rows))
+        return listbox
+
+    def keypress(self, size, key):
+        if key == "esc":
+            self.dismiss(None)
+            return None
+        return key
 
 
 class SubscribeModal(_Modal):
@@ -1901,6 +2013,11 @@ class _UrwidApp:
         # Pending edit dict (mirrors textual): {kind: "dm"|"post", id: ..., body: ...}
         self._pending_edit: dict | None = None
 
+        # Pending reply dict — mirrors the textual backend. Same shape
+        # as ``_pending_edit`` plus a ``parent_call`` field used to
+        # build the input caption.
+        self._pending_reply: dict | None = None
+
         # he debounce.
         self._he_alarm: Any = None
 
@@ -2471,19 +2588,46 @@ class _UrwidApp:
         prefix = "(offline) " if self._ui._offline else ""
         if self._pending_edit is not None:
             return [("yellow", f"{prefix}edit> ")]
+        # Reply-mode caption sandwiches a parent-call hint inside the
+        # normal label so the user sees both the active thread and
+        # what they're replying to. Esc cancels — see
+        # ``_cancel_pending_reply``.
         if target is None:
-            return [("default", f"{prefix}> ")]
-        kind, key = target
-        if kind == "dm":
-            label = f"dm:{key}"
+            base = ""
         else:
-            try:
-                cid = int(key)
-            except ValueError:
-                cid = -1
-            name = self._channel_name(cid)
-            label = f"ch:{cid} #{name}" if name else f"ch:{cid}"
-        return [("default", f"{prefix}{label}> ")]
+            kind, key = target
+            if kind == "dm":
+                base = f"dm:{key}"
+            else:
+                try:
+                    cid = int(key)
+                except ValueError:
+                    cid = -1
+                name = self._channel_name(cid)
+                base = f"ch:{cid} #{name}" if name else f"ch:{cid}"
+        if self._pending_reply is not None:
+            parent_call = self._pending_reply.get("parent_call") or ""
+            return [
+                ("yellow", f"{prefix}{base} (REPLY TO: {parent_call}, "),
+                ("yellow", "Esc cancel reply)> "),
+            ]
+        if not base:
+            return [("default", f"{prefix}> ")]
+        return [("default", f"{prefix}{base}> ")]
+
+    def _cancel_pending_reply(self) -> None:
+        """Drop reply mode and restore the standard input caption.
+
+        Called from the global Esc handler when ``_pending_reply`` is
+        set; otherwise Esc keeps its normal "focus the input" meaning.
+        Idempotent — a no-op when there's nothing to cancel.
+        """
+        if self._pending_reply is None:
+            return
+        self._pending_reply = None
+        if self._input is not None:
+            self._input.set_edit_text("")
+        self._refresh_input_caption()
 
     def _refresh_input_caption(self) -> None:
         if self._input is not None:
@@ -2870,6 +3014,9 @@ class _UrwidApp:
             realtime=row.get("realtime"),
             lid=row.get("lid"),
             reactions=reactions,
+            reply_id=row.get("reply_id") or row.get("r"),
+            reply_ts=row.get("reply_ts") or row.get("rts"),
+            reply_from=row.get("reply_from") or row.get("rfc"),
         )
         # Wire mouse-click → action menu so clicking a row opens the
         # Edit/Resend/React menu (same as Enter on the keyboard).
@@ -2946,6 +3093,7 @@ class _UrwidApp:
             ham_name=self._ui._client.ham_name,
             delivery_timeout_s=self._ui._options.delivery_timeout_s,
             show_edits=self._ui._options.show_edits,
+            reply_meta=self._reply_meta_for_row(msg_row),
         )
         self._rows[rkey] = msg_row
         if append:
@@ -2967,7 +3115,28 @@ class _UrwidApp:
             ham_name=self._ui._client.ham_name,
             delivery_timeout_s=self._ui._options.delivery_timeout_s,
             show_edits=self._ui._options.show_edits,
+            reply_meta=self._reply_meta_for_row(row),
         )
+
+    def _reply_meta_for_row(self, row: _MessageRow) -> dict | None:
+        """Resolve a row's reply metadata against the live store.
+
+        Mirrors :meth:`ui.tui._WhatspycApp._reply_meta_for_row`. Returns
+        ``None`` for non-reply rows so they pay no DB cost.
+        """
+        if (
+            row.reply_id is None
+            and row.reply_ts is None
+            and row.reply_from is None
+        ):
+            return None
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        proxy = {
+            "reply_id": row.reply_id,
+            "reply_ts": row.reply_ts,
+            "reply_from": row.reply_from,
+        }
+        return resolve_reply_meta(store, row.kind, row.tkey, proxy)
 
     def _refresh_target_rows(self, target: TargetKey) -> None:
         walker = self._walkers.get(target)
@@ -3046,6 +3215,7 @@ class _UrwidApp:
                 ham_name=self._ui._client.ham_name,
                 delivery_timeout_s=self._ui._options.delivery_timeout_s,
                 show_edits=self._ui._options.show_edits,
+                reply_meta=self._reply_meta_for_row(msg_row),
             )
             self._rows[rkey] = msg_row
             walker.insert(0, msg_row)
@@ -3505,7 +3675,13 @@ class _UrwidApp:
         # list after the user dismisses the menu.
         self._set_focus_step("messages")
         is_mine = (row.from_call or "").upper() == self._ui._my_call
-        modal = ActionMenu(allow_edit=is_mine, allow_resend=is_mine)
+        reply_meta = self._reply_meta_for_row(row)
+        allow_view_reply = bool(reply_meta and reply_meta.get("in_db"))
+        modal = ActionMenu(
+            allow_edit=is_mine,
+            allow_resend=is_mine,
+            allow_view_reply=allow_view_reply,
+        )
 
         async def _wait() -> None:
             choice = await self._show_modal(modal)
@@ -3515,8 +3691,106 @@ class _UrwidApp:
                 await self._do_resend(row)
             elif choice == "react":
                 await self._do_react(row)
+            elif choice == "reply":
+                await self._begin_reply(row)
+            elif choice == "view-reply":
+                await self._do_view_reply(row, reply_meta)
 
         asyncio.create_task(_wait())
+
+    async def _begin_reply(self, row: _MessageRow) -> None:
+        """Enter reply mode (urwid). Mirrors the textual backend.
+
+        Stashes the parent's identity on ``self._pending_reply``, swaps
+        the input caption to surface the parent's call + the cancel
+        hint, and focuses the input. Esc cancels via
+        :meth:`_cancel_pending_reply` (driven from
+        :meth:`_on_unhandled_input`).
+        """
+        if self._refuse_offline("replying"):
+            return
+        target = self._ui._target
+        if target is None or target != (row.kind, row.tkey):
+            self._status_error(
+                ("yellow", "[hint] reply target must match the active thread")
+            )
+            return
+        if row.kind == "ch":
+            try:
+                cid = int(row.tkey)
+            except ValueError:
+                return
+            name = self._channel_name(cid)
+            if name and name.lower() == "announcements":
+                self._status_error(("yellow", "[Users cannot post to #announcements]"))
+                return
+            if not self._is_subscribed(cid):
+                self._status_error(("yellow", self._unsubscribed_send_hint(cid)))
+                return
+            paused = self._ui._client.paused_channels().get(cid)
+            if paused:
+                self._status_error(("yellow", self._paused_hint(cid, paused)))
+                return
+        self._pending_reply = {
+            "kind": row.kind,
+            "target_key": row.tkey,
+            "natural_key": row.natural_key,
+            "parent_call": (row.from_call or "").upper(),
+            "parent_ts": row.ts,
+        }
+        if self._input is not None:
+            self._input.set_edit_text("")
+        self._refresh_input_caption()
+        self._set_focus_step("input")
+
+    async def _do_view_reply(
+        self, row: _MessageRow, reply_meta: dict | None
+    ) -> None:
+        if not reply_meta or not reply_meta.get("parent"):
+            return
+        parent = reply_meta["parent"]
+        parent_kind = row.kind
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        try:
+            if parent_kind == "dm":
+                reactions = list(
+                    store.list_message_emojis(parent.get("id") or "")
+                )
+            else:
+                reactions = list(
+                    store.list_post_emojis(
+                        int(parent.get("channel_id") or 0),
+                        int(parent.get("ts") or 0),
+                    )
+                )
+        except Exception:
+            reactions = []
+        markup = _render_row_markup(
+            kind=parent_kind,
+            from_call=parent.get("from_call") or "",
+            body=parent.get("body") or "",
+            ts=parent.get("ts"),
+            edit_ts=parent.get("edit_ts"),
+            delivered_ts=parent.get("delivered_ts"),
+            received_ts=parent.get("received_ts"),
+            realtime=parent.get("realtime"),
+            lid=parent.get("lid"),
+            my_call=self._ui._my_call,
+            verbose=self._ui._options.verbose_history,
+            ham_name=self._ui._client.ham_name,
+            delivery_timeout_s=self._ui._options.delivery_timeout_s,
+            show_edits=self._ui._options.show_edits,
+            reactions=reactions,
+            reply_meta=None,
+        )
+        if parent_kind == "dm":
+            header = ("bold", f"Reply-to message from {parent.get('from_call') or ''}")
+        else:
+            cid = parent.get("channel_id")
+            name = self._channel_name(int(cid)) if isinstance(cid, int) else None
+            label = f"ch:{cid} #{name}" if name else f"ch:{cid}"
+            header = ("bold", f"Reply-to post in {label}")
+        await self._show_modal(ReplyToModal(header=header, body_markup=markup))
 
     async def _begin_edit(self, row: _MessageRow) -> None:
         if self._refuse_offline("editing"):
@@ -3587,6 +3861,9 @@ class _UrwidApp:
         if self._pending_edit is not None:
             await self._consume_pending_edit(text)
             return
+        if self._pending_reply is not None:
+            await self._consume_pending_reply(text)
+            return
         if text.startswith("/"):
             try:
                 await self._handle_command(text)
@@ -3594,6 +3871,67 @@ class _UrwidApp:
                 self._status_error(("red", f"[error] {e}"))
             return
         await self._send_to_target(text)
+
+    async def _consume_pending_reply(self, text: str) -> None:
+        """Send a reply for ``self._pending_reply``, then exit reply mode.
+
+        Mirrors the textual backend. After the wire send, the row is
+        mounted locally — the server only echoes acks, never the
+        original send, so without a local mount the user wouldn't see
+        their own reply until reconnect. The mounted row carries the
+        wire reply fields (``r`` for DMs, ``rts``/``rfc`` for posts)
+        so the inline ``[Reply To …]`` prefix renders immediately.
+        """
+        reply = self._pending_reply
+        self._pending_reply = None
+        self._refresh_input_caption()
+        if reply is None:
+            return
+        if self._refuse_offline("replying"):
+            return
+        c = self._ui._client
+        try:
+            if reply["kind"] == "dm":
+                msg_id = await c.send_message(
+                    reply["target_key"], text, reply_id=reply["natural_key"]
+                )
+                try:
+                    ts_seconds = int(msg_id.split("-", 1)[0]) // 1000
+                except (ValueError, AttributeError):
+                    ts_seconds = int(time.time())
+                await self._handle_inbound_dm(
+                    {
+                        "_id": msg_id,
+                        "fc": self._ui._my_call,
+                        "tc": reply["target_key"].upper(),
+                        "m": text,
+                        "ts": ts_seconds,
+                        "r": reply["natural_key"],
+                    },
+                    batched=False,
+                )
+            else:
+                cid = int(reply["target_key"])
+                parent_ts = int(reply["natural_key"])
+                ts = await c.post(
+                    cid,
+                    text,
+                    reply_ts=parent_ts,
+                    reply_from=reply["parent_call"],
+                )
+                await self._handle_inbound_post(
+                    {
+                        "cid": cid,
+                        "fc": self._ui._my_call,
+                        "ts": ts,
+                        "p": text,
+                        "rts": parent_ts,
+                        "rfc": reply["parent_call"],
+                    },
+                    batched=False,
+                )
+        except ValueError as exc:
+            self._status_error(("yellow", f"[{exc}]"))
 
     async def _consume_pending_edit(self, text: str) -> None:
         pe = self._pending_edit
@@ -4314,6 +4652,9 @@ class _UrwidApp:
             "received_ts": int(time.time() * 1000) if wire.get("fc", "").upper() != self._ui._my_call else None,
             "realtime": 1,
             "lid": None,
+            "reply_id": wire.get("r"),
+            "reply_ts": wire.get("rts"),
+            "reply_from": wire.get("rfc"),
         }
 
     def _mount_row_obj(
@@ -4620,6 +4961,11 @@ class _UrwidApp:
             self.action_unsub_channel()
             return True
         if key == "esc":
+            # Esc cancels an in-progress reply before refocusing the
+            # input. Edits aren't cancelled the same way — staying in
+            # edit mode across an Esc is consistent with the existing
+            # "type when ready" UX.
+            self._cancel_pending_reply()
             self._focus_input()
             return True
         if key == "tab":

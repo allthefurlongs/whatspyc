@@ -1675,6 +1675,97 @@ def test_delivery_timeout_render_post_unknown_channel(tmp_path: Path, capsys) ->
     store.close()
 
 
+def _make_ui_with_send_capture(tmp_path: Path) -> tuple[LineUI, SqliteStore, list]:
+    """Variant of _make_ui that captures send_message + post calls so
+    /replydm and /replypost dispatch can be asserted without a real
+    WpsClient."""
+    store = SqliteStore(tmp_path / "state.sqlite3")
+    calls: list = []
+
+    async def _send_message(to_call: str, text: str, **kw) -> str:
+        calls.append(("dm", to_call, text, kw))
+        return "fake-id"
+
+    async def _post(cid: int, text: str, **kw) -> int:
+        calls.append(("post", cid, text, kw))
+        return 1_700_000_999_000
+
+    client = SimpleNamespace(
+        _store=store,
+        _paused_channels={},
+        paused_channels=lambda: dict(client._paused_channels),
+        auto_backfill_post_count=None,
+        ham_name=lambda call: (store.lookup_ham(call) or {}).get("name") or None,
+        send_message=_send_message,
+        post=_post,
+        set_delivery_timeout_s=lambda v: None,
+    )
+    ui = LineUI(client, my_call="M0ABC", history_backfill=3)
+    return ui, store, calls
+
+
+def test_replydm_resolves_lid_and_routes_to_peer(tmp_path: Path) -> None:
+    """``/replydm LID text`` looks up the parent in the messages table,
+    sends to whichever side of the thread isn't the user, and carries
+    the parent's server ``_id`` as the ``r`` field."""
+    ui, store, calls = _make_ui_with_send_capture(tmp_path)
+    store.upsert_message(
+        {"_id": "100-M0FOO", "fc": "M0FOO", "tc": "M0ABC", "m": "ping", "ts": 100}
+    )
+    lid = store.recent_messages("M0FOO")[0]["lid"]
+    asyncio.run(ui._handle_command(f"/replydm {lid} pong back"))
+    assert calls == [("dm", "M0FOO", "pong back", {"reply_id": "100-M0FOO"})]
+    store.close()
+
+
+def test_replydm_routes_to_other_side_when_replying_to_own(tmp_path: Path) -> None:
+    """When the parent is one of our own DMs, the reply still goes to
+    the peer side (the to_call), not back to ourselves."""
+    ui, store, calls = _make_ui_with_send_capture(tmp_path)
+    store.upsert_message(
+        {"_id": "100-M0ABC", "fc": "M0ABC", "tc": "M0FOO", "m": "ping", "ts": 100}
+    )
+    lid = store.recent_messages("M0FOO")[0]["lid"]
+    asyncio.run(ui._handle_command(f"/replydm {lid} pong back"))
+    assert calls == [("dm", "M0FOO", "pong back", {"reply_id": "100-M0ABC"})]
+    store.close()
+
+
+def test_replydm_unknown_lid_warns(tmp_path: Path, capsys) -> None:
+    ui, store, calls = _make_ui_with_send_capture(tmp_path)
+    asyncio.run(ui._handle_command("/replydm 999 pong"))
+    assert calls == []
+    assert "no local message with lid 999" in capsys.readouterr().out
+    store.close()
+
+
+def test_replypost_resolves_lid_and_carries_parent_attribution(tmp_path: Path) -> None:
+    """``/replypost LID text`` looks up the parent post and carries its
+    ``ts`` and ``from_call`` as ``reply_ts`` / ``reply_from``."""
+    ui, store, calls = _make_ui_with_send_capture(tmp_path)
+    store.set_subscription(7, True)
+    store.upsert_post(7, {"ts": 1_777_821_179_422, "fc": "M0FOO", "p": "hello"})
+    lid = store.recent_posts(7)[0]["lid"]
+    asyncio.run(ui._handle_command(f"/replypost {lid} responding"))
+    assert calls == [
+        (
+            "post",
+            7,
+            "responding",
+            {"reply_ts": 1_777_821_179_422, "reply_from": "M0FOO"},
+        ),
+    ]
+    store.close()
+
+
+def test_replypost_unknown_lid_warns(tmp_path: Path, capsys) -> None:
+    ui, store, calls = _make_ui_with_send_capture(tmp_path)
+    asyncio.run(ui._handle_command("/replypost 999 hello"))
+    assert calls == []
+    assert "no local post with lid 999" in capsys.readouterr().out
+    store.close()
+
+
 def test_delivery_timeout_render_ignores_show_acks(tmp_path: Path, capsys) -> None:
     """The user explicitly asked: if acks are off, the timeout still
     fires. Two renders with show_acks toggled should both print."""

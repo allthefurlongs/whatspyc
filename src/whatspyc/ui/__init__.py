@@ -3,6 +3,114 @@
 from __future__ import annotations
 
 import re
+from typing import Any
+
+
+_REPLY_SNIPPET_LEN = 10
+
+
+def reply_natural_key(kind: str, row: dict | Any) -> str | None:
+    """Return the natural key of the parent for a reply row, or ``None``.
+
+    For DMs this is the parent's ``_id`` (taken straight from the wire
+    ``r`` field, which itself encodes ``{ts}-{fc}``). For posts it's
+    the parent's ``ts`` as a string — posts are keyed locally on
+    ``(channel_id, ts)`` and replies are presumed to live in the same
+    channel as their parent.
+    """
+    get = row.get if hasattr(row, "get") else lambda k, d=None: d
+    if kind == "dm":
+        rid = get("reply_id") or get("r")
+        return str(rid) if rid else None
+    if kind == "ch":
+        rts = get("reply_ts") or get("rts")
+        return str(int(rts)) if rts is not None else None
+    return None
+
+
+def reply_call_for(kind: str, row: dict | Any) -> str | None:
+    """Best-effort sender callsign of the parent post/DM being replied to.
+
+    Posts: ``rfc`` is on the wire alongside ``rts``. DMs: ``r`` is the
+    parent's ``_id`` of the form ``{ts}-{fc}``, so the callsign is
+    encoded in the same field — parse it back out. Returns ``None``
+    when no reply field is present, or when a DM's ``r`` is malformed.
+    """
+    get = row.get if hasattr(row, "get") else lambda k, d=None: d
+    if kind == "dm":
+        rid = get("reply_id") or get("r")
+        if not rid or not isinstance(rid, str):
+            return None
+        _, _, fc = rid.partition("-")
+        return fc.upper() or None
+    if kind == "ch":
+        rfc = get("reply_from") or get("rfc")
+        return rfc.upper() if isinstance(rfc, str) and rfc else None
+    return None
+
+
+def resolve_reply_meta(store, kind: str, target_key: str, row: dict | Any) -> dict | None:
+    """Resolve a row's reply metadata for rendering.
+
+    Returns ``None`` if the row is not a reply. Otherwise returns a dict
+    with ``call`` (str | None), ``snippet`` (str | None), ``in_db``
+    (bool) and ``parent`` (dict | None) — the full parent row from the
+    store, populated only when ``in_db`` is True so callers like the
+    "View Full Reply-To" modal can avoid a second lookup.
+
+    The parent lookup is done fresh on every call so a row that
+    initially rendered "<msg not in db>" picks up the real preview as
+    soon as the parent arrives and a refresh happens.
+    """
+    nk = reply_natural_key(kind, row)
+    if nk is None:
+        return None
+    call = reply_call_for(kind, row)
+    parent: dict | None = None
+    if kind == "dm":
+        try:
+            parent = store.lookup_message_by_id(nk)
+        except Exception:
+            parent = None
+    elif kind == "ch":
+        try:
+            parent = store.lookup_post(int(target_key), int(nk))
+        except (TypeError, ValueError, Exception):
+            parent = None
+    snippet: str | None = None
+    if parent is not None:
+        body = parent.get("body") or ""
+        # Only suffix with "..." when we actually truncated; a short
+        # parent body renders verbatim so the user isn't misled into
+        # thinking there's more text.
+        if len(body) > _REPLY_SNIPPET_LEN:
+            snippet = body[:_REPLY_SNIPPET_LEN] + "..."
+        else:
+            snippet = body or "..."
+        if not call:
+            call = (parent.get("from_call") or "").upper() or None
+    return {
+        "call": call,
+        "snippet": snippet,
+        "in_db": parent is not None,
+        "parent": parent,
+    }
+
+
+def reply_prefix_text(meta: dict | None) -> str:
+    """Plain-text reply prefix — used by the line UI.
+
+    Returns ``""`` when there's no reply.
+    """
+    if not meta:
+        return ""
+    call = meta.get("call")
+    if meta.get("in_db") and meta.get("snippet"):
+        body = meta["snippet"]
+        return f"[Reply To {call}: {body}] " if call else f"[Reply To: {body}] "
+    if call:
+        return f"[Reply To {call}: <msg not in db>] "
+    return "[Reply To: <msg not in db>] "
 
 
 # 1e12 ms = 2001-09-09 — well before WhatsPac existed. Anything below

@@ -18,7 +18,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from whatspyc.config import ChannelInfo
 from whatspyc.ui import help as help_data
-from whatspyc.ui import ts_to_ms
+from whatspyc.ui import reply_prefix_text, resolve_reply_meta, ts_to_ms
 from whatspyc.ui.options import SessionOptions
 from whatspyc.wps.client import WpsClient
 
@@ -268,7 +268,10 @@ class LineUI:
                 if verbose:
                     print(self._fmt_dm_verbose(r))
                 else:
-                    self._print_dm(r["from_call"], r["to_call"], r["ts"], r["body"])
+                    self._print_dm(
+                        r["from_call"], r["to_call"], r["ts"], r["body"],
+                        reply_prefix=self._reply_prefix("dm", "", r),
+                    )
         elif kind == "ch":
             rows = store.recent_posts(int(key), limit=n)
             if not rows:
@@ -278,7 +281,10 @@ class LineUI:
                 if verbose:
                     print(self._fmt_post_verbose(r))
                 else:
-                    self._print_post(r["channel_id"], r["from_call"], r["ts"], r["body"])
+                    self._print_post(
+                        r["channel_id"], r["from_call"], r["ts"], r["body"],
+                        reply_prefix=self._reply_prefix("ch", str(int(key)), r),
+                    )
 
     def _render_dm(self, m: dict) -> None:
         """Render a freshly-arrived ``m``-shaped dict (from `m` or one
@@ -292,7 +298,10 @@ class LineUI:
                 return
             # Row missing (race / external store). Fall through to
             # compact so something still appears.
-        self._print_dm(m.get("fc"), m.get("tc"), m.get("ts"), m.get("m"))
+        self._print_dm(
+            m.get("fc"), m.get("tc"), m.get("ts"), m.get("m"),
+            reply_prefix=self._reply_prefix("dm", "", m),
+        )
 
     def _render_post(self, cid: int | None, p: dict) -> None:
         if self._options.verbose_history and cid is not None:
@@ -300,7 +309,11 @@ class LineUI:
             if row is not None:
                 print(self._fmt_post_verbose(row))
                 return
-        self._print_post(cid, p.get("fc"), p.get("ts"), p.get("p"))
+        target_key = str(int(cid)) if cid is not None else ""
+        self._print_post(
+            cid, p.get("fc"), p.get("ts"), p.get("p"),
+            reply_prefix=self._reply_prefix("ch", target_key, p),
+        )
 
     def _lookup_message(self, m: dict) -> dict | None:
         msg_id = m.get("_id") or (
@@ -323,17 +336,41 @@ class LineUI:
             return None
 
     def _print_dm(
-        self, fc: str | None, tc: str | None, ts: int | float | None, body: str | None
+        self,
+        fc: str | None,
+        tc: str | None,
+        ts: int | float | None,
+        body: str | None,
+        *,
+        reply_prefix: str = "",
     ) -> None:
         peer = tc if (fc or "").upper() == self._my_call.upper() else fc
         prefix = self._dm_prefix(peer or "")
-        print(f"{prefix}{self._fmt_ts(ts)} {self._fmt_call(fc)}: {body}")
+        print(f"{prefix}{self._fmt_ts(ts)} {self._fmt_call(fc)}: {reply_prefix}{body}")
 
     def _print_post(
-        self, cid: int | None, fc: str | None, ts: int | float | None, body: str | None
+        self,
+        cid: int | None,
+        fc: str | None,
+        ts: int | float | None,
+        body: str | None,
+        *,
+        reply_prefix: str = "",
     ) -> None:
         prefix = self._channel_prefix(int(cid)) if cid is not None else ""
-        print(f"{prefix}{self._fmt_ts(ts)} {self._fmt_call(fc)}: {body}")
+        print(f"{prefix}{self._fmt_ts(ts)} {self._fmt_call(fc)}: {reply_prefix}{body}")
+
+    def _reply_prefix(self, kind: str, target_key: str, row: dict) -> str:
+        """Plain-text reply preview prefix for one row, or ``""``.
+
+        Looks up the parent in the store via the row's reply fields
+        (``r`` for DMs, ``rts``/``rfc`` for posts). When the parent is
+        in the local store, returns ``[Reply To CALL: 10chars...] ``;
+        otherwise the ``<msg not in db>`` fallback variant.
+        """
+        store = self._client._store  # type: ignore[attr-defined]
+        meta = resolve_reply_meta(store, kind, target_key, row)
+        return reply_prefix_text(meta)
 
     def _fmt_dm_verbose(self, row: dict) -> str:
         """Verbose render of a DM row (from ``recent_messages`` or
@@ -351,14 +388,17 @@ class LineUI:
         tc = row.get("to_call")
         peer = tc if (fc or "").upper() == self._my_call.upper() else fc
         prefix = self._dm_prefix(peer or "")
-        return self._compose_verbose(prefix, row)
+        reply_pref = self._reply_prefix("dm", "", row)
+        return self._compose_verbose(prefix, row, reply_pref)
 
     def _fmt_post_verbose(self, row: dict) -> str:
         cid = row.get("channel_id")
         prefix = self._channel_prefix(int(cid)) if cid is not None else ""
-        return self._compose_verbose(prefix, row)
+        target_key = str(int(cid)) if cid is not None else ""
+        reply_pref = self._reply_prefix("ch", target_key, row)
+        return self._compose_verbose(prefix, row, reply_pref)
 
-    def _compose_verbose(self, prefix: str, row: dict) -> str:
+    def _compose_verbose(self, prefix: str, row: dict, reply_prefix: str = "") -> str:
         lid = row.get("lid")
         ts = row.get("ts")
         fc = row.get("from_call")
@@ -367,7 +407,7 @@ class LineUI:
         head = f"{prefix}ID: {lid} - {self._fmt_ts(ts)}"
         if middle:
             head = f"{head} - {middle}"
-        return f"{head} - {self._fmt_call(fc)}: {body}"
+        return f"{head} - {self._fmt_call(fc)}: {reply_prefix}{body}"
 
     def _verbose_status(self, row: dict) -> str | None:
         """Compute the middle 'state' segment of the verbose line.
@@ -597,9 +637,10 @@ class LineUI:
         prefix = self._dm_prefix(peer or "")
         edts = obj.get("edts") or row.get("edit_ts")
         body = obj.get("m", row.get("body", ""))
+        reply_pref = self._reply_prefix("dm", "", row)
         return (
             f"{prefix}{self._fmt_ts(edts)} {self._fmt_call(fc)}: "
-            f"[EDITED] {body}"
+            f"{reply_pref}[EDITED] {body}"
         )
 
     def _fmt_post_edit(self, obj: dict) -> str | None:
@@ -619,9 +660,10 @@ class LineUI:
         edts = obj.get("edts") or row.get("edit_ts")
         body = obj.get("p", row.get("body", ""))
         fc = row.get("from_call")
+        reply_pref = self._reply_prefix("ch", str(int(cid)), row)
         return (
             f"{prefix}{self._fmt_ts(edts)} {self._fmt_call(fc)}: "
-            f"[EDITED] {body}"
+            f"{reply_pref}[EDITED] {body}"
         )
 
     def _paused_hint(self, cid: int, paused: int) -> str:
@@ -997,6 +1039,50 @@ class LineUI:
                 print(f"[{exc}]")
                 return
             print(f"[retrypost] resent lid {lid}")
+        elif cmd == "/replydm" and len(args) >= 2:
+            if self._refuse_offline("/replydm"):
+                return
+            try:
+                lid = int(args[0])
+            except ValueError:
+                print(f"[hint] /replydm: LID must be an integer (got {args[0]!r})")
+                return
+            row = self._client._store.lookup_message_by_lid(lid)  # type: ignore[attr-defined]
+            if row is None:
+                print(f"[hint] /replydm: no local message with lid {lid}")
+                return
+            # Reply goes to whichever side of the parent thread isn't us.
+            peer_call = (
+                row["to_call"]
+                if (row["from_call"] or "").upper() == self._my_call.upper()
+                else row["from_call"]
+            )
+            await self._client.send_message(
+                peer_call, " ".join(args[1:]), reply_id=row["id"]
+            )
+        elif cmd == "/replypost" and len(args) >= 2:
+            if self._refuse_offline("/replypost"):
+                return
+            try:
+                lid = int(args[0])
+            except ValueError:
+                print(f"[hint] /replypost: LID must be an integer (got {args[0]!r})")
+                return
+            row = self._client._store.lookup_post_by_lid(lid)  # type: ignore[attr-defined]
+            if row is None:
+                print(f"[hint] /replypost: no local post with lid {lid}")
+                return
+            cid = int(row["channel_id"])
+            paused = self._client.paused_channels().get(cid)
+            if paused:
+                print(self._paused_hint(cid, paused))
+                return
+            await self._client.post(
+                cid,
+                " ".join(args[1:]),
+                reply_ts=int(row["ts"]),
+                reply_from=row["from_call"],
+            )
         elif cmd == "/react" and len(args) == 2:
             if self._refuse_offline("/react"):
                 return
