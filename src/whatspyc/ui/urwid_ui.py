@@ -2756,6 +2756,17 @@ class _UrwidApp:
         )
         self._modal_stack.append((modal, prev_top, None))
         self._frame_holder.original_widget = overlay
+        # urwid's AsyncioEventLoop only auto-redraws after input events /
+        # alarms (via the ``_also_call_idle`` wrapper). When ``_show_modal``
+        # is reached from a chain of asyncio tasks deeper than the one the
+        # input handler started — e.g. ``Enter`` → ``_handle_input_submit``
+        # → ``_handle_command`` → ``action_quit_app`` → ``_wait`` — the
+        # idle redraw fires before the inner task gets to set the overlay,
+        # and the modal is invisible until the next keypress. Direct paths
+        # (``ctrl x`` → ``action_quit_app`` → ``_wait``) happen to win the
+        # race because the inner task runs before the idle. Force a draw
+        # here so every entry path renders the modal at push time.
+        self._loop.draw_screen()
         return modal.future
 
     def _dismiss_modal(self, modal: _Modal) -> None:
