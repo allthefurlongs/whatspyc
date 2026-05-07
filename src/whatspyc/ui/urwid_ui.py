@@ -25,6 +25,7 @@ there apply unchanged.
 from __future__ import annotations
 
 import asyncio
+import curses
 import logging
 import re
 import sys
@@ -55,6 +56,37 @@ from whatspyc.wps.connect_seq import ConnectSummary
 
 TargetKey = tuple[str, str]
 RowKey = tuple[str, str, str]
+
+
+_ALTSCREEN_SEQS_CACHE: tuple[str, str] | None = None
+
+
+def _altscreen_seqs() -> tuple[str, str]:
+    """Return ``(smcup, rmcup)`` strings derived from the current
+    terminal's terminfo entry, falling back to the xterm DEC
+    private-mode sequences when terminfo is unavailable. Cached so
+    repeated calls don't re-run ``setupterm``.
+
+    Going through terminfo (rather than hard-coding ``\\x1b[?1049h/l``)
+    lets screen and tmux route the buffer-switch through their own
+    altscreen handling when their config has it enabled.
+    """
+    global _ALTSCREEN_SEQS_CACHE
+    if _ALTSCREEN_SEQS_CACHE is not None:
+        return _ALTSCREEN_SEQS_CACHE
+    smcup = "\x1b[?1049h"
+    rmcup = "\x1b[?1049l"
+    try:
+        curses.setupterm()
+        ti_smcup = curses.tigetstr("smcup")
+        ti_rmcup = curses.tigetstr("rmcup")
+        if ti_smcup is not None and ti_rmcup is not None:
+            smcup = ti_smcup.decode("ascii", "replace")
+            rmcup = ti_rmcup.decode("ascii", "replace")
+    except Exception:
+        pass
+    _ALTSCREEN_SEQS_CACHE = (smcup, rmcup)
+    return _ALTSCREEN_SEQS_CACHE
 
 # ---------------------------------------------------------------------
 # Palette — named colour roles used throughout the file.
@@ -1656,18 +1688,21 @@ class ConnectProgressModal(_Modal):
         self.cancel_task: asyncio.Task | None = None
 
     def build(self) -> urwid.Widget:
-        rows: list[urwid.Widget] = []
+        # Frame so the progress ListBox grows to fill whatever vertical
+        # space the overlay gives us — a fixed BoxAdapter height clipped
+        # progress lines off the top once a multi-hop connect ran past
+        # ~10 lines, even when the modal had room to spare.
+        header_rows: list[urwid.Widget] = []
+        header_rows.append(urwid.Text(("dim", "Press q or Esc to cancel")))
+        header_rows.append(urwid.Divider())
         if self._banner:
-            rows.append(urwid.Text(("yellow,bold", self._banner)))
-            rows.append(urwid.Divider())
-        rows.append(urwid.Text(("bold", self._header)))
-        rows.append(urwid.Divider())
+            header_rows.append(urwid.Text(("yellow,bold", self._banner)))
+            header_rows.append(urwid.Divider())
+        header_rows.append(urwid.Text(("bold", self._header)))
+        header_rows.append(urwid.Divider())
         self._walker = urwid.SimpleFocusListWalker([])
         self._listbox = urwid.ListBox(self._walker)
-        rows.append(urwid.BoxAdapter(self._listbox, height=10))
-        rows.append(urwid.Divider())
-        rows.append(urwid.Text(("dim", "Press q or Esc to cancel")))
-        return urwid.Filler(urwid.Pile(rows), valign="top")
+        return urwid.Frame(self._listbox, header=urwid.Pile(header_rows))
 
     def add_line(self, text: Any) -> None:
         """Append a progress line. ``text`` may be a str or urwid markup."""
@@ -1927,9 +1962,14 @@ class _UrwidApp:
         # restores whatever was on the screen before the app started,
         # instead of leaving the shell prompt sitting in the middle of
         # the urwid render. urwid's raw_display.Screen doesn't do this
-        # itself.
-        sys.stdout.write("\x1b[?1049h")
-        sys.stdout.flush()
+        # itself. We pull smcup from terminfo rather than hard-coding
+        # the xterm DEC private-mode sequence so screen/tmux can route
+        # it through their own buffer-switch handling when altscreen is
+        # enabled.
+        smcup, _rmcup = _altscreen_seqs()
+        if smcup:
+            sys.stdout.write(smcup)
+            sys.stdout.flush()
         self._loop.start()
         try:
             if self._ui.session_driven:
@@ -1953,7 +1993,24 @@ class _UrwidApp:
                 except (asyncio.CancelledError, Exception):
                     pass
             self._loop.stop()
-            sys.stdout.write("\x1b[?1049l")
+            # Park the cursor on the bottom row and clear that line
+            # *before* rmcup. If altscreen actually switched buffers
+            # (xterm, screen with ``altscreen on``, tmux) this happens
+            # on the alt-buffer that's about to be discarded — harmless.
+            # If altscreen got silently dropped (screen with altscreen
+            # off, dumb terminals) rmcup is a no-op and the urwid
+            # render stays on screen, but the shell prompt at least
+            # lands on a clean bottom line instead of stomping the
+            # last urwid row — same end-state as ncurses' ``endwin()``
+            # (what htop relies on).
+            _smcup, rmcup = _altscreen_seqs()
+            try:
+                rows = self._loop.screen.get_cols_rows()[1]
+            except Exception:
+                rows = 24
+            sys.stdout.write(f"\x1b[{rows};1H\x1b[2K")
+            if rmcup:
+                sys.stdout.write(rmcup)
             sys.stdout.flush()
 
     # ------------------------------------------------------------------
@@ -1985,13 +2042,45 @@ class _UrwidApp:
                 client, _ = await self._open_offline(profile)
                 self._ui._client = client
                 self._enter_offline_mode()
+                self._post_connect_setup()
                 return
             ok = await self._run_connect_modal(profile, banner=banner)
             if ok:
+                self._post_connect_setup()
                 return
             # Connect cancelled or errored — show the picker again.
             banner = "Disconnected"
             profile = None
+
+    def _post_connect_setup(self) -> None:
+        """Re-run client-dependent widget setup once a client is up.
+
+        ``_build_widgets`` runs *before* the bootstrap connects, so in
+        session-driven mode it skips the target-list population (the
+        store call would crash on a ``None`` client). Once the
+        connector returns a live client, the target list needs to
+        catch up: subscribed channels should render with the
+        BALLOT-BOX-WITH-CHECK box rather than the empty BALLOT-BOX
+        they'd otherwise inherit from the
+        directory-only fill. The header also references the client's
+        display name and needs a fresh draw.
+        """
+        # Clear any rows that ``_build_widgets`` may have populated
+        # from the directory (channels.toml) so the merged
+        # subscribed-from-store + directory list ends up consistent.
+        if self._channels_walker is not None:
+            self._channels_walker.clear()
+        if self._dms_walker is not None:
+            self._dms_walker.clear()
+        self._target_items.clear()
+        self._populate_initial_target_lists()
+        if self._header_text is not None:
+            self._header_text.set_text(self._header_markup())
+        if self._loop is not None:
+            try:
+                self._loop.draw_screen()
+            except Exception:
+                pass
 
     async def _open_offline(self, profile: ConnectProfile) -> tuple[WpsClient, ConnectSummary]:
         """Open the connector for an offline profile (no link, no modal)."""
@@ -2176,9 +2265,11 @@ class _UrwidApp:
                 offline_client, _ = await self._open_offline(profile)
                 self._ui._client = offline_client
                 self._enter_offline_mode()
+                self._post_connect_setup()
                 return
             ok = await self._run_connect_modal(profile, banner=None)
             if ok:
+                self._post_connect_setup()
                 return
             cur_banner = "Disconnected"
             profile = None
@@ -2236,7 +2327,15 @@ class _UrwidApp:
                 ("pack", urwid.BoxAdapter(self._online_listbox, height=8)),
             ]
         )
-        self._populate_initial_target_lists()
+        # Client-dependent setup. In session-driven mode the client is
+        # ``None`` until the bootstrap finishes; without this guard
+        # ``_populate_initial_target_lists`` would run with an empty
+        # store result, leaving every channel rendered as
+        # unsubscribed (BALLOT-BOX) even after the connect ack lands. The
+        # bootstrap re-runs ``_post_connect_setup`` once the client
+        # is up.
+        if self._ui._client is not None:
+            self._populate_initial_target_lists()
 
         # ----- Centre pane: status pane + thread header + per-target ListBox -----
         self._status_walker = urwid.SimpleFocusListWalker([])
