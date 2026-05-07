@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Iterable, Optional
@@ -1715,6 +1716,13 @@ class _UrwidApp:
         self._ui._pending.clear()
         self._drain_task = asyncio.create_task(self._drain_events())
 
+        # Switch into the terminal's alternate-screen buffer so quitting
+        # restores whatever was on the screen before the app started,
+        # instead of leaving the shell prompt sitting in the middle of
+        # the urwid render. urwid's raw_display.Screen doesn't do this
+        # itself.
+        sys.stdout.write("\x1b[?1049h")
+        sys.stdout.flush()
         self._loop.start()
         try:
             await self._exit_future
@@ -1726,6 +1734,8 @@ class _UrwidApp:
                 except (asyncio.CancelledError, Exception):
                     pass
             self._loop.stop()
+            sys.stdout.write("\x1b[?1049l")
+            sys.stdout.flush()
 
     # ------------------------------------------------------------------
     # Widget construction.
