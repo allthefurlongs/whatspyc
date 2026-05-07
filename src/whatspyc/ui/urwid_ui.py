@@ -38,7 +38,7 @@ from whatspyc import __version__
 from whatspyc import log as log_mod
 
 _log = logging.getLogger(__name__)
-from whatspyc.config import ChannelInfo
+from whatspyc.config import ChannelInfo, ConnectProfile
 from whatspyc.ui import emoji_for_display, emoji_to_wire, ts_to_ms
 from whatspyc.ui import help as help_data
 from whatspyc.ui.emoji_catalog import (
@@ -50,6 +50,7 @@ from whatspyc.ui.emoji_catalog import (
 )
 from whatspyc.ui.options import SessionOptions
 from whatspyc.wps.client import WpsClient
+from whatspyc.wps.connect_seq import ConnectSummary
 
 
 TargetKey = tuple[str, str]
@@ -159,6 +160,34 @@ FOCUS_MAP: dict[Any, str] = {
 # ---------------------------------------------------------------------
 # Format helpers — produce urwid markup lists (lists of (attr, text) tuples).
 # ---------------------------------------------------------------------
+
+
+def _format_connected_line(summary: ConnectSummary) -> str:
+    """Compose the one-line summary shown when the link is up. Same
+    text as cli.py's pre-UI ``[Connected]`` echo."""
+    parts = [
+        f"{summary.server_message_count} new DMs",
+        f"{summary.server_post_count} new posts",
+    ]
+    if summary.paused_channels:
+        n = len(summary.paused_channels)
+        parts.append(f"{n} paused channel(s) — see /unpause hint(s) above")
+    return "[Connected] " + ", ".join(parts)
+
+
+def _format_open_error(exc: BaseException) -> str:
+    """Same shape as cli.py's ``_format_connect_error``. Duplicated here
+    so the modal can label connect failures without an import cycle."""
+    if isinstance(exc, ConnectionRefusedError):
+        return "connection refused — is the host/port correct and the service running?"
+    if isinstance(exc, asyncio.IncompleteReadError):
+        return "link closed unexpectedly during connect"
+    if isinstance(exc, TimeoutError):
+        return "connection timed out"
+    if isinstance(exc, OSError):
+        msg = str(exc) or exc.__class__.__name__
+        return f"network error: {msg}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _ts_text(ts: int | float | None, *, dim: bool = False) -> tuple[str, str]:
@@ -1600,6 +1629,173 @@ _QUICK_PICKS: list[EmojiEntry] = [
 
 
 # ---------------------------------------------------------------------
+# Connect / picker modals — the "session-driven" entry path.
+# ---------------------------------------------------------------------
+
+
+class ConnectProgressModal(_Modal):
+    """Streaming connect-progress display.
+
+    Used for both the initial connect and auto-reconnect cycles. Lines
+    are appended via ``add_line``; the modal sits on top of the main
+    widget tree until the caller calls ``dismiss(value)``. Pressing
+    ``q``/``Esc`` cancels: it cancels the bound ``cancel_task`` (the
+    in-flight connect coroutine, if any) and dismisses with ``None``,
+    which the bootstrap reads as "user bailed; show picker".
+    """
+
+    title = "Connecting"
+    overlay_min_height = 8
+
+    def __init__(self, *, header: str, banner: str | None = None) -> None:
+        super().__init__()
+        self._header = header
+        self._banner = banner
+        self._walker: urwid.SimpleFocusListWalker | None = None
+        self._listbox: urwid.ListBox | None = None
+        self.cancel_task: asyncio.Task | None = None
+
+    def build(self) -> urwid.Widget:
+        rows: list[urwid.Widget] = []
+        if self._banner:
+            rows.append(urwid.Text(("yellow,bold", self._banner)))
+            rows.append(urwid.Divider())
+        rows.append(urwid.Text(("bold", self._header)))
+        rows.append(urwid.Divider())
+        self._walker = urwid.SimpleFocusListWalker([])
+        self._listbox = urwid.ListBox(self._walker)
+        rows.append(urwid.BoxAdapter(self._listbox, height=10))
+        rows.append(urwid.Divider())
+        rows.append(urwid.Text(("dim", "Press q or Esc to cancel")))
+        return urwid.Filler(urwid.Pile(rows), valign="top")
+
+    def add_line(self, text: Any) -> None:
+        """Append a progress line. ``text`` may be a str or urwid markup."""
+        if self._walker is None:
+            return
+        self._walker.append(urwid.Text(text))
+        if self._listbox is not None and len(self._walker) > 0:
+            try:
+                self._listbox.set_focus(len(self._walker) - 1)
+            except (IndexError, ValueError):
+                pass
+        if self._app is not None and self._app._loop is not None:
+            try:
+                self._app._loop.draw_screen()
+            except Exception:
+                pass
+
+    def update_header(self, header: str) -> None:
+        self._header = header
+
+    def keypress(self, size, key):
+        if key in ("esc", "q", "Q"):
+            if self.cancel_task is not None and not self.cancel_task.done():
+                self.cancel_task.cancel()
+            self.dismiss(None)
+            return None
+        return key
+
+    @property
+    def overlay_size(self) -> tuple[int, str, int]:
+        return 70, "middle", 60
+
+
+class ProfilePickerModal(_Modal):
+    """Pick a profile from the list (offline + configured profiles).
+
+    Surfaced at startup when no ``--profile``/ad-hoc flags were given,
+    and on terminal disconnect / ``_reconnect_giveup``. Optional
+    ``banner`` is a one-line explanation shown above the list (e.g.
+    "Disconnected" or "Max reconnect retries reached").
+
+    Dismisses with the chosen ``ConnectProfile`` or ``None`` for quit.
+    """
+
+    title = "Select Profile"
+    overlay_min_height = 8
+
+    def __init__(
+        self,
+        *,
+        profiles: list[ConnectProfile],
+        default_name: str | None = None,
+        banner: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._profiles = profiles
+        self._default_name = default_name
+        self._banner = banner
+        self._listbox: urwid.ListBox | None = None
+        self._row_for_idx: list[_FocusableText] = []
+
+    def build(self) -> urwid.Widget:
+        rows: list[urwid.Widget] = []
+        if self._banner:
+            rows.append(urwid.Text(("yellow,bold", self._banner)))
+            rows.append(urwid.Divider())
+        rows.append(urwid.Text(("bold", "Select a connect profile")))
+        rows.append(urwid.Divider())
+        default_idx: int | None = None
+        for i, p in enumerate(self._profiles):
+            label = self._format_label(i, p)
+            row = _FocusableText(
+                label,
+                on_activate=lambda prof=p: self.dismiss(prof),
+            )
+            self._row_for_idx.append(row)
+            rows.append(row)
+            if self._default_name and p.name == self._default_name:
+                default_idx = len(rows) - 1
+        rows.append(urwid.Divider())
+        rows.append(
+            urwid.Text(("dim", "Enter to pick · digit to jump · q/Esc to quit"))
+        )
+        walker = urwid.SimpleFocusListWalker(rows)
+        self._listbox = urwid.ListBox(walker)
+        if default_idx is not None:
+            try:
+                self._listbox.set_focus(default_idx)
+            except (IndexError, ValueError):
+                pass
+        return self._listbox
+
+    def _format_label(self, i: int, p: ConnectProfile) -> list:
+        marker = ""
+        if self._default_name and p.name == self._default_name:
+            marker = " (default)"
+        if p.name.startswith("<") and p.name.endswith(">"):
+            return [
+                ("bold", f"{i}. "),
+                ("yellow", p.name),
+                ("dim", "  browse local database (no connection)"),
+            ]
+        user_hops = [s for s in p.connect_script if s.cmd]
+        suffix = f"  {len(user_hops)}-hop" if user_hops else "  direct"
+        return [
+            ("bold", f"{i}. "),
+            ("default", p.name),
+            ("yellow", marker),
+            ("dim", suffix),
+        ]
+
+    def keypress(self, size, key):
+        if key in ("esc", "q", "Q"):
+            self.dismiss(None)
+            return None
+        if key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(self._profiles):
+                self.dismiss(self._profiles[idx])
+                return None
+        return key
+
+    @property
+    def overlay_size(self) -> tuple[int, str, int]:
+        return 70, "middle", 70
+
+
+# ---------------------------------------------------------------------
 # Main App — owns the widget tree and runs urwid.MainLoop.
 # ---------------------------------------------------------------------
 
@@ -1677,6 +1873,17 @@ class _UrwidApp:
         self._frame: urwid.Frame | None = None
         self._frame_holder: urwid.WidgetPlaceholder | None = None
 
+        # Session-driven state. ``_active_connect_modal`` points at the
+        # currently-mounted ConnectProgressModal (during initial
+        # connect or auto-reconnect) so _disconnect / _reconnecting /
+        # _reconnected events can update it in place.
+        self._active_connect_modal: ConnectProgressModal | None = None
+        self._bootstrap_task: asyncio.Task | None = None
+        # Re-entrancy guard for the in-event-handler reconnect modal —
+        # we'd otherwise stack a new modal for each `_disconnect` while
+        # the previous reconnect cycle is still settling.
+        self._reconnect_handling: bool = False
+
     # ------------------------------------------------------------------
     # Public surface — called by UrwidUI.
     # ------------------------------------------------------------------
@@ -1725,8 +1932,20 @@ class _UrwidApp:
         sys.stdout.flush()
         self._loop.start()
         try:
+            if self._ui.session_driven:
+                # Drive the picker → connect modal → main session flow
+                # inside the running loop. The bootstrap sets
+                # ``self._ui._client`` on success and signals exit on
+                # quit/cancel.
+                self._bootstrap_task = asyncio.create_task(self._bootstrap_session())
             await self._exit_future
         finally:
+            if self._bootstrap_task is not None:
+                self._bootstrap_task.cancel()
+                try:
+                    await self._bootstrap_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if self._drain_task is not None:
                 self._drain_task.cancel()
                 try:
@@ -1736,6 +1955,239 @@ class _UrwidApp:
             self._loop.stop()
             sys.stdout.write("\x1b[?1049l")
             sys.stdout.flush()
+
+    # ------------------------------------------------------------------
+    # Session bootstrap (session-driven mode only).
+    # ------------------------------------------------------------------
+
+    async def _bootstrap_session(self) -> None:
+        """Drive the picker → connect cycle until a client is connected
+        (or the user quits). Runs inside the urwid main loop.
+        """
+        profile: ConnectProfile | None = self._ui._initial_profile
+        banner: str | None = None
+        while True:
+            if profile is None:
+                picker = ProfilePickerModal(
+                    profiles=self._ui._available_profiles,
+                    default_name=self._ui._default_profile_name,
+                    banner=banner,
+                )
+                choice = await self._show_modal(picker)
+                if choice is None:
+                    self._signal_clean_exit()
+                    return
+                profile = choice
+                banner = None
+            if self._ui._is_offline_profile_fn(profile):
+                # Offline doesn't open a link — connector returns the
+                # offline-shaped client immediately.
+                client, _ = await self._open_offline(profile)
+                self._ui._client = client
+                self._enter_offline_mode()
+                return
+            ok = await self._run_connect_modal(profile, banner=banner)
+            if ok:
+                return
+            # Connect cancelled or errored — show the picker again.
+            banner = "Disconnected"
+            profile = None
+
+    async def _open_offline(self, profile: ConnectProfile) -> tuple[WpsClient, ConnectSummary]:
+        """Open the connector for an offline profile (no link, no modal)."""
+        async def _on_event(_obj: dict) -> None:
+            return
+
+        def _on_client_ready(c: WpsClient) -> None:
+            self._ui._client = c
+
+        client, summary = await self._ui._connection_opener(  # type: ignore[misc]
+            profile,
+            progress=lambda _line: None,
+            on_event=_on_event,
+            on_client_ready=_on_client_ready,
+        )
+        return client, summary
+
+    def _enter_offline_mode(self) -> None:
+        """Flip the running UI into offline (read-only) mode after the
+        user picked the ``<offline>`` sentinel from the in-UI picker."""
+        self._ui._offline = True
+        self._status_visible = True
+        self._refresh_status_pane()
+        self._status_error(
+            ("yellow", "[offline] read-only mode — browsing local store, no connection")
+        )
+        # Refresh the header so the OFFLINE marker shows.
+        if self._header_text is not None:
+            self._header_text.set_text(self._header_markup())
+
+    async def _run_connect_modal(
+        self, profile: ConnectProfile, *, banner: str | None
+    ) -> bool:
+        """Open the ConnectProgressModal and run the connection_opener.
+
+        Returns True when the link is up (self._ui._client is set);
+        False when the user cancelled or the opener raised. The picker
+        loop in ``_bootstrap_session`` decides what happens next.
+        """
+        modal = ConnectProgressModal(
+            header=f"Connecting via '{profile.name}'…",
+            banner=banner,
+        )
+        self._active_connect_modal = modal
+        modal.add_line(("dim", f"Connecting with '{profile.name}' profile..."))
+
+        async def _on_event(obj: dict) -> None:
+            self.render_event(obj)
+
+        def _on_client_ready(c: WpsClient) -> None:
+            # Set the UI's client *before* ``client.open()`` returns so
+            # events that arrive during the type-`c` settle (mb / cpb /
+            # pch / o / he / ...) reach handlers with a valid
+            # ``self._ui._client`` rather than crashing on ``None``.
+            self._ui._client = c
+
+        async def _runner() -> None:
+            try:
+                _, summary = await self._ui._connection_opener(  # type: ignore[misc]
+                    profile,
+                    progress=modal.add_line,
+                    on_event=_on_event,
+                    on_client_ready=_on_client_ready,
+                )
+            except asyncio.CancelledError:
+                # User pressed q/Esc; partial client is closed by the
+                # connector's own cleanup. Reset the UI's reference so
+                # the picker that follows starts from a clean slate.
+                self._ui._client = None
+                return
+            except Exception as exc:
+                # Connect failed mid-handshake — the connector closed
+                # the partial client. Drop the dangling UI reference.
+                self._ui._client = None
+                modal.add_line(("red", f"Could not connect: {_format_open_error(exc)}"))
+                # Briefly leave the error visible so the user sees why.
+                try:
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    pass
+                modal.dismiss(("error", exc))
+                return
+            connected_line = _format_connected_line(summary)
+            modal.add_line(("connect_line", connected_line))
+            # Also write the summary into the status pane so the user
+            # has a record after the modal disappears. Don't force the
+            # pane visible — the user explicitly asked for this not to
+            # toggle on visibility (use Ctrl-L if you want to see it).
+            self._status_write(("connect_line", connected_line))
+            modal.dismiss(("ok", summary))
+
+        runner_task = asyncio.create_task(_runner())
+        modal.cancel_task = runner_task
+        try:
+            result = await self._show_modal(modal)
+        finally:
+            self._active_connect_modal = None
+            if not runner_task.done():
+                runner_task.cancel()
+                try:
+                    await runner_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        return isinstance(result, tuple) and result and result[0] == "ok"
+
+    def _on_link_dropped(self) -> None:
+        """Schedule the in-UI reconnect / picker flow on `_disconnect`.
+
+        Called by the event-dispatch handler. If a connect modal is
+        already up (initial bootstrap, or a prior reconnect cycle),
+        do nothing — events will keep updating it.
+        """
+        if not self._ui.session_driven:
+            return
+        if self._reconnect_handling or self._active_connect_modal is not None:
+            return
+        self._reconnect_handling = True
+        asyncio.create_task(self._handle_link_drop())
+
+    async def _handle_link_drop(self) -> None:
+        try:
+            client = self._ui._client
+            if client is not None and client.is_auto_reconnect:
+                # Auto-reconnect on. Show progress modal; the
+                # `_reconnecting` / `_reconnected` / `_reconnect_giveup`
+                # handlers update / dismiss it.
+                modal = ConnectProgressModal(
+                    header="Reconnecting…",
+                    banner="Disconnected",
+                )
+                modal.add_line(("yellow", "Link dropped, reconnecting..."))
+                self._active_connect_modal = modal
+                # No cancel_task: pressing q closes the running client
+                # via the modal-dismiss-watcher below.
+                result = await self._show_modal(modal)
+                self._active_connect_modal = None
+                if isinstance(result, tuple) and result and result[0] == "reconnected":
+                    return  # back to normal session
+                if isinstance(result, tuple) and result and result[0] == "giveup":
+                    await self._reopen_picker(banner="Max reconnect retries reached")
+                    return
+                # Modal dismissed with None == user pressed q/Esc.
+                if client is not None:
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
+                self._signal_clean_exit()
+                return
+            # No auto-reconnect. Straight to picker.
+            await self._reopen_picker(banner="Disconnected")
+        finally:
+            self._reconnect_handling = False
+
+    async def _reopen_picker(self, *, banner: str) -> None:
+        """Close the current client (if any) and re-run the
+        picker → connect cycle. Mirrors ``_bootstrap_session``'s loop
+        but starts from a known disconnected state."""
+        client = self._ui._client
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            self._ui._client = None
+        cur_banner = banner
+        profile: ConnectProfile | None = None
+        while True:
+            if profile is None:
+                picker = ProfilePickerModal(
+                    profiles=self._ui._available_profiles,
+                    default_name=self._ui._default_profile_name,
+                    banner=cur_banner,
+                )
+                choice = await self._show_modal(picker)
+                if choice is None:
+                    self._signal_clean_exit()
+                    return
+                profile = choice
+                cur_banner = None
+            if self._ui._is_offline_profile_fn(profile):
+                offline_client, _ = await self._open_offline(profile)
+                self._ui._client = offline_client
+                self._enter_offline_mode()
+                return
+            ok = await self._run_connect_modal(profile, banner=None)
+            if ok:
+                return
+            cur_banner = "Disconnected"
+            profile = None
+
+    def _signal_clean_exit(self) -> None:
+        if self._ui.exit_reason is None:
+            self._ui.exit_reason = None  # explicit clean exit
+        if self._exit_future is not None and not self._exit_future.done():
+            self._exit_future.set_result(None)
 
     # ------------------------------------------------------------------
     # Widget construction.
@@ -1910,13 +2362,19 @@ class _UrwidApp:
         # ``bold`` / ``yellow`` / ``dim`` would show on the default
         # terminal background instead, leaving gaps in the bar.
         my = self._ui._my_call or ""
-        name = self._ui._client._name or ""
+        # Session-driven mode starts with no client until the
+        # bootstrap connect succeeds — the header has to render
+        # behind the connect modal during that window. Fall back to
+        # an empty name; a later refresh will pick up the real one.
+        client = self._ui._client
+        name = getattr(client, "_name", "") if client is not None else ""
         offline = " · OFFLINE" if self._ui._offline else ""
         return [
             ("header", f"whatspyc (v{__version__})"),
             ("header", f" — {my}"),
             ("header", f" · {name}" if name else ""),
             ("header_yellow", offline),
+            ("header_dim", " — Recommended GUI client: http://whatspac.oarc.uk/"),
         ]
 
     def _input_caption(self) -> list:
@@ -2811,10 +3269,28 @@ class _UrwidApp:
             if top_modal is modal:
                 if self._frame_holder is not None:
                     self._frame_holder.original_widget = prev_top
+                # Mirror ``_show_modal``: the AsyncioEventLoop only
+                # auto-redraws on input events / alarms, so without a
+                # forced draw the modal frame visibly lingers (until
+                # the next keypress) even after the dismiss future has
+                # resolved. Most painful on the connect-progress modal,
+                # which dismisses programmatically after the connect
+                # completes — the user sees the modal still up until
+                # they nudge a key.
+                if self._loop is not None:
+                    try:
+                        self._loop.draw_screen()
+                    except Exception:
+                        pass
                 return
         # Should never reach here; defensive.
         if self._frame_holder is not None and self._frame is not None:
             self._frame_holder.original_widget = self._frame
+            if self._loop is not None:
+                try:
+                    self._loop.draw_screen()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Modal opens (mirroring TextualUI helpers)
@@ -3481,7 +3957,9 @@ class _UrwidApp:
             self._write_to_active(line)
             if self._status_visible:
                 self._status_write(line)
-            if not self._ui._client.is_auto_reconnect:
+            if self._ui.session_driven:
+                self._on_link_dropped()
+            elif not self._ui._client.is_auto_reconnect:
                 self._signal_terminal_link_loss()
         elif t == "_reconnecting":
             attempt = obj.get("attempt", 0)
@@ -3493,6 +3971,10 @@ class _UrwidApp:
             self._write_to_active(line)
             if self._status_visible:
                 self._status_write(line)
+            if self._active_connect_modal is not None:
+                self._active_connect_modal.add_line(
+                    ("reconnect_line", f"Reconnect attempt {attempt} in {delay:.1f}s")
+                )
         elif t == "_reconnect_failed":
             line = [
                 ("reconnect_line", "[link]"),
@@ -3501,6 +3983,14 @@ class _UrwidApp:
             self._write_to_active(line)
             if self._status_visible:
                 self._status_write(line)
+            if self._active_connect_modal is not None:
+                self._active_connect_modal.add_line(
+                    (
+                        "reconnect_line",
+                        f"Attempt {obj.get('attempt')} failed: "
+                        f"{obj.get('error') or obj.get('exc') or ''}",
+                    )
+                )
         elif t == "_reconnected":
             line = [
                 ("green", "[link]"),
@@ -3512,6 +4002,23 @@ class _UrwidApp:
             # Server-side subscription state may have shifted across
             # the link drop; rebuild the cache lazily on next consult.
             self._invalidate_subscribed_cids()
+            if self._active_connect_modal is not None:
+                self._active_connect_modal.add_line(
+                    ("connect_line", f"Reconnected (attempt {obj.get('attempt')})")
+                )
+                # Brief pause so the success line is visible, then dismiss.
+                modal = self._active_connect_modal
+                attempt = obj.get("attempt")
+
+                async def _close_after_brief_pause(m=modal, a=attempt) -> None:
+                    try:
+                        await asyncio.sleep(0.4)
+                    except asyncio.CancelledError:
+                        pass
+                    if m.future is not None and not m.future.done():
+                        m.dismiss(("reconnected", a))
+
+                asyncio.create_task(_close_after_brief_pause())
         elif t == "_reconnect_giveup":
             line = [
                 ("disconnect_line", "[link]"),
@@ -3520,7 +4027,23 @@ class _UrwidApp:
             self._write_to_active(line)
             if self._status_visible:
                 self._status_write(line)
-            self._signal_terminal_link_loss()
+            if self._ui.session_driven:
+                if self._active_connect_modal is not None:
+                    self._active_connect_modal.add_line(
+                        (
+                            "disconnect_line",
+                            f"Giving up after {obj.get('attempts')} attempts",
+                        )
+                    )
+                    if (
+                        self._active_connect_modal.future is not None
+                        and not self._active_connect_modal.future.done()
+                    ):
+                        self._active_connect_modal.dismiss(
+                            ("giveup", obj.get("attempts"))
+                        )
+            else:
+                self._signal_terminal_link_loss()
         elif t == "_silence_disconnect":
             line = [
                 ("disconnect_line", "[link]"),
@@ -3529,7 +4052,10 @@ class _UrwidApp:
             self._write_to_active(line)
             if self._status_visible:
                 self._status_write(line)
-            self._signal_terminal_link_loss()
+            if self._ui.session_driven:
+                self._on_link_dropped()
+            else:
+                self._signal_terminal_link_loss()
         elif t == "_delivery_timeout":
             self._handle_delivery_timeout(obj)
         elif t == "_error":
@@ -4300,22 +4826,38 @@ class UrwidUI:
     """Public urwid UI shell. Mirrors ``TextualUI`` so cli.py is a
     one-line dispatch difference between the two.
 
-    ``offline=True`` puts the UI in read-only mode: the connect path
-    skips ``client.open()`` and any send / edit / react / sub / unsub
-    is refused with a banner. Note the ctor signature does **not**
-    take Textual-only knobs like ``cursor_blink`` — urwid has no
-    compositor and no cursor-blink redraws.
+    Two construction modes:
+
+    * **Session-driven** — ``connection_opener`` + ``available_profiles``
+      are provided and ``client`` is ``None``. The UI itself shows the
+      profile picker (when ``initial_profile is None``) and the
+      connect-progress modal, drives the connect, and handles the
+      reconnect / giveup modal on link drop.
+    * **Legacy / offline** — ``client`` is provided directly. The UI
+      skips the bootstrap modals entirely and runs against the given
+      client. Used for the offline-only path and the line UI shape.
+
+    ``offline=True`` puts the UI in read-only mode: any send / edit /
+    react / sub / unsub is refused with a banner. Note the ctor
+    signature does **not** take Textual-only knobs like
+    ``cursor_blink`` — urwid has no compositor and no cursor-blink
+    redraws.
     """
 
     def __init__(
         self,
-        client: WpsClient,
+        client: WpsClient | None = None,
         *,
         my_call: str,
         channels: list[ChannelInfo] | None = None,
         history_backfill: int = 3,
         options: SessionOptions | None = None,
         offline: bool = False,
+        connection_opener: Callable[..., Any] | None = None,
+        available_profiles: list[ConnectProfile] | None = None,
+        initial_profile: ConnectProfile | None = None,
+        default_profile_name: str | None = None,
+        is_offline_profile: Callable[[ConnectProfile], bool] | None = None,
     ) -> None:
         self._client = client
         self._my_call = my_call.upper()
@@ -4327,6 +4869,19 @@ class UrwidUI:
         self._pending: list[dict] = []
         self._app: _UrwidApp | None = None
         self.exit_reason: str | None = None
+
+        # Session-driven mode plumbing. Only set when ``connection_opener``
+        # is provided; otherwise the UI runs in legacy mode against
+        # whatever ``client`` it was constructed with.
+        self._connection_opener = connection_opener
+        self._available_profiles = list(available_profiles or [])
+        self._initial_profile = initial_profile
+        self._default_profile_name = default_profile_name
+        self._is_offline_profile_fn = is_offline_profile or (lambda p: False)
+
+    @property
+    def session_driven(self) -> bool:
+        return self._connection_opener is not None
 
     def render_event(self, obj: dict) -> None:
         if self._app is None:

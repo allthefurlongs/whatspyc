@@ -11,7 +11,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Any, Awaitable, Callable
 
 import click
 
@@ -30,7 +30,7 @@ from whatspyc.ui.options import SessionOptions
 from whatspyc.ui.tui import TextualUI
 from whatspyc.ui.urwid_ui import UrwidUI
 from whatspyc.wps.client import WpsClient
-from whatspyc.wps.connect_seq import ConnectSequence
+from whatspyc.wps.connect_seq import ConnectSequence, ConnectSummary
 from whatspyc.wps.hop_script import HopScriptError, HopStep
 
 
@@ -368,6 +368,22 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
         "ax_level": ax_level,
         "remote": remote,
     }
+
+    if effective_ui in ("textual", "urwid"):
+        # Session-driven flow: picker, connect-progress, and reconnect
+        # all happen inside the UI itself. cli.py contributes the
+        # connection_opener (the bit that actually builds + opens the
+        # WpsClient) and resolves the initial profile.
+        initial_profile = _resolve_initial_profile_for_session(
+            c,
+            profile_name=profile_name,
+            no_prompt=no_prompt,
+            parsed_hops=parsed_hops,
+            adhoc_args=adhoc_args,
+        )
+        asyncio.run(_run_session_driven(c, initial_profile))
+        return
+
     profile = _pick_profile(
         c,
         profile_name=profile_name,
@@ -388,6 +404,209 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
     )
     on_terminal_disconnect = _make_reconnect_handler(c, profile, picker_used=picker_used)
     asyncio.run(_run(c, profile, on_terminal_disconnect))
+
+
+def _resolve_initial_profile_for_session(
+    c: cfg_mod.Config,
+    *,
+    profile_name: str | None,
+    no_prompt: bool,
+    parsed_hops: list[HopStep],
+    adhoc_args: dict,
+) -> ConnectProfile | None:
+    """Mirror ``_pick_profile``'s precedence but never run the click
+    prompt — for textual/urwid the in-UI picker handles that case.
+
+    Returns the resolved profile, or ``None`` to mean "show the in-UI
+    picker on startup".
+    """
+    if profile_name and (parsed_hops or any(v is not None for v in adhoc_args.values())):
+        raise click.UsageError(
+            "--profile is mutually exclusive with --hop / --transport / "
+            "--host / --remote etc."
+        )
+    if profile_name:
+        if profile_name == OFFLINE_PROFILE_NAME:
+            return _OFFLINE_PROFILE
+        try:
+            return c.resolve_profile(profile_name)
+        except KeyError as exc:
+            raise click.UsageError(str(exc)) from None
+    if parsed_hops or any(v is not None for v in adhoc_args.values()):
+        return _adhoc_profile(hops=parsed_hops, **adhoc_args)
+    if no_prompt:
+        if not c.default_profile:
+            raise click.UsageError(
+                "--no-prompt was given but no `default_profile` is set in config"
+            )
+        return c.resolve_profile(c.default_profile)
+    if not c.connect_profiles:
+        raise click.UsageError(
+            "no connection configured. Either define [[connect_profiles]] "
+            f"in {cfg_mod.config_path()}, or pass --transport/--host/... "
+            "(plus --hop entries) to build an ad-hoc profile."
+        )
+    return None
+
+
+def _make_connection_opener(c: cfg_mod.Config, store: SqliteStore):
+    """Build the (opener, closer) pair the UI calls to open / close
+    a WPS link for a given profile.
+
+    ``opener(profile, progress, on_event, on_client_ready)`` is the
+    "build a fresh WpsClient and open it" coroutine. It closes the
+    previously-opened client (if any), registers the freshly-built
+    client via ``on_client_ready`` *before* ``client.open()`` returns
+    so the UI's render_event sees a real client when the type-`c`
+    burst starts flowing, and returns ``(client, ConnectSummary)``.
+
+    ``closer()`` shuts whatever client is currently held — used in
+    the outer ``finally`` of ``_run_session_driven`` to clean up on
+    normal exit.
+    """
+
+    state: dict[str, WpsClient | None] = {"client": None}
+
+    async def _close_state_client() -> None:
+        cur = state["client"]
+        if cur is not None:
+            try:
+                await cur.close()
+            except Exception:
+                pass
+            state["client"] = None
+
+    async def opener(
+        profile: ConnectProfile,
+        *,
+        progress: Callable[[Any], None],
+        on_event: Callable[[dict], Awaitable[None]],
+        on_client_ready: Callable[[WpsClient], None] | None = None,
+    ) -> tuple[WpsClient, ConnectSummary]:
+        await _close_state_client()
+        if _is_offline_profile(profile):
+            def _no_stream() -> AsyncByteStream:
+                raise RuntimeError(
+                    "offline mode: WpsClient stream factory called — "
+                    "a UI guard is missing for some send / network path"
+                )
+
+            client = WpsClient(
+                _no_stream,
+                store,
+                my_call=c.app_call,  # type: ignore[arg-type]
+                name=c.name,
+                on_event=on_event,
+                connect_script=[],
+                auto_backfill_post_count=c.auto_backfill_post_count,
+                auto_reconnect=False,
+                reconnect_max_retries=0,
+                delivery_timeout_s=c.delivery_timeout_s,
+            )
+            state["client"] = client
+            if on_client_ready is not None:
+                on_client_ready(client)
+            return client, ConnectSummary(paused_channels=[], online_users=[])
+
+        seq = ConnectSequence()
+
+        async def hook(obj: dict) -> None:
+            await seq.on_event(obj)
+            await on_event(obj)
+
+        client = WpsClient(
+            lambda: _build_stream_for(profile, c.my_call),  # type: ignore[arg-type]
+            store,
+            my_call=c.app_call,  # type: ignore[arg-type]
+            name=c.name,
+            on_event=hook,
+            connect_script=profile.connect_script,
+            hop_progress=progress,
+            auto_backfill_post_count=c.auto_backfill_post_count,
+            auto_reconnect=c.auto_reconnect,
+            reconnect_max_retries=c.reconnect_max_retries,
+            delivery_timeout_s=c.delivery_timeout_s,
+        )
+        state["client"] = client
+        if on_client_ready is not None:
+            on_client_ready(client)
+        progress(f"Connecting with '{profile.name}' profile...")
+        try:
+            await client.open()
+        except BaseException:
+            # Cancel / handshake-error path. Clear state so the next
+            # opener call doesn't try to close a half-open client.
+            try:
+                await client.close()
+            except Exception:
+                pass
+            state["client"] = None
+            raise
+        progress("Sending connection details...")
+        summary = await seq.wait()
+        return client, summary
+
+    return opener, _close_state_client
+
+
+async def _run_session_driven(
+    c: cfg_mod.Config,
+    initial_profile: ConnectProfile | None,
+) -> None:
+    """textual/urwid entry point. Hands the picker + connect lifecycle
+    to the UI; cli.py contributes only the connector closure.
+
+    ``initial_profile`` is non-``None`` when the user gave an explicit
+    ``--profile`` / ad-hoc flags / ``--no-prompt`` (so we know what to
+    connect to up front). ``None`` means "ask the user via the in-UI
+    picker."
+    """
+    store = SqliteStore(Path(c.state_dir) / "state.sqlite3")
+    opener, closer = _make_connection_opener(c, store)
+    options = SessionOptions(
+        show_acks=c.show_acks,
+        show_edits=c.show_edits,
+        verbose_history=c.verbose_history,
+        delivery_timeout_s=c.delivery_timeout_s,
+        emoji_search_debounce_ms=c.emoji_search_debounce_ms,
+        bell_on_activity=c.bell_on_activity,
+    )
+    # Picker entries: <offline> at index 0, then configured profiles.
+    available = [_OFFLINE_PROFILE] + list(c.connect_profiles)
+    if c.ui == "textual":
+        ui = TextualUI(
+            client=None,
+            my_call=c.app_call,  # type: ignore[arg-type]
+            channels=c.channels,
+            history_backfill=c.history_backfill,
+            options=options,
+            cursor_blink=not c.low_power_mode,
+            connection_opener=opener,
+            available_profiles=available,
+            initial_profile=initial_profile,
+            default_profile_name=c.default_profile,
+            is_offline_profile=_is_offline_profile,
+        )
+    else:
+        ui = UrwidUI(
+            client=None,
+            my_call=c.app_call,  # type: ignore[arg-type]
+            channels=c.channels,
+            history_backfill=c.history_backfill,
+            options=options,
+            connection_opener=opener,
+            available_profiles=available,
+            initial_profile=initial_profile,
+            default_profile_name=c.default_profile,
+            is_offline_profile=_is_offline_profile,
+        )
+    try:
+        await ui.run()
+    finally:
+        try:
+            await closer()
+        finally:
+            store.close()
 
 
 def _make_reconnect_handler(

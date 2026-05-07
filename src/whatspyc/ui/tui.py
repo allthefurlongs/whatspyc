@@ -50,7 +50,7 @@ from textual.widgets._footer import FooterKey
 
 from whatspyc import __version__
 from whatspyc import log as log_mod
-from whatspyc.config import ChannelInfo
+from whatspyc.config import ChannelInfo, ConnectProfile
 from whatspyc.ui import emoji_for_display
 from whatspyc.ui import help as help_data
 from whatspyc.ui import ts_to_ms
@@ -64,6 +64,7 @@ from whatspyc.ui.emoji_catalog import (
 )
 from whatspyc.ui.options import SessionOptions
 from whatspyc.wps.client import WpsClient
+from whatspyc.wps.connect_seq import ConnectSummary
 
 
 TargetKey = tuple[str, str]  # ("ch", "5") or ("dm", "G7XYZ")
@@ -170,9 +171,21 @@ class _TabBar(Horizontal):
 
 
 class TextualUI:
+    """Two construction modes:
+
+    * **Session-driven** — ``connection_opener`` + ``available_profiles``
+      are provided and ``client`` is ``None``. The UI itself shows the
+      profile picker (when ``initial_profile is None``) and the
+      connect-progress modal, drives the connect, and handles the
+      reconnect / giveup modal on link drop.
+    * **Legacy / offline** — ``client`` is provided directly. The UI
+      skips the bootstrap modals entirely and runs against the given
+      client. Used for the offline-only path and the line UI shape.
+    """
+
     def __init__(
         self,
-        client: WpsClient,
+        client: WpsClient | None = None,
         *,
         my_call: str,
         channels: list[ChannelInfo] | None = None,
@@ -180,6 +193,11 @@ class TextualUI:
         options: SessionOptions | None = None,
         offline: bool = False,
         cursor_blink: bool = True,
+        connection_opener: Callable[..., Any] | None = None,
+        available_profiles: list[ConnectProfile] | None = None,
+        initial_profile: ConnectProfile | None = None,
+        default_profile_name: str | None = None,
+        is_offline_profile: Callable[[ConnectProfile], bool] | None = None,
     ) -> None:
         self._client = client
         self._my_call = my_call.upper()
@@ -195,6 +213,19 @@ class TextualUI:
         # after auto-reconnect gives up; the cli reads this after run()
         # returns to decide whether to offer a reconnect/quit prompt.
         self.exit_reason: str | None = None
+
+        # Session-driven mode plumbing. Only consulted when
+        # ``connection_opener`` is set; otherwise the UI runs in legacy
+        # mode against whatever ``client`` it was constructed with.
+        self._connection_opener = connection_opener
+        self._available_profiles = list(available_profiles or [])
+        self._initial_profile = initial_profile
+        self._default_profile_name = default_profile_name
+        self._is_offline_profile_fn = is_offline_profile or (lambda p: False)
+
+    @property
+    def session_driven(self) -> bool:
+        return self._connection_opener is not None
 
     def render_event(self, obj: dict) -> None:
         if self._app is None or not self._app.is_mounted:
@@ -1679,6 +1710,257 @@ class SettingsModal(ModalScreen[None]):
 
 
 # ----------------------------------------------------------------------
+# Connect / picker modals — session-driven mode
+# ----------------------------------------------------------------------
+
+
+def _format_connected_line(summary: ConnectSummary) -> str:
+    """Compose the one-line summary shown when the link is up. Same
+    text as cli.py's pre-UI ``[Connected]`` echo."""
+    parts = [
+        f"{summary.server_message_count} new DMs",
+        f"{summary.server_post_count} new posts",
+    ]
+    if summary.paused_channels:
+        n = len(summary.paused_channels)
+        parts.append(f"{n} paused channel(s) — see /unpause hint(s) above")
+    return "[Connected] " + ", ".join(parts)
+
+
+def _format_open_error(exc: BaseException) -> str:
+    """Same shape as cli.py's ``_format_connect_error``. Duplicated here
+    so the modal can label connect failures without an import cycle."""
+    if isinstance(exc, ConnectionRefusedError):
+        return "connection refused — is the host/port correct and the service running?"
+    if isinstance(exc, asyncio.IncompleteReadError):
+        return "link closed unexpectedly during connect"
+    if isinstance(exc, TimeoutError):
+        return "connection timed out"
+    if isinstance(exc, OSError):
+        msg = str(exc) or exc.__class__.__name__
+        return f"network error: {msg}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+class ConnectProgressModal(ModalScreen[Any]):
+    """Streaming connect-progress display.
+
+    Used for the initial connect and auto-reconnect cycles. Lines are
+    appended via ``add_line``; the screen sits on top of the main
+    app until the caller calls ``self.dismiss(value)``. Pressing
+    ``q``/``Esc`` cancels: it cancels the bound ``cancel_task`` (the
+    in-flight connect coroutine, if any) and dismisses with ``None``.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("q", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ConnectProgressModal {
+        align: center middle;
+    }
+    #connect-pane {
+        width: 80%;
+        height: 60%;
+        max-width: 100;
+        max-height: 30;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #connect-banner { color: $warning; text-style: bold; padding-bottom: 1; }
+    #connect-header { text-style: bold; padding-bottom: 1; }
+    #connect-log { height: 1fr; border: round $accent-lighten-2; padding: 0 1; }
+    #connect-hint { color: $text-muted; padding-top: 1; }
+    """
+
+    def __init__(self, *, header: str, banner: str | None = None) -> None:
+        super().__init__()
+        self._header = header
+        self._banner = banner
+        self.cancel_task: asyncio.Task | None = None
+        self._log: RichLog | None = None
+        # Lines that arrive before on_mount land here and flush on
+        # mount. The runner may push its first progress line in the
+        # same tick that the modal is pushed — without buffering they'd
+        # be silently dropped.
+        self._pending_lines: list[Any] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="connect-pane"):
+            if self._banner:
+                yield Static(self._banner, id="connect-banner")
+            yield Static(self._header, id="connect-header")
+            yield RichLog(id="connect-log", wrap=True, markup=True, highlight=False)
+            yield Static("Press q or Esc to cancel", id="connect-hint")
+
+    def on_mount(self) -> None:
+        self._log = self.query_one("#connect-log", RichLog)
+        for line in self._pending_lines:
+            self._write_line(line)
+        self._pending_lines.clear()
+
+    def _write_line(self, text: Any) -> None:
+        # urwid markup tuples → flatten to plain text. Rich markup in
+        # str form is honoured by RichLog directly.
+        if isinstance(text, list):
+            rendered_parts: list[str] = []
+            for span in text:
+                if isinstance(span, tuple) and len(span) == 2:
+                    _attr, s = span
+                    rendered_parts.append(str(s))
+                else:
+                    rendered_parts.append(str(span))
+            self._log.write("".join(rendered_parts))  # type: ignore[union-attr]
+            return
+        if isinstance(text, tuple) and len(text) == 2:
+            _attr, s = text
+            self._log.write(str(s))  # type: ignore[union-attr]
+            return
+        self._log.write(str(text))  # type: ignore[union-attr]
+
+    def add_line(self, text: Any) -> None:
+        """Append a progress line. Accepts plain str or Rich markup."""
+        if self._log is None:
+            self._pending_lines.append(text)
+            return
+        self._write_line(text)
+
+    def update_header(self, header: str) -> None:
+        self._header = header
+        try:
+            self.query_one("#connect-header", Static).update(header)
+        except Exception:
+            pass
+
+    def action_cancel(self) -> None:
+        if self.cancel_task is not None and not self.cancel_task.done():
+            self.cancel_task.cancel()
+        self.dismiss(None)
+
+
+class ProfilePickerModal(ModalScreen[ConnectProfile | None]):
+    """Pick a profile from the list (offline + configured profiles).
+
+    Surfaced at startup when no ``--profile``/ad-hoc flags were given,
+    and on terminal disconnect / ``_reconnect_giveup``. Optional
+    ``banner`` is a one-line explanation shown above the list (e.g.
+    "Disconnected" or "Max reconnect retries reached").
+
+    Dismisses with the chosen ``ConnectProfile`` or ``None`` for quit.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("q", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ProfilePickerModal {
+        align: center middle;
+    }
+    #picker-pane {
+        width: 80%;
+        height: 70%;
+        max-width: 90;
+        max-height: 30;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #picker-banner { color: $warning; text-style: bold; padding-bottom: 1; }
+    #picker-header { text-style: bold; padding-bottom: 1; }
+    #picker-list { height: 1fr; }
+    #picker-hint { color: $text-muted; padding-top: 1; }
+    .picker-row { padding: 0 1; }
+    """
+
+    def __init__(
+        self,
+        *,
+        profiles: list[ConnectProfile],
+        default_name: str | None = None,
+        banner: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._profiles = profiles
+        self._default_name = default_name
+        self._banner = banner
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker-pane"):
+            if self._banner:
+                yield Static(self._banner, id="picker-banner")
+            yield Static("Select a connect profile", id="picker-header")
+            items: list[ListItem] = []
+            for i, p in enumerate(self._profiles):
+                items.append(
+                    ListItem(
+                        Static(self._row_label(i, p), classes="picker-row"),
+                        id=f"picker-{i}",
+                    )
+                )
+            yield ListView(*items, id="picker-list")
+            yield Static(
+                "Enter to pick · digit to jump · q/Esc to quit", id="picker-hint"
+            )
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#picker-list", ListView)
+        idx = 0
+        if self._default_name is not None:
+            for i, p in enumerate(self._profiles):
+                if p.name == self._default_name:
+                    idx = i
+                    break
+        try:
+            lv.index = idx
+        except Exception:
+            pass
+        lv.focus()
+
+    def _row_label(self, i: int, p: ConnectProfile) -> str:
+        marker = ""
+        if self._default_name and p.name == self._default_name:
+            marker = " [yellow](default)[/]"
+        if p.name.startswith("<") and p.name.endswith(">"):
+            return (
+                f"[bold]{i}.[/] [yellow]{p.name}[/]  "
+                f"[dim]browse local database (no connection)[/]"
+            )
+        user_hops = [s for s in p.connect_script if s.cmd]
+        suffix = f"[dim]  {len(user_hops)}-hop[/]" if user_hops else "[dim]  direct[/]"
+        return f"[bold]{i}.[/] {p.name}{marker}{suffix}"
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        event.stop()
+        item_id = event.item.id or ""
+        if not item_id.startswith("picker-"):
+            return
+        try:
+            idx = int(item_id.split("-", 1)[1])
+        except (ValueError, IndexError):
+            return
+        if 0 <= idx < len(self._profiles):
+            self.dismiss(self._profiles[idx])
+
+    def on_key(self, event: events.Key) -> None:
+        # Digit shortcut. Match the urwid behaviour: pressing N picks
+        # entry N regardless of focus, as long as the index exists.
+        key = event.key
+        if key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(self._profiles):
+                event.stop()
+                self.dismiss(self._profiles[idx])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ----------------------------------------------------------------------
 # Main app
 # ----------------------------------------------------------------------
 
@@ -1876,6 +2158,16 @@ class _WhatspycApp(App):
         # are no-ops so the burst collapses into one refresh.
         self._he_refresh_pending: bool = False
 
+        # Session-driven state. ``_active_connect_modal`` points at the
+        # currently-mounted ConnectProgressModal (during initial
+        # connect or auto-reconnect) so _disconnect / _reconnecting /
+        # _reconnected events can update it in place.
+        self._active_connect_modal: ConnectProgressModal | None = None
+        # Re-entrancy guard for the in-event-handler reconnect modal —
+        # we'd otherwise stack a new modal for each `_disconnect` while
+        # the previous reconnect cycle is still settling.
+        self._reconnect_handling: bool = False
+
     # ------------------------------------------------------------------
     # Compose / mount
     # ------------------------------------------------------------------
@@ -1931,9 +2223,11 @@ class _WhatspycApp(App):
         self._w_target_switcher = self.query_one("#target-switcher", ContentSwitcher)
         self._w_tabs = self.query_one("#tab-strip", _TabBar)
         self._apply_left_pane_width()
-        self._populate_initial_target_lists()
-        self._refresh_online_pane(self._ui._client.online_users())
-        self._refresh_thread_header()
+        # Client-dependent setup. In session-driven mode the client
+        # is None until the bootstrap finishes the connect; defer
+        # ``_post_connect_setup`` until then.
+        if self._ui._client is not None:
+            self._post_connect_setup()
         if self._ui._offline:
             # Force the status pane visible and announce the mode so the
             # user always sees the read-only banner — `_status_error`
@@ -1953,6 +2247,27 @@ class _WhatspycApp(App):
             self.render_event(obj)
         self._ui._pending.clear()
         self._w_input.focus()
+        if self._ui.session_driven:
+            # Drive the picker → connect modal → main session flow.
+            # Worker runs alongside the drain worker; sets self._ui._client
+            # before client.open() so events from the open()'s reader_task
+            # land on a real client.
+            self.run_worker(
+                self._bootstrap_session(), exclusive=False, name="bootstrap"
+            )
+
+    def _post_connect_setup(self) -> None:
+        """Client-dependent setup that on_mount used to do unconditionally.
+
+        Re-runs the channel/DM list population and online roster refresh.
+        In session-driven mode this fires from the bootstrap once the
+        connector has set ``self._ui._client``; in legacy mode it fires
+        directly from on_mount.
+        """
+        self._populate_initial_target_lists()
+        if self._ui._client is not None:
+            self._refresh_online_pane(self._ui._client.online_users())
+        self._refresh_thread_header()
 
     def on_unmount(self) -> None:
         log_mod.remove_pane_handler(self._log_handler)
@@ -2925,6 +3240,217 @@ class _WhatspycApp(App):
             pass
 
     # ------------------------------------------------------------------
+    # Session bootstrap (session-driven mode only).
+    # ------------------------------------------------------------------
+
+    async def _bootstrap_session(self) -> None:
+        """Drive picker → connect-modal cycle until a client is up
+        (or the user quits). Mirrors urwid's ``_bootstrap_session``."""
+        profile: ConnectProfile | None = self._ui._initial_profile
+        banner: str | None = None
+        while True:
+            if profile is None:
+                picker = ProfilePickerModal(
+                    profiles=self._ui._available_profiles,
+                    default_name=self._ui._default_profile_name,
+                    banner=banner,
+                )
+                choice = await self.push_screen_wait(picker)
+                if choice is None:
+                    self._signal_clean_exit()
+                    return
+                profile = choice
+                banner = None
+            if self._ui._is_offline_profile_fn(profile):
+                client, _ = await self._open_offline(profile)
+                self._ui._client = client
+                self._enter_offline_mode()
+                self._post_connect_setup()
+                return
+            ok = await self._run_connect_modal(profile, banner=banner)
+            if ok:
+                self._post_connect_setup()
+                return
+            banner = "Disconnected"
+            profile = None
+
+    async def _open_offline(
+        self, profile: ConnectProfile
+    ) -> tuple[WpsClient, ConnectSummary]:
+        async def _on_event(_obj: dict) -> None:
+            return
+
+        def _on_client_ready(c: WpsClient) -> None:
+            self._ui._client = c
+
+        client, summary = await self._ui._connection_opener(  # type: ignore[misc]
+            profile,
+            progress=lambda _line: None,
+            on_event=_on_event,
+            on_client_ready=_on_client_ready,
+        )
+        return client, summary
+
+    def _enter_offline_mode(self) -> None:
+        self._ui._offline = True
+        self._status_error(
+            "[yellow][offline][/] read-only mode — browsing local "
+            "store, no connection"
+        )
+
+    async def _run_connect_modal(
+        self, profile: ConnectProfile, *, banner: str | None
+    ) -> bool:
+        """Show the ConnectProgressModal and run the connection_opener.
+
+        Returns True when the link is up (self._ui._client is set);
+        False when the user cancelled or the opener raised. The picker
+        loop in ``_bootstrap_session`` decides what happens next.
+        """
+        modal = ConnectProgressModal(
+            header=f"Connecting via '{profile.name}'…",
+            banner=banner,
+        )
+        self._active_connect_modal = modal
+        modal.add_line(f"[dim]Connecting with '{profile.name}' profile...[/]")
+
+        async def _on_event(obj: dict) -> None:
+            self.render_event(obj)
+
+        def _on_client_ready(c: WpsClient) -> None:
+            # Set before client.open() returns so events from the
+            # post-handshake reader_task hit a real client.
+            self._ui._client = c
+
+        async def _runner() -> None:
+            try:
+                _, summary = await self._ui._connection_opener(  # type: ignore[misc]
+                    profile,
+                    progress=modal.add_line,
+                    on_event=_on_event,
+                    on_client_ready=_on_client_ready,
+                )
+            except asyncio.CancelledError:
+                self._ui._client = None
+                return
+            except Exception as exc:
+                self._ui._client = None
+                modal.add_line(f"[red]Could not connect: {_format_open_error(exc)}[/]")
+                try:
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    pass
+                modal.dismiss(("error", exc))
+                return
+            connected_line = _format_connected_line(summary)
+            modal.add_line(f"[green]{connected_line}[/]")
+            # Also write the summary into the status pane so the user
+            # has a record after the modal disappears. Don't force the
+            # pane visible — the user explicitly asked for this not to
+            # toggle on visibility (use Ctrl-S if you want to see it).
+            self._status_write(f"[green]{connected_line}[/]")
+            modal.dismiss(("ok", summary))
+
+        runner_task = asyncio.create_task(_runner())
+        modal.cancel_task = runner_task
+        try:
+            result = await self.push_screen_wait(modal)
+        finally:
+            self._active_connect_modal = None
+            if not runner_task.done():
+                runner_task.cancel()
+                try:
+                    await runner_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        return isinstance(result, tuple) and result and result[0] == "ok"
+
+    def _on_link_dropped(self) -> None:
+        """Schedule the in-UI reconnect / picker flow on `_disconnect`.
+
+        Called by the event-dispatch handler. If a connect modal is
+        already up (initial bootstrap, or a prior reconnect cycle),
+        do nothing — events will keep updating it.
+        """
+        if not self._ui.session_driven:
+            return
+        if self._reconnect_handling or self._active_connect_modal is not None:
+            return
+        self._reconnect_handling = True
+        self.run_worker(self._handle_link_drop(), exclusive=False, name="link-drop")
+
+    async def _handle_link_drop(self) -> None:
+        try:
+            client = self._ui._client
+            if client is not None and client.is_auto_reconnect:
+                modal = ConnectProgressModal(
+                    header="Reconnecting…",
+                    banner="Disconnected",
+                )
+                modal.add_line("[yellow]Link dropped, reconnecting...[/]")
+                self._active_connect_modal = modal
+                result = await self.push_screen_wait(modal)
+                self._active_connect_modal = None
+                if isinstance(result, tuple) and result and result[0] == "reconnected":
+                    return
+                if isinstance(result, tuple) and result and result[0] == "giveup":
+                    await self._reopen_picker(banner="Max reconnect retries reached")
+                    return
+                # User pressed q/Esc — close the client and quit.
+                if client is not None:
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
+                self._signal_clean_exit()
+                return
+            await self._reopen_picker(banner="Disconnected")
+        finally:
+            self._reconnect_handling = False
+
+    async def _reopen_picker(self, *, banner: str) -> None:
+        """Close the current client (if any) and re-run the
+        picker → connect cycle."""
+        client = self._ui._client
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            self._ui._client = None
+        cur_banner = banner
+        profile: ConnectProfile | None = None
+        while True:
+            if profile is None:
+                picker = ProfilePickerModal(
+                    profiles=self._ui._available_profiles,
+                    default_name=self._ui._default_profile_name,
+                    banner=cur_banner,
+                )
+                choice = await self.push_screen_wait(picker)
+                if choice is None:
+                    self._signal_clean_exit()
+                    return
+                profile = choice
+                cur_banner = None
+            if self._ui._is_offline_profile_fn(profile):
+                offline_client, _ = await self._open_offline(profile)
+                self._ui._client = offline_client
+                self._enter_offline_mode()
+                return
+            ok = await self._run_connect_modal(profile, banner=None)
+            if ok:
+                return
+            cur_banner = "Disconnected"
+            profile = None
+
+    def _signal_clean_exit(self) -> None:
+        try:
+            self.exit()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Helpers — channel name lookup, prompt, paused/subscribe hints
     # ------------------------------------------------------------------
 
@@ -3247,7 +3773,9 @@ class _WhatspycApp(App):
             self._write_to_active(line)
             if self._status_visible():
                 self._status_write(line)
-            if not self._ui._client.is_auto_reconnect:
+            if self._ui.session_driven:
+                self._on_link_dropped()
+            elif not self._ui._client.is_auto_reconnect:
                 self._signal_terminal_link_loss()
         elif t == "_reconnecting":
             line = (
@@ -3257,6 +3785,11 @@ class _WhatspycApp(App):
             self._write_to_active(line)
             if self._status_visible():
                 self._status_write(line)
+            if self._active_connect_modal is not None:
+                self._active_connect_modal.add_line(
+                    f"[yellow]Reconnect attempt {obj.get('attempt')} in "
+                    f"{obj.get('delay'):.1f}s[/]"
+                )
         elif t == "_reconnect_failed":
             line = (
                 f"[yellow][link][/] reconnect attempt {obj.get('attempt')} failed: "
@@ -3265,6 +3798,11 @@ class _WhatspycApp(App):
             self._write_to_active(line)
             if self._status_visible():
                 self._status_write(line)
+            if self._active_connect_modal is not None:
+                self._active_connect_modal.add_line(
+                    f"[yellow]Attempt {obj.get('attempt')} failed: "
+                    f"{obj.get('exc')}[/]"
+                )
         elif t == "_reconnected":
             line = f"[green][link][/] reconnected (attempt {obj.get('attempt')})"
             self._write_to_active(line)
@@ -3273,6 +3811,22 @@ class _WhatspycApp(App):
             # Server-side subscription state may have shifted across the
             # link drop; rebuild the cache lazily on next consult.
             self._invalidate_subscribed_cids()
+            if self._active_connect_modal is not None:
+                modal = self._active_connect_modal
+                attempt = obj.get("attempt")
+                modal.add_line(f"[green]Reconnected (attempt {attempt})[/]")
+
+                async def _close_after_brief_pause(m=modal, a=attempt) -> None:
+                    try:
+                        await asyncio.sleep(0.4)
+                    except asyncio.CancelledError:
+                        pass
+                    try:
+                        m.dismiss(("reconnected", a))
+                    except Exception:
+                        pass
+
+                asyncio.create_task(_close_after_brief_pause())
         elif t == "_reconnect_giveup":
             line = (
                 f"[red][link][/] giving up after {obj.get('attempts')} "
@@ -3281,7 +3835,19 @@ class _WhatspycApp(App):
             self._write_to_active(line)
             if self._status_visible():
                 self._status_write(line)
-            self._signal_terminal_link_loss()
+            if self._ui.session_driven:
+                if self._active_connect_modal is not None:
+                    self._active_connect_modal.add_line(
+                        f"[red]Giving up after {obj.get('attempts')} attempts[/]"
+                    )
+                    try:
+                        self._active_connect_modal.dismiss(
+                            ("giveup", obj.get("attempts"))
+                        )
+                    except Exception:
+                        pass
+            else:
+                self._signal_terminal_link_loss()
         elif t == "_error":
             self._status_error(f"[red][error][/] {obj.get('exc')}")
         elif t == "_delivery_timeout":
