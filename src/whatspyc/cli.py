@@ -75,6 +75,7 @@ def _apply_nodecmd_mode(
     ui_mode: str | None,
     my_call_cli: str | None,
     state_dir_cli: Path | None,
+    conf_path: Path | None = None,
 ) -> None:
     """Apply ``--nodecmd`` mode in place: read callsign + (first-use) name
     from stdin, derive a per-call state dir, force ``ui = "line"``.
@@ -102,9 +103,19 @@ def _apply_nodecmd_mode(
     if c.node_state_dir is None:
         raise click.UsageError(
             "--nodecmd requires `node_state_dir` set in "
-            f"{cfg_mod.config_path()} — that's the root directory each "
-            "per-call state dir is created under"
+            f"{conf_path or cfg_mod.config_path()} — that's the root "
+            "directory each per-call state dir is created under"
         )
+
+    # When stdout is a pipe (the node case), Python defaults to block
+    # buffering — `print()` output sits in a 4KB buffer until flushed,
+    # so the user sees nothing until either the buffer fills or the
+    # program writes a prompt that does its own flush. Force line
+    # buffering so every newline-terminated line is delivered as it
+    # would be on a TTY. Only TextIOWrapper has `reconfigure`; tests
+    # may swap a StringIO into stdout.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
 
     raw_call = sys.stdin.readline()
     call = raw_call.strip().upper()
@@ -226,6 +237,7 @@ def _pick_profile(
     no_prompt: bool,
     hops: list[HopStep],
     adhoc_args: dict,
+    conf_path: Path | None = None,
 ) -> ConnectProfile:
     """Decide which ConnectProfile to use for this run.
 
@@ -256,8 +268,9 @@ def _pick_profile(
     if not c.connect_profiles:
         raise click.UsageError(
             "no connection configured. Either define [[connect_profiles]] "
-            f"in {cfg_mod.config_path()}, or pass --transport/--host/... "
-            "(plus --hop entries) to build an ad-hoc profile."
+            f"in {conf_path or cfg_mod.config_path()}, or pass "
+            "--transport/--host/... (plus --hop entries) to build an "
+            "ad-hoc profile."
         )
 
     if no_prompt:
@@ -400,9 +413,18 @@ class _VersionedCommand(click.Command):
     help="Console log sink. 'auto' (default): textual/urwid UI → status "
     "pane, line UI → stderr. 'pane' is rejected with --ui line.",
 )
+@click.option(
+    "--conf",
+    "conf",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Alternative path to the config file. Overrides the default "
+    "$XDG_CONFIG_HOME/whatspyc/config.toml location. Channels.toml stays "
+    "at its default location.",
+)
 def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_port, ax_level,
          my_call, name, remote, state_dir, ui_mode, nodecmd, log_level, log_file,
-         log_console) -> None:
+         log_console, conf) -> None:
     """Connect to a WhatsPac service and drop into an interactive prompt."""
     # `--nodecmd` reads the callsign from stdin with no prompt printed
     # first — that's the convention packet nodes follow. Skip the banner
@@ -413,8 +435,9 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
             f"\nwhatspyc (v{__version__}) text-only WhatsPac client - WhatsPac is designed for "
             "GUI experience, try it at http://whatspac.oarc.uk/\n"
         )
+    conf_path = conf if conf is not None else cfg_mod.config_path()
     try:
-        c = cfg_mod.load()
+        c = cfg_mod.load(conf)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from None
     if nodecmd:
@@ -423,6 +446,7 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
             ui_mode=ui_mode,
             my_call_cli=my_call,
             state_dir_cli=state_dir,
+            conf_path=conf_path,
         )
     # Precedence: CLI flag > config key > env var (WHATSPYC_LOG, handled in
     # log.setup) > hardcoded WARNING. log_file has no env var.
@@ -483,6 +507,7 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
             no_prompt=no_prompt,
             parsed_hops=parsed_hops,
             adhoc_args=adhoc_args,
+            conf_path=conf_path,
         )
         asyncio.run(_run_session_driven(c, initial_profile))
         return
@@ -493,6 +518,7 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
         no_prompt=no_prompt,
         hops=parsed_hops,
         adhoc_args=adhoc_args,
+        conf_path=conf_path,
     )
     # If the picker would have run on this invocation (no explicit profile,
     # no ad-hoc flags, no --no-prompt, and profiles are configured), use the
@@ -516,6 +542,7 @@ def _resolve_initial_profile_for_session(
     no_prompt: bool,
     parsed_hops: list[HopStep],
     adhoc_args: dict,
+    conf_path: Path | None = None,
 ) -> ConnectProfile | None:
     """Mirror ``_pick_profile``'s precedence but never run the click
     prompt — for textual/urwid the in-UI picker handles that case.
@@ -546,8 +573,9 @@ def _resolve_initial_profile_for_session(
     if not c.connect_profiles:
         raise click.UsageError(
             "no connection configured. Either define [[connect_profiles]] "
-            f"in {cfg_mod.config_path()}, or pass --transport/--host/... "
-            "(plus --hop entries) to build an ad-hoc profile."
+            f"in {conf_path or cfg_mod.config_path()}, or pass "
+            "--transport/--host/... (plus --hop entries) to build an "
+            "ad-hoc profile."
         )
     return None
 

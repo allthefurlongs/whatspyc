@@ -326,12 +326,30 @@ def ensure_channels_file(path: Path | None = None) -> Path:
     return p
 
 
-def load() -> Config:
+def load(path: Path | None = None) -> Config:
+    """Load config from disk.
+
+    ``path`` overrides the default ``config_path()`` location — used by the
+    ``--conf`` CLI flag for alternative deployments. When supplied, the file
+    must exist (a typo'd path silently falling back to defaults would be
+    surprising); the default-location form keeps tolerating a missing file
+    so a fresh install runs on baked-in defaults.
+
+    The channels file always lives at ``channels_path()`` regardless — it's
+    a separate concern from the connection / global config and users
+    redirect it via ``XDG_CONFIG_HOME`` if they need to.
+    """
     cfg = Config()
-    p = config_path()
-    if p.exists():
-        raw = tomllib.loads(p.read_text(encoding="utf-8"))
+    if path is not None:
+        if not path.exists():
+            raise ValueError(f"--conf: file not found: {path}")
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
         cfg = parse(raw)
+    else:
+        p = config_path()
+        if p.exists():
+            raw = tomllib.loads(p.read_text(encoding="utf-8"))
+            cfg = parse(raw)
     # Channels live in their own file. Seed it from package data on
     # first run so a fresh install ships with the standard directory.
     ch_path = ensure_channels_file()

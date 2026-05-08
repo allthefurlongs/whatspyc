@@ -146,7 +146,9 @@ Slash commands:
 
 The config file lives at `$XDG_CONFIG_HOME/whatspyc/config.toml` (default
 `~/.config/whatspyc/config.toml`). It is plain TOML; missing files and
-missing keys are fine — defaults below apply.
+missing keys are fine — defaults below apply. Pass `--conf PATH` to load
+from somewhere else (the path must exist; `channels.toml` stays at its
+default location regardless).
 
 The schema splits in two:
 
