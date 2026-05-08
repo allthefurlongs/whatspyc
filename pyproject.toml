@@ -13,7 +13,6 @@ authors = [{ name = "Matt 2E0HKD" }]
 dependencies = [
     "click>=8.1",
     "websockets>=12.0",
-    "prompt_toolkit>=3.0.43",
     "textual>=0.60",
     "urwid>=2.6",
     "emoji>=2.10",

@@ -43,17 +43,6 @@ def _parse_positive_int(raw: str) -> int:
     return v
 
 
-def _parse_nonneg_int(raw: str) -> int:
-    s = raw.strip()
-    try:
-        v = int(s)
-    except ValueError:
-        raise ValueError(f"expected a non-negative integer, got {raw!r}") from None
-    if v < 0:
-        raise ValueError(f"expected a non-negative integer, got {raw!r}")
-    return v
-
-
 def _format_int(v: int) -> str:
     return str(v)
 
@@ -64,6 +53,12 @@ class _OptionSpec:
     description: str
     parse: Callable[[str], Any]
     format: Callable[[Any], str]
+    # When True the option is only meaningful in the line UI and is
+    # filtered out of the textual / urwid Settings modals via
+    # ``SessionOptions.names(include_line_only=False)``. Stored on the
+    # SessionOptions object regardless so callers can read it without
+    # caring which UI is running.
+    line_only: bool = False
 
 
 _SPECS: dict[str, _OptionSpec] = {
@@ -72,6 +67,7 @@ _SPECS: dict[str, _OptionSpec] = {
         description="Show [ack] line when a DM/post is delivered to the server.",
         parse=_parse_bool,
         format=_format_bool,
+        line_only=True,
     ),
     "show_edits": _OptionSpec(
         name="show_edits",
@@ -101,17 +97,6 @@ _SPECS: dict[str, _OptionSpec] = {
         parse=_parse_positive_int,
         format=_format_int,
     ),
-    "emoji_search_debounce_ms": _OptionSpec(
-        name="emoji_search_debounce_ms",
-        description=(
-            "Milliseconds to wait after the last keystroke before "
-            "rebuilding the EmojiPrompt grid (textual + urwid backends). "
-            "0 = rebuild on every keystroke (historic behaviour). Higher "
-            "values smooth typing on slow hardware."
-        ),
-        parse=_parse_nonneg_int,
-        format=_format_int,
-    ),
     "bell_on_activity": _OptionSpec(
         name="bell_on_activity",
         description=(
@@ -120,6 +105,37 @@ _SPECS: dict[str, _OptionSpec] = {
         ),
         parse=_parse_bool,
         format=_format_bool,
+    ),
+    "notify_new_dms": _OptionSpec(
+        name="notify_new_dms",
+        description=(
+            "Line UI only. When on (default), live DMs that aren't for "
+            "the current /dm target are summarised as "
+            "[New DMs from CALL (N)] instead of printing the body — "
+            "/dm CALL clears that peer's count and shows the thread. "
+            "Off → fully silent; the row is still stored, /dm CALL to "
+            "read. DMs for the active target and your own echoes are "
+            "always rendered in full."
+        ),
+        parse=_parse_bool,
+        format=_format_bool,
+        line_only=True,
+    ),
+    "notify_new_posts": _OptionSpec(
+        name="notify_new_posts",
+        description=(
+            "Line UI only. When on (default), live channel posts in "
+            "channels other than the current /ch target are summarised "
+            "as [New posts in CID:#name (N)] instead of printing the "
+            "body — /ch CID clears that channel's count and shows "
+            "history. Off → fully silent; the post is still stored, "
+            "/ch CID to read. Posts in the active channel and your own "
+            "echoes are always rendered in full. Edits (cped) are "
+            "unaffected — they always print regardless."
+        ),
+        parse=_parse_bool,
+        format=_format_bool,
+        line_only=True,
     ),
 }
 
@@ -139,19 +155,30 @@ class SessionOptions:
         show_edits: bool = True,
         verbose_history: bool = False,
         delivery_timeout_s: int = 60,
-        emoji_search_debounce_ms: int = 200,
         bell_on_activity: bool = True,
+        notify_new_dms: bool = True,
+        notify_new_posts: bool = True,
     ) -> None:
         self.show_acks = show_acks
         self.show_edits = show_edits
         self.verbose_history = verbose_history
         self.delivery_timeout_s = delivery_timeout_s
-        self.emoji_search_debounce_ms = emoji_search_debounce_ms
         self.bell_on_activity = bell_on_activity
+        self.notify_new_dms = notify_new_dms
+        self.notify_new_posts = notify_new_posts
 
     @classmethod
-    def names(cls) -> list[str]:
-        return list(_SPECS.keys())
+    def names(cls, *, include_line_only: bool = True) -> list[str]:
+        """Names of every known option.
+
+        ``include_line_only=False`` drops options flagged as line-UI-only
+        from the listing — used by the textual / urwid Settings modals
+        so options that have no effect there don't show up. The line UI
+        keeps the default (``True``) and sees every option.
+        """
+        if include_line_only:
+            return list(_SPECS.keys())
+        return [n for n, s in _SPECS.items() if not s.line_only]
 
     @classmethod
     def describe(cls, name: str) -> str:

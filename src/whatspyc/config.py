@@ -73,7 +73,6 @@ _LEGACY_TUI_KEYS = {
     "tui_fps": "textual_fps",
     "tui_animations": "textual_animations",
     "tui_smooth_scroll": "textual_smooth_scroll",
-    "tui_emoji_search_debounce_ms": "emoji_search_debounce_ms",
 }
 
 
@@ -173,6 +172,24 @@ class Config:
     # otherwise a fresh connect against a busy peer would fire dozens
     # of beeps in a row. Toggleable per session via ``/set bell``.
     bell_on_activity: bool = True
+    # Line UI only. When True (default), live inbound DMs that aren't
+    # for the current /dm target are summarised as
+    # ``[New DMs from CALL (N)]`` instead of printing the body —
+    # /dm CALL clears that peer's running count and shows the thread.
+    # False → fully silent for non-target DMs (still stored). DMs for
+    # the active target and your own outbound echoes are always
+    # rendered in full. Ignored by the textual / urwid backends.
+    notify_new_dms: bool = True
+    # Line UI only. Channel-post counterpart of ``notify_new_dms``.
+    # When True (default), live posts (cp / cpb) for channels other
+    # than the current /ch target are summarised as
+    # ``[New posts in CID:#name (N)]`` instead of printing the body —
+    # /ch CID clears that channel's running count. False → fully
+    # silent for non-target channels. Posts in the active channel and
+    # your own outbound echoes are always rendered in full. Edits
+    # (cped) are unaffected and always render. Ignored by the textual
+    # / urwid backends.
+    notify_new_posts: bool = True
     # Where Python logging writes. ``None`` keeps the default basicConfig
     # destination (stderr); a path routes records to a file (and creates
     # the parent dir if missing). Useful with ``--ui textual`` /
@@ -193,12 +210,11 @@ class Config:
     # Bundled "run on slow hardware" preset. When ``True`` and the
     # individual ``textual_*`` knobs below are still at their dataclass
     # defaults, ``resolve_low_power_defaults`` overrides them with a
-    # documented preset (15 FPS, no animations, no smooth scroll, no
-    # header clock, longer emoji-search debounce). Per-knob explicit
-    # settings always win — the preset only fills in what the user
-    # didn't already pin. Most of the preset only affects the textual
-    # backend; ``--ui urwid`` ignores fps / animations / smooth-scroll
-    # because urwid has no equivalent costs.
+    # documented preset (15 FPS, no animations, no smooth scroll). Per-
+    # knob explicit settings always win — the preset only fills in what
+    # the user didn't already pin. Only affects ``--ui textual``; urwid
+    # has no equivalent costs (no FPS cap, no animations, no smooth-
+    # scroll) so ``low_power_mode`` is a no-op there.
     low_power_mode: bool = False
     # Frame-rate cap for the Textual driver. Threaded into
     # ``TEXTUAL_FPS`` env var before ``App.run`` so it must be set in
@@ -212,11 +228,6 @@ class Config:
     # Disable sub-cell smooth scrolling (``TEXTUAL_SMOOTH_SCROLL=0``).
     # Restart-required. Textual-only.
     textual_smooth_scroll: bool = True
-    # Coalesce EmojiPrompt search re-renders: wait this many ms after
-    # the last keystroke before rebuilding the grid. ``0`` keeps the
-    # historic per-keystroke behaviour. Session-mutable via
-    # ``/set emoji_search_debounce_ms``. Cross-backend (both TUIs use it).
-    emoji_search_debounce_ms: int = 200
     connect_profiles: list[ConnectProfile] = field(default_factory=list)
     channels: list[ChannelInfo] = field(default_factory=list)
 
@@ -442,6 +453,20 @@ def parse(raw: dict) -> Config:
                 f"config: bell_on_activity must be a boolean, got {v!r}"
             )
         cfg.bell_on_activity = v
+    if "notify_new_dms" in raw:
+        v = raw["notify_new_dms"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"config: notify_new_dms must be a boolean, got {v!r}"
+            )
+        cfg.notify_new_dms = v
+    if "notify_new_posts" in raw:
+        v = raw["notify_new_posts"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"config: notify_new_posts must be a boolean, got {v!r}"
+            )
+        cfg.notify_new_posts = v
     if "log_file" in raw:
         v = raw["log_file"]
         if not isinstance(v, str) or not v:
@@ -506,15 +531,6 @@ def parse(raw: dict) -> Config:
             )
         cfg.textual_smooth_scroll = v
         perf_user_supplied.add("textual_smooth_scroll")
-    if "emoji_search_debounce_ms" in raw:
-        v = raw["emoji_search_debounce_ms"]
-        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 2000:
-            raise ValueError(
-                "config: emoji_search_debounce_ms must be an integer "
-                f"in [0, 2000], got {v!r}"
-            )
-        cfg.emoji_search_debounce_ms = v
-        perf_user_supplied.add("emoji_search_debounce_ms")
     resolve_low_power_defaults(cfg, perf_user_supplied)
 
     if "channels" in raw:
@@ -588,8 +604,7 @@ def resolve_low_power_defaults(cfg: Config, user_supplied: set[str]) -> None:
 
     The ``textual_*`` knobs only affect ``--ui textual``; urwid
     doesn't have equivalent costs (no FPS cap, no animations, no
-    smooth-scroll). ``emoji_search_debounce_ms`` is honoured by both
-    backends.
+    smooth-scroll), so ``low_power_mode`` is a no-op there.
 
     No-op when ``low_power_mode`` is ``False``.
     """
@@ -601,8 +616,6 @@ def resolve_low_power_defaults(cfg: Config, user_supplied: set[str]) -> None:
         cfg.textual_animations = False
     if "textual_smooth_scroll" not in user_supplied:
         cfg.textual_smooth_scroll = False
-    if "emoji_search_debounce_ms" not in user_supplied:
-        cfg.emoji_search_debounce_ms = 300
 
 
 def resolve_engine_defaults(p: ConnectProfile, user_supplied: set[str]) -> None:

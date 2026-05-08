@@ -22,14 +22,22 @@ from dataclasses import dataclass
 class ConnectSummary:
     server_message_count: int = 0
     server_post_count: int = 0
+    # Observed count of inbound DMs that landed in the connect window
+    # (`m` + `mb`, excluding our own callsign so self-echoes don't inflate
+    # it). The server's `mc` is hardcoded to 0 by `first_time_connect_handler`
+    # (wps.py:336) — fresh-DB connects still get DMs delivered via `mb`
+    # but server_message_count is a lie in that branch, so prefer this
+    # for any user-facing "X new DMs" display.
+    received_message_count: int = 0
     welcome: bool = False
     paused_channels: list[dict] = None  # type: ignore[assignment]
     online_users: list[str] = None  # type: ignore[assignment]
 
 
 class ConnectSequence:
-    def __init__(self, *, idle_after: float = 3.0) -> None:
+    def __init__(self, *, idle_after: float = 3.0, my_call: str | None = None) -> None:
         self._idle_after = idle_after
+        self._my_call = (my_call or "").upper()
         self._summary = ConnectSummary(paused_channels=[], online_users=[])
         self._got_c_reply = asyncio.Event()
         self._last_event = asyncio.Event()
@@ -42,6 +50,15 @@ class ConnectSequence:
             self._summary.server_post_count = obj.get("pc", 0)
             self._summary.welcome = bool(obj.get("w", 0))
             self._got_c_reply.set()
+        elif t == "m":
+            fc = (obj.get("fc") or "").upper()
+            if fc and fc != self._my_call:
+                self._summary.received_message_count += 1
+        elif t == "mb":
+            for m in obj.get("m", []):
+                fc = (m.get("fc") or "").upper()
+                if fc and fc != self._my_call:
+                    self._summary.received_message_count += 1
         elif t == "pch":
             self._summary.paused_channels = list(obj.get("ch", []))
         elif t == "o":

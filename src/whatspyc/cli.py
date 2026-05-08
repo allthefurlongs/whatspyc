@@ -286,7 +286,7 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
     "ui_mode",
     type=click.Choice(["line", "textual", "urwid"]),
     default=None,
-    help="UI backend. line = prompt_toolkit REPL; textual = Textual full-"
+    help="UI backend. line = simple stdin/stdout REPL; textual = Textual full-"
     "screen multi-pane; urwid = urwid full-screen multi-pane (lighter on "
     "slow hardware).",
 )
@@ -508,7 +508,7 @@ def _make_connection_opener(c: cfg_mod.Config, store: SqliteStore):
                 on_client_ready(client)
             return client, ConnectSummary(paused_channels=[], online_users=[])
 
-        seq = ConnectSequence()
+        seq = ConnectSequence(my_call=c.app_call)
 
         async def hook(obj: dict) -> None:
             await seq.on_event(obj)
@@ -568,8 +568,9 @@ async def _run_session_driven(
         show_edits=c.show_edits,
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
-        emoji_search_debounce_ms=c.emoji_search_debounce_ms,
         bell_on_activity=c.bell_on_activity,
+        notify_new_dms=c.notify_new_dms,
+        notify_new_posts=c.notify_new_posts,
     )
     # Picker entries: <offline> at index 0, then configured profiles.
     available = [_OFFLINE_PROFILE] + list(c.connect_profiles)
@@ -775,8 +776,9 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
         show_edits=c.show_edits,
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
-        emoji_search_debounce_ms=c.emoji_search_debounce_ms,
         bell_on_activity=c.bell_on_activity,
+        notify_new_dms=c.notify_new_dms,
+        notify_new_posts=c.notify_new_posts,
     )
     if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]
@@ -819,7 +821,7 @@ async def _connect_and_run_ui(
     """Run one connect-and-UI cycle. Returns ``"terminal"`` if the link
     dropped without recovery (cli should offer reconnect/quit), otherwise
     ``None`` (clean exit / cancelled connect — cli should stop)."""
-    seq = ConnectSequence()
+    seq = ConnectSequence(my_call=c.app_call)
 
     # Hold UI rendering until the connect sequence settles so the
     # "Sending connection details..." line stays put — otherwise the
@@ -853,8 +855,9 @@ async def _connect_and_run_ui(
         show_edits=c.show_edits,
         verbose_history=c.verbose_history,
         delivery_timeout_s=c.delivery_timeout_s,
-        emoji_search_debounce_ms=c.emoji_search_debounce_ms,
         bell_on_activity=c.bell_on_activity,
+        notify_new_dms=c.notify_new_dms,
+        notify_new_posts=c.notify_new_posts,
     )
     if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]
@@ -928,12 +931,28 @@ async def _connect_and_run_ui(
         await client.close()
         return None
     summary = connect_task.result()
+    # Aggregate connect-window DMs (from `m` / `mb`) into one summary line.
+    # Per-row prints would scroll a busy reconnect off the top before the
+    # user can read it; non-DM buffered events still replay individually.
+    dm_senders: dict[str, int] = {}
+    my_upper = c.app_call.upper()  # type: ignore[union-attr]
     for obj in pending_events:
-        ui.render_event(obj)
+        t = obj.get("t")
+        if t == "m":
+            fc = (obj.get("fc") or "").upper()
+            if fc and fc != my_upper:
+                dm_senders[fc] = dm_senders.get(fc, 0) + 1
+        elif t == "mb":
+            for m in obj.get("m", []):
+                fc = (m.get("fc") or "").upper()
+                if fc and fc != my_upper:
+                    dm_senders[fc] = dm_senders.get(fc, 0) + 1
+        else:
+            ui.render_event(obj)
     pending_events.clear()
     connect_done = True
     parts = [
-        f"{summary.server_message_count} new DMs",
+        f"{summary.received_message_count} new DMs",
         f"{summary.server_post_count} new posts",
     ]
     if summary.paused_channels:
@@ -941,7 +960,15 @@ async def _connect_and_run_ui(
         parts.append(
             f"{n} paused channel(s) — see /unpause hint(s) above"
         )
+    click.echo()
     click.echo("[Connected] " + ", ".join(parts))
+    if dm_senders:
+        ordered = sorted(dm_senders.items(), key=lambda kv: (-kv[1], kv[0]))
+        click.echo(
+            "[New DMs from "
+            + ", ".join(f"{call} ({n})" for call, n in ordered)
+            + "]"
+        )
     try:
         await ui.run()
     finally:

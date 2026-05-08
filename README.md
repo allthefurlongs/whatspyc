@@ -24,11 +24,13 @@ What it does today:
 - Local SQLite store of every message/post/edit/emoji seen, used to feed
   delta timestamps into the connect handshake (so reconnects don't pull
   the whole history).
-- Three interactive front-ends: a `prompt_toolkit` line UI and two
-  multi-pane TUIs — `textual` (rich, animated) and `urwid` (lighter on
-  slow hardware) — both with per-target message panes, in-place
-  edit/ack updates, scroll-back paging from the local store, a modal
-  message-action menu, and a live online-users pane.
+- Three interactive front-ends: a plain stdin/stdout line UI (no
+  cursor positioning or ANSI redraw — runs on BPQ TNC consoles, serial
+  terminals, and minimal embedded shells) and two multi-pane TUIs —
+  `textual` (rich, animated) and `urwid` (lighter on slow hardware) —
+  both with per-target message panes, in-place edit/ack updates,
+  scroll-back paging from the local store, a modal message-action
+  menu, and a live online-users pane.
 - Periodic keep-alives and (opt-in) automatic reconnect with exponential
   backoff — when enabled, the connect script auto-replays on every
   reconnect.
@@ -106,13 +108,22 @@ settle) you can type `q` + Enter to cancel — the partial link is torn
 down cleanly so you don't leave the entry node holding an orphaned
 session. Once connected, `/quit` is the equivalent.
 
-You'll land in a prompt. Slash commands:
+You'll land in a `whatspyc> ` prompt. The prompt label is only shown
+at the top level — once you're inside a `/dm` or `/ch` target, no
+prompt is reprinted between messages, to keep the screen clean on
+slow / append-only terminals (BPQ TNC consoles, serial terminals).
+Use `/target` to print the current label on demand and `/back` to
+drop the target.
+
+Slash commands:
 
 | command | what |
 | --- | --- |
 | `/h [command]` | help. `/h` alone lists every slash command with a one-line summary; `/h <command>` shows detailed help (the leading slash is optional, so `/h ch` and `/h /ch` are equivalent). |
 | `/dm CALL` | set the current target to a DM with `CALL` (callsign is uppercased) |
 | `/ch CID` or `/ch NAME` | set the current target to a channel by id, or by name looked up in the channel directory (case-insensitive, leading `#` optional — `lounge` and `#lounge` both work). After history replay, if you're not subscribed, the UI prompts to subscribe — declining drops you back to whatever target you had before (or no target) so you don't get stranded in a channel you didn't commit to. |
+| `/target` | line UI only — print the current prompt label (`5 #lounge>`, `dm CALL>`, or `whatspyc>`) on demand. Useful inside a target where the prompt is otherwise suppressed, so you can confirm where typed text would land. |
+| `/back` | line UI only — drop the current `/dm` or `/ch` target so plain text no longer auto-routes anywhere; the prompt becomes `whatspyc> ` until you `/dm CALL` or `/ch N|#NAME` again. |
 | (plain text) | send to the current target. Posting to a channel you're not subscribed to is blocked at the client: WPS accepts the `cp` and broadcasts it to subscribers, but only relays new posts back to subscribers, so you'd never see replies — `/sub` first. |
 | `/sub CID\|NAME [N]` | subscribe to a channel and pull `N` historic posts. The channel can be a numeric cid or a directory name (with or without `#`). Two-phase: send `cs`, await the server's ack (which carries the count of historic posts available), then either fetch `N` posts (when `N` was given), or prompt for the count with a sensible default. `N=0` subscribes realtime-only. The default for the prompt is `auto_backfill_post_count` (if configured) else 10, capped at the actual post count. |
 | `/unsub CID\|NAME` | unsubscribe (cid or directory name, with or without `#`) |
@@ -128,7 +139,7 @@ You'll land in a prompt. Slash commands:
 | `/replypost LID text` | post a channel reply to a previous post. `LID` is the local short id of the parent post. The reply lands in the same channel as the parent, with the parent's `ts` and `fc` carried as wire `rts` / `rfc`. |
 | `/history [N]` | replay the last `N` historic messages/posts for the current target from the local store. Defaults to `history_backfill` if `N` is omitted. Output style follows the `verbose_history` session option (compact by default, verbose when set). The same backfill runs automatically each time you switch target. |
 | `/vhistory [N]` | one-shot **verbose** replay of the last `N` items for the current target. Always renders the verbose form (local id, timestamp, delivery state for outbound items, real-time-receipt latency for inbound items) regardless of `verbose_history`. Does not change the session option. |
-| `/set [NAME [VALUE]]` | view or change session-tunable options. `/set` lists every option with its current value and a one-line description; `/set NAME` shows just one; `/set NAME VALUE` updates it for the running session (does not persist — restart picks the config-file value back up). Values like `on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0` are all accepted for booleans. Known options: `show_acks`, `show_edits`, `verbose_history`, `delivery_timeout_s`, `emoji_search_debounce_ms`, `bell_on_activity`. Each option is also a top-level config key with the same name. |
+| `/set [NAME [VALUE]]` | view or change session-tunable options. `/set` lists every option with its current value and a one-line description; `/set NAME` shows just one; `/set NAME VALUE` updates it for the running session (does not persist — restart picks the config-file value back up). Values like `on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0` are all accepted for booleans. Known options: `show_acks`, `show_edits`, `verbose_history`, `delivery_timeout_s`, `bell_on_activity`, `notify_new_dms` (line UI only), `notify_new_posts` (line UI only). Each option is also a top-level config key with the same name. |
 | `/quit` | clean disconnect (drops the RHP link; the rest of the chain follows) |
 
 # Configuration reference
@@ -156,7 +167,7 @@ top level is rejected at config-load time.
 | --- | --- | --- | --- | --- |
 | `my_call` | `--my-call` | string | *(required)* | Your callsign — `BASE[-SSID]`, base must be 1–6 alphanumerics including at least one digit, SSID 0–15. The SSID is used as the AX.25 source for the RHP link, but stripped before anything inside the WPS application layer (connect record, message `fc`/`tc`, reaction attribution, self-call comparisons), matching the server's own SSID-strip on the callsign-line handshake. **Required**, in either the file or via the flag. |
 | `name` | `--name` | string | *(required)* | Display name in the type-`c` connect record. **Required**, in either the file or via the flag. |
-| `ui` | `--ui` | string | `"line"` | One of `"line"` (prompt_toolkit single-line REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. |
+| `ui` | `--ui` | string | `"line"` | One of `"line"` (simple stdin/stdout REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. |
 | `state_dir` | `--state-dir` | path | `$XDG_DATA_HOME/whatspyc` (i.e. `~/.local/share/whatspyc`) | Directory holding `state.sqlite3`. Created if missing. |
 | `default_profile` | *(none)* | string \| null | `null` | Name of a configured profile to preselect in the picker / use under `--no-prompt`. Must match one of the `[[connect_profiles]]` names — typos are caught at config-load time. |
 | `history_backfill` | *(none)* | int | `3` | How many historic messages (DM target) or posts (channel target) to replay from the local SQLite store each time you switch target. The same count is the default for `/history` when no explicit count is given. Set to `0` to disable the auto-replay. |
@@ -168,16 +179,17 @@ top level is rejected at config-load time.
 | `verbose_history` | *(none)* | bool | `false` | Default rendering style for `/history`, target-switch backfill, and live arrivals. Compact form: `100 #lounge> [ts] <Bob, M6HKD>: msg`. Verbose form: `100 #lounge> ID: 71 - [ts] - Received real-time in 7s - <Bob, M6HKD>: msg` (inbound realtime), and `Delivered to server in 23s` / `Delivering...` / `NOT DELIVERED` for outbound. Toggleable per session via `/set verbose_history on|off`. `/vhistory` is always verbose regardless. |
 | `delivery_timeout_s` | *(none)* | int | `60` | Seconds before an outbound DM (`m`) / post (`cp`) is treated as unacknowledged. When a row hits this deadline without a matching `mr` / `cpr` ack, the client prints a one-line timeout notice — e.g. `[timeout] [ch:5 #lounge] post 6 at [2026-05-03 16:46:42]. To resend: /retrypost 6` (or `[dm:M6HKD] msg 12 ...` with `/retrydm 12`). The notice **always** prints regardless of `show_acks`, since "no ack received" is harder to notice than "ack received". The same threshold also drives the verbose render's `Delivering...` → `NOT DELIVERED` flip. Whatspyc-specific — the web client has no automatic timeout (its "resend" button is purely manual). Toggleable per session via `/set delivery_timeout_s N`. |
 | `bell_on_activity` | *(none)* | bool | `true` | Ring the terminal bell (BEL, `\x07`) on every real-time DM (`m`) and channel post (`cp`) — matches the web client's notify-on-arrival behaviour. Whether you actually hear a beep, see a visual flash, or get nothing depends on your terminal emulator's bell setting (most terminals expose audible/visual/off as a preference); whatspyc just emits the byte. Batch frames (`mb` / `cpb` — connect-time DM backlog and `/sub` post pulls) are deliberately silent so a fresh connect against a busy peer doesn't produce a flurry of beeps. All three UIs honour it (Textual via `App.bell()`, urwid by writing to the screen, line by writing to patched stdout). Toggleable per session via `/set bell_on_activity on\|off`. |
+| `notify_new_dms` | *(none)* | bool | `true` | **Line UI only.** When a live DM arrives for a peer that isn't your current `/dm` target, suppress the body and emit a single `[New DMs from CALL (N), CALL2 (M)]` line instead — same shape as the connect-time summary, with the count rolling forward as more arrive. `/dm CALL` clears that peer's count and shows the buffered thread. Set to `false` to be fully silent for non-target DMs (the row is still stored — open it later with `/dm CALL`). DMs targeted at your active thread, and your own outbound echoes, are always rendered in full regardless of this setting. Toggleable per session via `/set notify_new_dms on\|off`. The textual / urwid backends have their own multi-pane render and ignore this option (it does not appear in their Settings modal). |
+| `notify_new_posts` | *(none)* | bool | `true` | **Line UI only.** Channel-post counterpart of `notify_new_dms`. When a live post (`cp` / `cpb`) arrives in a channel that isn't your current `/ch` target, suppress the body and emit a single `[New posts in 5:#lounge (2), 9 (1)]` line instead — `cid:#name` when the directory has a name for that channel, bare `cid` otherwise; ordered by count desc / cid asc. `/ch CID` clears that channel's count. Set to `false` to be fully silent for non-target channels. Posts in your active channel and your own outbound echoes are always rendered in full. Edits (`cped`) are unaffected — they always print regardless. Toggleable per session via `/set notify_new_posts on\|off`. The textual / urwid backends have their own multi-pane render and ignore this option (it does not appear in their Settings modal). |
 | `log_level` | `--log-level` | string | `WARNING` | Python logging level (`CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `NOTSET`, case-insensitive). Resolution order: `--log-level` > `log_level` config key > `WHATSPYC_LOG` env var > built-in `WARNING`. |
 | `log_file` | `--log-file` | path \| null | `null` | Append log records to this file. Additive — the console sink (see `log_console`) is unaffected, so any combination of file + console + neither is valid. The parent directory is created if missing. CLI flag wins over the config key; no env var. |
 | `log_console` | `--log-console` | string | `"auto"` | Where the console-shaped log sink writes. Independent of `log_file`. Values: `"auto"` → status pane in TUI, stderr in line UI; `"stderr"` → always stderr (corrupts the TUI surface — opt-in only); `"pane"` → status pane (TUI only; line UI is **rejected** at startup); `"off"` → no console sink, file only (or silent if `log_file` is unset). In pane mode, `WARNING` and below appear in the pane (yellow for warnings); `ERROR`+ auto-shows the pane if it's hidden. |
-| `low_power_mode` | *(none)* | bool | `false` | Bundled "run on slow hardware" preset. When `true`, fills in any unset perf knob with a low-cost default: `textual_fps = 15`, `textual_animations = false`, `textual_smooth_scroll = false`, `emoji_search_debounce_ms = 300`. Per-knob explicit settings always win over the preset. The `textual_*` knobs only affect `--ui textual`; urwid has no equivalent costs (no FPS cap, no animations, no compositor) so `low_power_mode` is a no-op there other than the `emoji_search_debounce_ms` setting, which both backends honour. Restart required (the underlying knobs all are). |
+| `low_power_mode` | *(none)* | bool | `false` | Bundled "run on slow hardware" preset. When `true`, fills in any unset perf knob with a low-cost default: `textual_fps = 15`, `textual_animations = false`, `textual_smooth_scroll = false`. Per-knob explicit settings always win over the preset. Only affects `--ui textual`; urwid has no equivalent costs (no FPS cap, no animations, no compositor) so `low_power_mode` is a no-op there. Restart required (the underlying knobs all are). |
 | `textual_fps` | *(none)* | int (1–60) | `60` | Frame-rate cap for the Textual driver. Sets `TEXTUAL_FPS` before app startup. Drop to 30 / 15 on slow hardware to cut idle CPU. Textual-only. **Restart required** — Textual reads the env var once during `App.__init__`. |
 | `textual_animations` | *(none)* | bool | `true` | Disable Textual's animations (sets `TEXTUAL_ANIMATIONS=0`). Saves cycles on slow terminals where eased transitions look janky anyway. Textual-only. **Restart required.** |
 | `textual_smooth_scroll` | *(none)* | bool | `true` | Disable sub-cell smooth scrolling (sets `TEXTUAL_SMOOTH_SCROLL=0`). Lower CPU for the same useful behaviour on character-cell terminals. Textual-only. **Restart required.** |
-| `emoji_search_debounce_ms` | *(none)* | int (0–2000) | `200` | Coalesce EmojiPrompt search re-renders: wait this many ms after the last keystroke before rebuilding the grid. `0` means re-render on every keystroke. Toggleable per session via `/set emoji_search_debounce_ms N`. Honoured by both Textual and urwid backends. |
 
-> **Slow-hardware shortcut:** drop `low_power_mode = true` at the top of `~/.config/whatspyc/config.toml` and restart. That's the same as setting all four preset keys to their preset values, but with one knob to remember. For the lightest experience use `--ui urwid` together with `low_power_mode = true`.
+> **Slow-hardware shortcut:** drop `low_power_mode = true` at the top of `~/.config/whatspyc/config.toml` and restart. That's the same as setting all three preset keys to their preset values, but with one knob to remember. For the lightest experience use `--ui urwid` together with `low_power_mode = true`.
 
 ## Connect profiles
 

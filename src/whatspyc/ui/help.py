@@ -300,6 +300,30 @@ COMMANDS: dict[str, CommandHelp] = {
             "Booleans accept on/off, true/false, yes/no, 1/0."
         ),
     ),
+    "/target": CommandHelp(
+        name="/target",
+        usage="/target",
+        summary="Print the current target prompt label.",
+        details=(
+            "Line UI only. Prints whatever the prompt label would have "
+            "been — '5 #lounge>' inside a channel target, 'dm CALL>' "
+            "inside a DM target, 'whatspyc>' at the top level — followed "
+            "by a newline. Useful inside a target where the prompt is "
+            "otherwise suppressed for cleanliness, so you can confirm "
+            "where typed text would land."
+        ),
+    ),
+    "/back": CommandHelp(
+        name="/back",
+        usage="/back",
+        summary="Leave the current DM or channel target, return to top level.",
+        details=(
+            "Line UI only. Drops the current /dm or /ch target so plain "
+            "text typed at the prompt no longer auto-routes anywhere; "
+            "the prompt becomes 'whatspyc> ' until you /dm CALL or "
+            "/ch N|#NAME again."
+        ),
+    ),
     "/quit": CommandHelp(
         name="/quit",
         usage="/quit",

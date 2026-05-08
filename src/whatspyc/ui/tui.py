@@ -645,7 +645,7 @@ class HelpScreen(ModalScreen[None]):
         log.write("[bold]Slash commands[/] (use /h <command> for details)")
         # Hide commands the TUI has replaced with GUI affordances.
         # /set still works (it opens the settings modal), so it stays.
-        hide = {"/list", "/users"}
+        hide = {"/list", "/users", "/target", "/back"}
         for line in help_data.list_lines(hide=hide)[1:]:  # drop duplicated header
             log.write(line)
 
@@ -916,7 +916,7 @@ class EmojiPrompt(ModalScreen[str | None]):
     }
     """
 
-    def __init__(self, *, debounce_ms: int = 0) -> None:
+    def __init__(self) -> None:
         super().__init__()
         # Active "view" — what the grid currently shows. Drives _render.
         # The subgroup tab id (when in People & Body), else "" for the
@@ -927,10 +927,9 @@ class EmojiPrompt(ModalScreen[str | None]):
         # Cache the buttons currently mounted, in DOM order.
         self._grid_buttons: list[_EmojiButton] = []
         # ms to wait after the last keystroke before re-rendering the
-        # grid for a search update. 0 keeps the historic per-keystroke
-        # behaviour. Tab clicks bypass this — they're a single user
-        # gesture, not a stream of events.
-        self._debounce_ms: int = max(0, debounce_ms)
+        # grid for a search update. Tab clicks bypass this — they're
+        # a single user gesture, not a stream of events.
+        self._debounce_ms: int = 200
         # Active debounce timer (Textual ``Timer``). Stopped + replaced
         # by each keystroke; cleared when the timer fires.
         self._render_timer: Any = None
@@ -1732,7 +1731,10 @@ class SettingsModal(ModalScreen[None]):
 
     def on_mount(self) -> None:
         lv = self.query_one("#settings-list", ListView)
-        for n in self._opts.names():
+        # Skip line-UI-only options (e.g. notify_new_dms) — they have no
+        # effect in the textual backend, so showing them in this modal
+        # would just confuse users.
+        for n in self._opts.names(include_line_only=False):
             lv.append(self._row_for(n))
         lv.focus()
 
@@ -1818,7 +1820,7 @@ def _format_connected_line(summary: ConnectSummary) -> str:
     """Compose the one-line summary shown when the link is up. Same
     text as cli.py's pre-UI ``[Connected]`` echo."""
     parts = [
-        f"{summary.server_message_count} new DMs",
+        f"{summary.received_message_count} new DMs",
         f"{summary.server_post_count} new posts",
     ]
     if summary.paused_channels:
@@ -3249,10 +3251,8 @@ class _WhatspycApp(App):
         self._open_settings_modal()
 
     def action_insert_emoji(self) -> None:
-        debounce = self._ui._options.emoji_search_debounce_ms
-
         async def _run() -> None:
-            picked = await self.push_screen_wait(EmojiPrompt(debounce_ms=debounce))
+            picked = await self.push_screen_wait(EmojiPrompt())
             if not picked:
                 return
             # Hex codepoint fallback (for terminals that can't render
@@ -4045,24 +4045,32 @@ class _WhatspycApp(App):
         if not items:
             return
         by_peer: dict[TargetKey, list[dict]] = {}
+        # Per-target count of inbound DMs (excludes our own echoes) so
+        # the unread badge matches the [Connected] line's "from someone
+        # else" count.
+        inbound_counts: dict[TargetKey, int] = {}
+        my_call = self._ui._my_call
         for m in items:
             fc = m.get("fc")
             tc = m.get("tc")
-            peer = tc if fc == self._ui._my_call else fc
+            peer = tc if fc == my_call else fc
             if not peer:
                 continue
             target: TargetKey = ("dm", peer)
             by_peer.setdefault(target, []).append(m)
+            if fc != my_call:
+                inbound_counts[target] = inbound_counts.get(target, 0) + 1
         active = self._active_target()
         for target, group in by_peer.items():
             self._add_target(target)
             if active != target:
-                # Inactive target: just bump unread by the group size and
-                # refresh the label once. Rows page in from the store
-                # on activation.
-                self._unread[target] = self._unread.get(target, 0) + len(group)
-                self._refresh_target_label(target)
-                self._refresh_tab_labels()
+                # Inactive target: bump unread by inbound-only count.
+                # Rows page in from the store on activation.
+                inbound = inbound_counts.get(target, 0)
+                if inbound:
+                    self._unread[target] = self._unread.get(target, 0) + inbound
+                    self._refresh_target_label(target)
+                    self._refresh_tab_labels()
                 continue
             # Active target: resolve store rows for each item once, then
             # bulk-fetch reactions for the whole group in one query
@@ -4157,9 +4165,13 @@ class _WhatspycApp(App):
         if active != target:
             # Inactive target → bump unread, do NOT mount the row. The
             # row will be paged in from the store on activation.
-            self._unread[target] = self._unread.get(target, 0) + 1
-            self._refresh_target_label(target)
-            self._refresh_tab_labels()
+            # Self-sent echoes (e.g. from another session of ours) don't
+            # count as unread — they match the [Connected] line's "from
+            # someone else" semantics.
+            if fc != self._ui._my_call:
+                self._unread[target] = self._unread.get(target, 0) + 1
+                self._refresh_target_label(target)
+                self._refresh_tab_labels()
             return
         # Active target → mount the row. Look up the persisted row from
         # the store (by id) so we get the same fields the verbose render
@@ -4700,8 +4712,7 @@ class _WhatspycApp(App):
     async def _do_react(self, row: MessageRow) -> None:
         if self._refuse_offline("reacting"):
             return
-        debounce = self._ui._options.emoji_search_debounce_ms
-        emoji = await self.push_screen_wait(EmojiPrompt(debounce_ms=debounce))
+        emoji = await self.push_screen_wait(EmojiPrompt())
         if not emoji:
             return
         c = self._ui._client

@@ -824,10 +824,6 @@ def test_legacy_tui_keys_rejected_with_migration_message() -> None:
         cfg_mod.parse({"tui_fps": 30})
     with pytest.raises(ValueError, match="tui_animations.*textual_animations"):
         cfg_mod.parse({"tui_animations": False})
-    with pytest.raises(
-        ValueError, match="tui_emoji_search_debounce_ms.*emoji_search_debounce_ms"
-    ):
-        cfg_mod.parse({"tui_emoji_search_debounce_ms": 200})
 
 
 def test_multiple_legacy_keys_listed_in_one_error() -> None:
@@ -848,7 +844,6 @@ def test_tui_perf_defaults() -> None:
     assert c.textual_fps == 60
     assert c.textual_animations is True
     assert c.textual_smooth_scroll is True
-    assert c.emoji_search_debounce_ms == 200
 
 
 def test_textual_fps_validation() -> None:
@@ -879,21 +874,6 @@ def test_textual_animations_and_smooth_scroll_validation() -> None:
         cfg_mod.parse({"textual_smooth_scroll": 1})
 
 
-def test_emoji_search_debounce_ms_validation() -> None:
-    # 0 is allowed (means: rebuild on every keystroke).
-    c = cfg_mod.parse({"emoji_search_debounce_ms": 0})
-    assert c.emoji_search_debounce_ms == 0
-    c = cfg_mod.parse({"emoji_search_debounce_ms": 2000})
-    assert c.emoji_search_debounce_ms == 2000
-
-    with pytest.raises(ValueError, match="emoji_search_debounce_ms"):
-        cfg_mod.parse({"emoji_search_debounce_ms": -1})
-    with pytest.raises(ValueError, match="emoji_search_debounce_ms"):
-        cfg_mod.parse({"emoji_search_debounce_ms": 2001})
-    with pytest.raises(ValueError, match="emoji_search_debounce_ms"):
-        cfg_mod.parse({"emoji_search_debounce_ms": True})
-
-
 def test_low_power_mode_preset_fills_in_defaults() -> None:
     """``low_power_mode = true`` with no other knobs gives the bundled preset."""
     c = cfg_mod.parse({"low_power_mode": True})
@@ -901,7 +881,6 @@ def test_low_power_mode_preset_fills_in_defaults() -> None:
     assert c.textual_fps == 15
     assert c.textual_animations is False
     assert c.textual_smooth_scroll is False
-    assert c.emoji_search_debounce_ms == 300
 
 
 def test_low_power_mode_preset_user_pin_wins() -> None:
@@ -912,7 +891,6 @@ def test_low_power_mode_preset_user_pin_wins() -> None:
     # Other knobs follow the preset since the user didn't pin them.
     assert c.textual_animations is False
     assert c.textual_smooth_scroll is False
-    assert c.emoji_search_debounce_ms == 300
 
 
 def test_low_power_mode_off_does_not_override() -> None:
@@ -921,7 +899,6 @@ def test_low_power_mode_off_does_not_override() -> None:
     assert c.textual_fps == 60
     assert c.textual_animations is True
     assert c.textual_smooth_scroll is True
-    assert c.emoji_search_debounce_ms == 200
 
 
 def test_low_power_mode_validation() -> None:

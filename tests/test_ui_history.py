@@ -871,6 +871,11 @@ def test_render_event_uc_includes_name_when_known(tmp_path: Path, capsys) -> Non
 def test_render_event_dm_includes_name_and_call(tmp_path: Path, capsys) -> None:
     ui, store = _make_ui(tmp_path)
     store.upsert_ham("M0FOO", "Alice", 1_000)
+    # The full-body render only happens when the user is /dm'd into
+    # that peer (or the DM is their own outbound echo); otherwise the
+    # new notify_new_dms path summarises it. This test is about the
+    # render shape, so set the target up front.
+    ui._target = ("dm", "M0FOO")
     ui.render_event(
         {"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "hi", "ts": 1}
     )
@@ -887,6 +892,11 @@ def test_render_event_post_includes_name_and_call(tmp_path: Path, capsys) -> Non
     channels = [ChannelInfo(cid=7, name="lounge")]
     ui, store = _make_ui(tmp_path, channels=channels)
     store.upsert_ham("M0FOO", "Alice", 1_000)
+    # The full-body render only happens when /ch'd into the channel
+    # (or it's our own outbound echo); otherwise the new
+    # notify_new_posts path summarises it. This test is about the
+    # render shape, so set the target up front.
+    ui._target = ("ch", "7")
     ui.render_event({"t": "cp", "cid": 7, "fc": "M0FOO", "p": "hello", "ts": 1})
     out = capsys.readouterr().out
     assert "7 #lounge>" in out
@@ -1560,6 +1570,10 @@ def test_render_event_verbose_realtime_dm_uses_persisted_row(
     ui, store = _make_ui(
         tmp_path, options=SessionOptions(verbose_history=True)
     )
+    # Full-body render is gated on being /dm'd into the peer (or it
+    # being our own outbound echo). Set the target so we exercise the
+    # verbose render path the test is actually about.
+    ui._target = ("dm", "M0FOO")
     # Simulate the default handler having already persisted the row.
     ts_s = 1_700_000_000
     store.upsert_message(
@@ -1583,6 +1597,11 @@ def test_render_event_compact_does_not_use_lid(tmp_path: Path, capsys) -> None:
     """In compact mode (default) live `m` arrival skips the verbose
     lookup entirely and renders the historic single-line form."""
     ui, store = _make_ui(tmp_path)  # verbose_history=False
+    # Compact-vs-verbose only kicks in when the body is actually
+    # rendered — i.e. for the current /dm target. (The non-target
+    # path emits a [New DMs from ...] summary instead and is covered
+    # by the notify_new_dms tests below.)
+    ui._target = ("dm", "M0FOO")
     ui.render_event(
         {"t": "m", "_id": "100-M0FOO", "fc": "M0FOO", "tc": "M0ABC",
          "m": "live", "ts": 1_000}
@@ -1590,6 +1609,290 @@ def test_render_event_compact_does_not_use_lid(tmp_path: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert "ID:" not in out
     assert "live" in out
+    store.close()
+
+
+def test_notify_new_dms_summarises_non_target_inbound(
+    tmp_path: Path, capsys
+) -> None:
+    """Live `m` from a peer the user isn't /dm'd into is summarised as a
+    `[New DMs from CALL (N)]` line rather than printed in full. Counts
+    accumulate across arrivals and across senders."""
+    # bell_on_activity=False so the BEL bytes don't interleave with the
+    # captured output and complicate per-line matching.
+    ui, store = _make_ui(
+        tmp_path, options=SessionOptions(bell_on_activity=False)
+    )
+    # No /dm target → the peer is "non-target" by default.
+    ui.render_event(
+        {"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "first", "ts": 1}
+    )
+    ui.render_event(
+        {"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "second", "ts": 2}
+    )
+    ui.render_event(
+        {"t": "m", "fc": "G0BAR", "tc": "M0ABC", "m": "third", "ts": 3}
+    )
+    out = capsys.readouterr().out
+    # Bodies must never appear — only the summary line.
+    assert "first" not in out
+    assert "second" not in out
+    assert "third" not in out
+    # Three notification lines, each cumulative; final should mention
+    # both peers, ordered by count desc then callsign asc.
+    lines = [l for l in out.splitlines() if l]
+    assert lines[0] == "[New DMs from M0FOO (1)]"
+    assert lines[1] == "[New DMs from M0FOO (2)]"
+    assert lines[2] == "[New DMs from M0FOO (2), G0BAR (1)]"
+    store.close()
+
+
+def test_notify_new_dms_off_is_silent_for_non_target(
+    tmp_path: Path, capsys
+) -> None:
+    """notify_new_dms = off keeps non-target DM bodies suppressed AND
+    suppresses the notification line — fully silent. Body never prints."""
+    ui, store = _make_ui(
+        tmp_path, options=SessionOptions(notify_new_dms=False)
+    )
+    ui.render_event(
+        {"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "hidden", "ts": 1}
+    )
+    out = capsys.readouterr().out
+    assert "hidden" not in out
+    assert "New DMs from" not in out
+    store.close()
+
+
+def test_notify_new_dms_renders_in_full_for_active_target(
+    tmp_path: Path, capsys
+) -> None:
+    """When the user is /dm'd into the peer, the body renders in full
+    (no summary line). This is the same path covered by the broader
+    rendering tests, restated here as a contrast against the summary
+    behaviour."""
+    ui, store = _make_ui(tmp_path)
+    ui._target = ("dm", "M0FOO")
+    ui.render_event(
+        {"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "visible", "ts": 1}
+    )
+    out = capsys.readouterr().out
+    assert "visible" in out
+    assert "New DMs from" not in out
+    store.close()
+
+
+def test_notify_new_dms_outbound_echo_always_renders(
+    tmp_path: Path, capsys
+) -> None:
+    """Our own outbound DMs (server-echoed `m` with fc == my_call) are
+    always rendered in full, regardless of the current target — they
+    aren't 'unread DMs' to be summarised."""
+    ui, store = _make_ui(tmp_path)
+    # No /dm target. The DM is from us to M0FOO.
+    ui.render_event(
+        {"t": "m", "fc": "M0ABC", "tc": "M0FOO", "m": "outbound", "ts": 1}
+    )
+    out = capsys.readouterr().out
+    assert "outbound" in out
+    assert "New DMs from" not in out
+    store.close()
+
+
+def test_dm_command_clears_unread_for_that_peer(
+    tmp_path: Path, capsys
+) -> None:
+    """`/dm CALL` drops that peer from the running unread tally so
+    subsequent notification lines no longer mention them."""
+    ui, store = _make_ui(tmp_path)
+    # Two unread peers accumulated.
+    ui.render_event({"t": "m", "fc": "M0FOO", "tc": "M0ABC", "m": "a", "ts": 1})
+    ui.render_event({"t": "m", "fc": "G0BAR", "tc": "M0ABC", "m": "b", "ts": 2})
+    capsys.readouterr()  # discard accumulated output
+    # Switch into M0FOO — this clears its counter.
+    asyncio.run(ui._handle_command("/dm M0FOO"))
+    capsys.readouterr()
+    # Another DM from G0BAR; the line must NOT mention M0FOO any more
+    # (its counter was cleared, even though we never visited).
+    ui.render_event({"t": "m", "fc": "G0BAR", "tc": "M0ABC", "m": "c", "ts": 3})
+    out = capsys.readouterr().out
+    assert "[New DMs from G0BAR (2)]" in out
+    assert "M0FOO" not in out
+    store.close()
+
+
+def test_notify_new_dms_batch_emits_single_summary(
+    tmp_path: Path, capsys
+) -> None:
+    """An `mb` batch coalesces non-target inbound items into ONE summary
+    line, not one per batch member — otherwise a fresh subscribe / pull
+    would scroll the prompt with notification spam."""
+    ui, store = _make_ui(tmp_path)
+    ui.render_event(
+        {
+            "t": "mb",
+            "m": [
+                {"fc": "M0FOO", "tc": "M0ABC", "m": "x", "ts": 1},
+                {"fc": "M0FOO", "tc": "M0ABC", "m": "y", "ts": 2},
+                {"fc": "G0BAR", "tc": "M0ABC", "m": "z", "ts": 3},
+            ],
+        }
+    )
+    out = capsys.readouterr().out
+    summary_lines = [l for l in out.splitlines() if l.startswith("[New DMs")]
+    assert len(summary_lines) == 1
+    # Counts reflect all three batch members; ordering is by count desc.
+    assert summary_lines[0] == "[New DMs from M0FOO (2), G0BAR (1)]"
+    # No bodies leaked through.
+    for body in ("x", "y", "z"):
+        assert body not in out.replace("M0FOO", "").replace("G0BAR", "")
+    store.close()
+
+
+def test_notify_new_posts_summarises_non_target_inbound(
+    tmp_path: Path, capsys
+) -> None:
+    """Live `cp` for a channel the user isn't /ch'd into is summarised as
+    `[New posts in CID:#name (N), CID2 (M)]` rather than printed in full.
+    Counts accumulate; the cid:name format collapses to bare cid when no
+    directory entry has a name for that channel."""
+    channels = [ChannelInfo(cid=5, name="lounge")]
+    ui, store = _make_ui(
+        tmp_path,
+        channels=channels,
+        options=SessionOptions(bell_on_activity=False),
+    )
+    # No /ch target → all incoming posts are non-target.
+    ui.render_event({"t": "cp", "cid": 5, "fc": "M0FOO", "p": "first", "ts": 1})
+    ui.render_event({"t": "cp", "cid": 5, "fc": "M0FOO", "p": "second", "ts": 2})
+    ui.render_event({"t": "cp", "cid": 9, "fc": "G0BAR", "p": "third", "ts": 3})
+    out = capsys.readouterr().out
+    # Bodies must never appear — only the summary line.
+    assert "first" not in out
+    assert "second" not in out
+    assert "third" not in out
+    lines = [l for l in out.splitlines() if l]
+    assert lines[0] == "[New posts in 5:#lounge (1)]"
+    assert lines[1] == "[New posts in 5:#lounge (2)]"
+    # cid 9 has no directory entry → bare cid form.
+    assert lines[2] == "[New posts in 5:#lounge (2), 9 (1)]"
+    store.close()
+
+
+def test_notify_new_posts_off_is_silent_for_non_target(
+    tmp_path: Path, capsys
+) -> None:
+    """notify_new_posts = off keeps non-target post bodies suppressed
+    AND suppresses the notification line — fully silent."""
+    channels = [ChannelInfo(cid=5, name="lounge")]
+    ui, store = _make_ui(
+        tmp_path,
+        channels=channels,
+        options=SessionOptions(notify_new_posts=False),
+    )
+    ui.render_event({"t": "cp", "cid": 5, "fc": "M0FOO", "p": "hidden", "ts": 1})
+    out = capsys.readouterr().out
+    assert "hidden" not in out
+    assert "New posts in" not in out
+    store.close()
+
+
+def test_notify_new_posts_renders_in_full_for_active_target(
+    tmp_path: Path, capsys
+) -> None:
+    """When /ch'd into the channel, the post body renders in full and
+    no summary line is printed."""
+    channels = [ChannelInfo(cid=5, name="lounge")]
+    ui, store = _make_ui(tmp_path, channels=channels)
+    ui._target = ("ch", "5")
+    ui.render_event({"t": "cp", "cid": 5, "fc": "M0FOO", "p": "visible", "ts": 1})
+    out = capsys.readouterr().out
+    assert "visible" in out
+    assert "New posts in" not in out
+    store.close()
+
+
+def test_notify_new_posts_outbound_echo_always_renders(
+    tmp_path: Path, capsys
+) -> None:
+    """Our own outbound posts (cp echo with fc == my_call) always render
+    in full, regardless of the current target — they aren't 'unread' to
+    summarise."""
+    channels = [ChannelInfo(cid=5, name="lounge")]
+    ui, store = _make_ui(tmp_path, channels=channels)
+    # No /ch target.
+    ui.render_event(
+        {"t": "cp", "cid": 5, "fc": "M0ABC", "p": "outbound", "ts": 1}
+    )
+    out = capsys.readouterr().out
+    assert "outbound" in out
+    assert "New posts in" not in out
+    store.close()
+
+
+def test_ch_command_clears_unread_for_that_channel(
+    tmp_path: Path, capsys
+) -> None:
+    """`/ch CID` drops that cid from the running unread tally so
+    subsequent notification lines no longer mention it."""
+    channels = [
+        ChannelInfo(cid=5, name="lounge"),
+        ChannelInfo(cid=7, name="packet"),
+    ]
+    ui, store = _make_ui(
+        tmp_path,
+        channels=channels,
+        options=SessionOptions(bell_on_activity=False),
+    )
+    # Mark ch 5 subscribed so /ch 5 doesn't trigger the subscribe
+    # prompt — that path reads from stdin which the test harness
+    # can't drive.
+    store.set_subscription(5, True)
+    ui.render_event({"t": "cp", "cid": 5, "fc": "M0FOO", "p": "a", "ts": 1})
+    ui.render_event({"t": "cp", "cid": 7, "fc": "G0BAR", "p": "b", "ts": 2})
+    capsys.readouterr()
+    asyncio.run(ui._handle_command("/ch 5"))
+    capsys.readouterr()
+    # New post on ch 7; the line must NOT mention ch 5.
+    ui.render_event({"t": "cp", "cid": 7, "fc": "G0BAR", "p": "c", "ts": 3})
+    out = capsys.readouterr().out
+    summary = [l for l in out.splitlines() if l.startswith("[New posts in")]
+    assert summary == ["[New posts in 7:#packet (2)]"]
+    store.close()
+
+
+def test_notify_new_posts_batch_emits_single_summary(
+    tmp_path: Path, capsys
+) -> None:
+    """A `cpb` batch coalesces non-target inbound posts into ONE summary
+    line — same parallel as the `mb` case for DMs. Outbound items in the
+    same batch still render in full."""
+    channels = [ChannelInfo(cid=5, name="lounge")]
+    ui, store = _make_ui(
+        tmp_path,
+        channels=channels,
+        options=SessionOptions(bell_on_activity=False),
+    )
+    ui.render_event(
+        {
+            "t": "cpb",
+            "cid": 5,
+            "p": [
+                {"fc": "M0FOO", "p": "x", "ts": 1},
+                {"fc": "G0BAR", "p": "y", "ts": 2},
+                # Outbound — should render in full inside the batch
+                # rather than count toward the summary.
+                {"fc": "M0ABC", "p": "z-mine", "ts": 3},
+            ],
+        }
+    )
+    out = capsys.readouterr().out
+    summary = [l for l in out.splitlines() if l.startswith("[New posts in")]
+    assert summary == ["[New posts in 5:#lounge (2)]"]
+    # Own post body still renders.
+    assert "z-mine" in out
+    # Inbound bodies do not.
+    assert "x" not in out.replace("\\x", "")  # rough body-absence check
     store.close()
 
 

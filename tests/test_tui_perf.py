@@ -227,7 +227,8 @@ def test_emoji_prompt_debounce_coalesces_rapid_keystrokes(tmp_path: Path) -> Non
                 # 60 ms debounce — small enough that the test stays
                 # quick, large enough that successive ``set_value``
                 # calls clearly land inside the window.
-                prompt = EmojiPrompt(debounce_ms=60)
+                prompt = EmojiPrompt()
+                prompt._debounce_ms = 60
                 await app.push_screen(prompt)
                 await pilot.pause()
 

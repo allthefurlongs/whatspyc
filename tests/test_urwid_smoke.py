@@ -300,7 +300,7 @@ def test_modals_render_at_small_sizes(tmp_path: Path) -> None:
         modals = [
             ActionMenu(allow_edit=True, allow_resend=True),
             HelpScreen(),
-            EmojiPrompt(debounce_ms=0),
+            EmojiPrompt(),
             SubscribeModal(
                 cid=5, ref="#lounge", do_subscribe=do_sub,
                 default_count_for=lambda pc: min(10, pc),
@@ -338,7 +338,7 @@ def test_emoji_prompt_renders_at_modest_overlay(tmp_path: Path) -> None:
     triggered a 3-item subgroup tab bar), and render the shell."""
     ui, app, store = _make_app(tmp_path)
     try:
-        modal = EmojiPrompt(debounce_ms=0)
+        modal = EmojiPrompt()
         modal.attach(app)
         # Trigger subgroup tab strip by switching to People & Body.
         modal._on_top_tab_change("People & Body")
@@ -384,7 +384,7 @@ def test_modals_render(tmp_path: Path) -> None:
 
         modals = [
             HelpScreen(),
-            EmojiPrompt(debounce_ms=200),
+            EmojiPrompt(),
             SubscribeModal(
                 cid=5, ref="#lounge",
                 do_subscribe=do_sub,
@@ -754,7 +754,7 @@ def test_help_screen_focused_on_unknown_command(tmp_path: Path) -> None:
 def test_emoji_prompt_initial_view_is_quick_picks(tmp_path: Path) -> None:
     ui, app, store = _make_app(tmp_path)
     try:
-        modal = EmojiPrompt(debounce_ms=0)
+        modal = EmojiPrompt()
         body = modal.attach(app)
         assert body is not None
         # Quick-picks tab is active by default and entries are populated.
@@ -780,7 +780,7 @@ def test_emoji_prompt_enter_picks_focused_button_not_first(tmp_path: Path) -> No
     try:
         loop = _asyncio.new_event_loop()
         try:
-            modal = EmojiPrompt(debounce_ms=0)
+            modal = EmojiPrompt()
             modal.future = loop.create_future()
             modal._app = app
             modal.build()
@@ -835,7 +835,7 @@ def test_emoji_button_mouse_click_dismisses_with_own_char(tmp_path: Path) -> Non
     try:
         loop = _asyncio.new_event_loop()
         try:
-            modal = EmojiPrompt(debounce_ms=0)
+            modal = EmojiPrompt()
             modal.future = loop.create_future()
             modal._app = app
             modal.build()

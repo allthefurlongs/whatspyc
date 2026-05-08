@@ -1,8 +1,11 @@
-"""prompt_toolkit-based interactive line UI.
+"""Interactive line UI built on plain stdin/stdout for maximum
+terminal compatibility.
 
-Renders incoming WPS messages above the prompt without garbling the input
-line, via ``patch_stdout``. Slash-command parsing routes through the
-provided ``WpsClient``.
+Targets the oldest / least capable terminals (BPQ TNC consoles, serial
+terminals, minimal embedded shells) — no cursor positioning, no ANSI
+redraw, just `print()` and a blocking `sys.stdin.readline()` run in an
+executor so the asyncio event loop keeps turning. Slash-command
+parsing routes through the provided ``WpsClient``.
 """
 
 from __future__ import annotations
@@ -12,9 +15,6 @@ import datetime
 import sys
 import time
 from typing import Callable
-
-from prompt_toolkit import PromptSession
-from prompt_toolkit.patch_stdout import patch_stdout
 
 from whatspyc.config import ChannelInfo
 from whatspyc.ui import help as help_data
@@ -41,7 +41,20 @@ class LineUI:
         self._options = options or SessionOptions()
         self._offline = offline
         self._target: tuple[str, str] | None = None  # ("dm", call) or ("ch", str(cid))
-        self._session: PromptSession = PromptSession()
+        # Per-peer count of inbound live DMs that have arrived since the
+        # user last visited that thread. Drives the [New DMs from X (N)]
+        # notification shown in place of the full body when the user
+        # isn't currently /dm'd into that peer. Cleared per-peer on
+        # /dm CALL. Independent of the connect-time aggregation in
+        # cli.py — that prints once and is forgotten; this tracker only
+        # follows live arrivals after the connect window closes.
+        self._unread_dms: dict[str, int] = {}
+        # Per-channel count of inbound live posts (cp / cpb) for
+        # channels other than the current /ch target. Drives the
+        # [New posts in CID:#name (N)] notification. Cleared per-cid
+        # on /ch CID. Outbound echoes (own posts) are excluded — they
+        # always render in full regardless of target.
+        self._unread_posts: dict[int, int] = {}
         self._stop = asyncio.Event()
         # Set to "terminal" when the link drops with no auto-reconnect or
         # after auto-reconnect gives up; the cli reads this after run()
@@ -54,18 +67,15 @@ class LineUI:
         Called with stdout already patched (see ``run``)."""
         t = obj.get("t")
         if t == "m":
-            self._render_dm(obj)
+            self._handle_live_dm(obj)
             self._maybe_bell()
         elif t == "mb":
-            for m in obj.get("m", []):
-                self._render_dm(m)
+            self._handle_live_dm_batch(obj.get("m", []))
         elif t == "cp":
-            self._render_post(obj.get("cid"), obj)
+            self._handle_live_post(obj.get("cid"), obj)
             self._maybe_bell()
         elif t == "cpb":
-            cid = obj.get("cid")
-            for p in obj.get("p", []):
-                self._render_post(cid, p)
+            self._handle_live_post_batch(obj.get("cid"), obj.get("p", []))
         elif t == "mr":
             if self._options.show_acks:
                 print(self._fmt_mr_ack(obj))
@@ -136,10 +146,8 @@ class LineUI:
     def _maybe_bell(self) -> None:
         """Ring the terminal bell when ``bell_on_activity`` is on.
 
-        prompt_toolkit's ``patch_stdout`` will route the BEL byte
-        through its renderer; the byte is non-printing so it doesn't
-        disturb the visible buffer — the terminal emulator translates
-        it to whatever (audible / visual / nothing) the user has
+        Plain BEL byte to stdout — the terminal emulator translates it
+        to whatever (audible / visual / nothing) the user has
         configured.
         """
         if not self._options.bell_on_activity:
@@ -148,52 +156,73 @@ class LineUI:
         sys.stdout.flush()
 
     def _signal_terminal_link_loss(self) -> None:
-        """Mark the session as ended due to an unrecoverable disconnect and
-        wake the prompt loop so ``run()`` returns immediately rather than
-        waiting for the user to hit Enter."""
+        """Mark the session as ended due to an unrecoverable disconnect
+        and wake the prompt loop so ``run()`` returns immediately rather
+        than waiting for the user to hit Enter. Setting ``self._stop``
+        is sufficient — ``_read_line`` races the executor read against
+        ``self._stop.wait()``."""
         if self.exit_reason is not None:
             return
         self.exit_reason = "terminal"
         self._stop.set()
+
+    async def _read_line(self) -> str | None:
+        """Read one line from stdin, or return None if the session is
+        stopping or stdin reached EOF.
+
+        Uses run_in_executor so the blocking readline doesn't pin the
+        event loop, and races against ``self._stop`` so an unrecoverable
+        link-drop wakes the loop without waiting for the user to press
+        Enter. The read thread continues running until stdin returns;
+        that's fine because the program is exiting.
+        """
+        loop = asyncio.get_running_loop()
+        read_fut = loop.run_in_executor(None, sys.stdin.readline)
+        stop_task = asyncio.create_task(self._stop.wait())
         try:
-            app = self._session.app
-            if app.is_running:
-                app.exit()
-        except Exception:
-            pass
+            await asyncio.wait(
+                {read_fut, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if self._stop.is_set():
+                return None
+            line = read_fut.result()
+            if line == "":  # EOF
+                return None
+            return line.rstrip("\n").rstrip("\r")
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
 
     async def run(self) -> None:
         """Run until the user types ``/quit`` or the link drops."""
-        with patch_stdout():
+        if self._offline:
             print()
-            if self._offline:
-                print("Offline mode — browsing local store, no connection")
-                print(
-                    "/h for help, /quit to quit, /list to view stored "
-                    "channels and DM threads"
-                )
-            else:
-                print("Connected to WPS")
-                print("/h for help, /quit to quit, /list to view channels")
-            print()
-            while not self._stop.is_set():
-                try:
-                    prompt_text = self._prompt_label()
-                    line = await self._session.prompt_async(prompt_text)
-                except (EOFError, KeyboardInterrupt):
-                    break
-                if line is None:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    if line.startswith("/"):
-                        await self._handle_command(line)
-                    else:
-                        await self._send_to_target(line)
-                except Exception as exc:  # surface to user without dying
-                    print(f"[error] {exc}")
+            print("Offline mode — browsing local store, no connection")
+            print(
+                "/h for help, /quit to quit, /list to view stored "
+                "channels and DM threads"
+            )
+        else:
+            print("/h for help, /quit to quit, /list to view channels")
+        print()
+        while not self._stop.is_set():
+            if self._target is None:
+                sys.stdout.write(self._prompt_label())
+                sys.stdout.flush()
+            line = await self._read_line()
+            if line is None:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                if line.startswith("/"):
+                    await self._handle_command(line)
+                else:
+                    await self._send_to_target(line)
+            except Exception as exc:  # surface to user without dying
+                print(f"[error] {exc}")
 
     def _print_channels(self) -> None:
         print("Channels: /ch <id> or /ch <name> to switch")
@@ -284,7 +313,71 @@ class LineUI:
                     self._print_post(
                         r["channel_id"], r["from_call"], r["ts"], r["body"],
                         reply_prefix=self._reply_prefix("ch", str(int(key)), r),
+                        lid=r["lid"],
                     )
+
+    def _dm_peer(self, m: dict) -> tuple[str, bool]:
+        """Return (peer_callsign, is_outbound) for a DM-shaped dict.
+
+        ``is_outbound`` is True when the DM was sent by us (``fc`` matches
+        ``my_call``); the peer is then ``tc``. Otherwise the peer is
+        ``fc``. Both halves are uppercased for comparison-stable use as
+        dict keys / target tuples.
+        """
+        my = self._my_call.upper()
+        fc = (m.get("fc") or "").upper()
+        is_outbound = fc == my
+        peer = (m.get("tc") if is_outbound else m.get("fc")) or ""
+        return peer.upper(), is_outbound
+
+    def _is_dm_target(self, peer: str) -> bool:
+        return self._target is not None and self._target == ("dm", peer)
+
+    def _handle_live_dm(self, m: dict) -> None:
+        """Live ``m`` event: render in full when it belongs to the current
+        thread (or it's our own outbound echo); otherwise summarise as
+        ``[New DMs from X (N)]`` per the ``notify_new_dms`` option."""
+        peer, is_outbound = self._dm_peer(m)
+        if is_outbound or self._is_dm_target(peer):
+            self._render_dm(m)
+            return
+        self._unread_dms[peer] = self._unread_dms.get(peer, 0) + 1
+        if self._options.notify_new_dms:
+            print(self._fmt_unread_dm_notice())
+
+    def _handle_live_dm_batch(self, items: list[dict]) -> None:
+        """``mb`` event: render target / outbound items in full and
+        coalesce non-target inbound items into a single notification
+        line at the end (instead of one notification per batch member).
+        """
+        suppressed = 0
+        for m in items:
+            peer, is_outbound = self._dm_peer(m)
+            if is_outbound or self._is_dm_target(peer):
+                self._render_dm(m)
+                continue
+            self._unread_dms[peer] = self._unread_dms.get(peer, 0) + 1
+            suppressed += 1
+        if suppressed and self._options.notify_new_dms:
+            print(self._fmt_unread_dm_notice())
+
+    def _fmt_unread_dm_notice(self) -> str:
+        """Format the running unread-DM notification line.
+
+        Same shape as cli.py's connect-time ``[New DMs from CALL (N)]``
+        summary so the user sees a single consistent style for "you have
+        new DMs you haven't opened yet" — most-counts first, then
+        callsign-alphabetical, dropped peers (count == 0) skipped.
+        """
+        active = [(c, n) for c, n in self._unread_dms.items() if n > 0]
+        if not active:
+            return ""
+        ordered = sorted(active, key=lambda kv: (-kv[1], kv[0]))
+        return (
+            "[New DMs from "
+            + ", ".join(f"{call} ({n})" for call, n in ordered)
+            + "]"
+        )
 
     def _render_dm(self, m: dict) -> None:
         """Render a freshly-arrived ``m``-shaped dict (from `m` or one
@@ -303,16 +396,91 @@ class LineUI:
             reply_prefix=self._reply_prefix("dm", "", m),
         )
 
+    def _is_ch_target(self, cid: int) -> bool:
+        return self._target is not None and self._target == ("ch", str(cid))
+
+    def _is_outbound_post(self, p: dict) -> bool:
+        fc = (p.get("fc") or "").upper()
+        return fc == self._my_call.upper()
+
+    def _handle_live_post(self, cid: int | None, p: dict) -> None:
+        """Live ``cp`` event: render in full when it belongs to the
+        current /ch target (or it's our own outbound echo); otherwise
+        summarise as ``[New posts in CID:#name (N)]`` per the
+        ``notify_new_posts`` option. ``cid is None`` is treated as
+        non-target and ignored — the protocol shouldn't send a `cp`
+        without a cid, but defensively we don't track unknown channels.
+        """
+        if cid is None:
+            self._render_post(cid, p)
+            return
+        cid_int = int(cid)
+        if self._is_outbound_post(p) or self._is_ch_target(cid_int):
+            self._render_post(cid_int, p)
+            return
+        self._unread_posts[cid_int] = self._unread_posts.get(cid_int, 0) + 1
+        if self._options.notify_new_posts:
+            print(self._fmt_unread_posts_notice())
+
+    def _handle_live_post_batch(self, cid: int | None, items: list[dict]) -> None:
+        """``cpb`` event: render target / outbound items in full and
+        coalesce non-target inbound items into a single notification
+        line at the end (parallels the ``mb`` handling)."""
+        if cid is None:
+            for p in items:
+                self._render_post(cid, p)
+            return
+        cid_int = int(cid)
+        suppressed = 0
+        for p in items:
+            if self._is_outbound_post(p) or self._is_ch_target(cid_int):
+                self._render_post(cid_int, p)
+                continue
+            self._unread_posts[cid_int] = self._unread_posts.get(cid_int, 0) + 1
+            suppressed += 1
+        if suppressed and self._options.notify_new_posts:
+            print(self._fmt_unread_posts_notice())
+
+    def _fmt_channel_short(self, cid: int) -> str:
+        """``5:#lounge`` when the directory has a name, bare ``5`` otherwise.
+
+        Compact form used inside the running [New posts in ...] line —
+        differs from ``_channel_ref`` (which reads ``ch 5 #lounge``) so
+        the notification line stays tight when several channels are
+        listed together.
+        """
+        name = self._channel_name(cid)
+        return f"{cid}:#{name}" if name else str(cid)
+
+    def _fmt_unread_posts_notice(self) -> str:
+        """Format the running unread-posts notification line.
+
+        Most-counts first, then cid-ascending, dropped channels
+        (count == 0) skipped — same ordering convention as the DM
+        unread tally so the two lines look familiar side-by-side.
+        """
+        active = [(cid, n) for cid, n in self._unread_posts.items() if n > 0]
+        if not active:
+            return ""
+        ordered = sorted(active, key=lambda kv: (-kv[1], kv[0]))
+        return (
+            "[New posts in "
+            + ", ".join(
+                f"{self._fmt_channel_short(cid)} ({n})" for cid, n in ordered
+            )
+            + "]"
+        )
+
     def _render_post(self, cid: int | None, p: dict) -> None:
-        if self._options.verbose_history and cid is not None:
-            row = self._lookup_post(int(cid), p)
-            if row is not None:
-                print(self._fmt_post_verbose(row))
-                return
+        row = self._lookup_post(int(cid), p) if cid is not None else None
+        if self._options.verbose_history and row is not None:
+            print(self._fmt_post_verbose(row))
+            return
         target_key = str(int(cid)) if cid is not None else ""
         self._print_post(
             cid, p.get("fc"), p.get("ts"), p.get("p"),
             reply_prefix=self._reply_prefix("ch", target_key, p),
+            lid=row.get("lid") if row else None,
         )
 
     def _lookup_message(self, m: dict) -> dict | None:
@@ -356,9 +524,11 @@ class LineUI:
         body: str | None,
         *,
         reply_prefix: str = "",
+        lid: int | None = None,
     ) -> None:
         prefix = self._channel_prefix(int(cid)) if cid is not None else ""
-        print(f"{prefix}{self._fmt_ts(ts)} {self._fmt_call(fc)}: {reply_prefix}{body}")
+        id_part = f"id:{lid} " if lid is not None else ""
+        print(f"{prefix}{id_part}{self._fmt_ts(ts)} {self._fmt_call(fc)}: {reply_prefix}{body}")
 
     def _reply_prefix(self, kind: str, target_key: str, row: dict) -> str:
         """Plain-text reply preview prefix for one row, or ``""``.
@@ -849,12 +1019,16 @@ class LineUI:
         await self._client.request_post_batch(cid, min(n, pc))
 
     async def _prompt_for_count(self, prompt_text: str, *, default: int) -> int:
-        """Ask for an integer count via the prompt-toolkit session.
+        """Ask for an integer count via stdin.
 
-        Empty input → ``default``. Non-integer input → ``default`` with a
-        warning. Pulled out as a method so tests can monkey-patch it.
+        Empty input (or link-drop / EOF) → ``default``. Non-integer
+        input → ``default`` with a warning. Pulled out as a method so
+        tests can monkey-patch it.
         """
-        raw = (await self._session.prompt_async(prompt_text)).strip()
+        sys.stdout.write(prompt_text)
+        sys.stdout.flush()
+        line = await self._read_line()
+        raw = (line or "").strip()
         if not raw:
             return default
         try:
@@ -864,10 +1038,13 @@ class LineUI:
             return default
 
     async def _prompt_yes_no(self, prompt_text: str, *, default: bool = False) -> bool:
-        """Ask a yes/no question. Empty input → ``default``. ``y``/``yes``
-        → True, anything else → False. Pulled out as a method so tests can
-        monkey-patch it."""
-        raw = (await self._session.prompt_async(prompt_text)).strip().lower()
+        """Ask a yes/no question. Empty input (or link-drop / EOF) →
+        ``default``. ``y``/``yes`` → True, anything else → False. Pulled
+        out as a method so tests can monkey-patch it."""
+        sys.stdout.write(prompt_text)
+        sys.stdout.flush()
+        line = await self._read_line()
+        raw = (line or "").strip().lower()
         if not raw:
             return default
         return raw in ("y", "yes")
@@ -1108,7 +1285,13 @@ class LineUI:
                     return
                 await self._client.react_post(row["channel_id"], row["ts"], args[1])
         elif cmd == "/dm" and len(args) == 1:
-            self._target = ("dm", args[0].upper())
+            peer = args[0].upper()
+            self._target = ("dm", peer)
+            # Switching into the thread counts as "reading" any
+            # accumulated unread DMs from that peer — drop them from
+            # the running notice tally so subsequent [New DMs from ...]
+            # lines no longer mention this peer.
+            self._unread_dms.pop(peer, None)
             self._show_history(self._target, self._history_backfill)
         elif cmd == "/ch" and len(args) == 1:
             cid = self._resolve_channel(args[0])
@@ -1117,6 +1300,13 @@ class LineUI:
                 return
             previous_target = self._target
             self._target = ("ch", str(cid))
+            # Switching into the channel counts as "reading" any
+            # accumulated unread posts there — drop them from the
+            # running notice tally. Done here even when the subscribe
+            # prompt declines (we revert the target below) — a brief
+            # reset is harmless and avoids stale counts hanging on a
+            # channel the user just glanced at.
+            self._unread_posts.pop(cid, None)
             # History (from local store) goes first so the user has whatever
             # context they already have on screen, then the paused notice
             # or subscribe prompt sits right above the prompt where it
@@ -1165,5 +1355,9 @@ class LineUI:
                 print("[hint] /vhistory N: N must be a positive integer")
                 return
             self._show_history(self._target, n, verbose=True)
+        elif cmd == "/target" and not args:
+            print(self._prompt_label().rstrip())
+        elif cmd == "/back" and not args:
+            self._target = None
         else:
             print(f"[hint] unknown or malformed command: {line}")

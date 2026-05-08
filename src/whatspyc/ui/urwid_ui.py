@@ -209,7 +209,7 @@ def _format_connected_line(summary: ConnectSummary) -> str:
     """Compose the one-line summary shown when the link is up. Same
     text as cli.py's pre-UI ``[Connected]`` echo."""
     parts = [
-        f"{summary.server_message_count} new DMs",
+        f"{summary.received_message_count} new DMs",
         f"{summary.server_post_count} new posts",
     ]
     if summary.paused_channels:
@@ -1004,7 +1004,7 @@ class HelpScreen(_Modal):
                 rows.append(urwid.Text(line))
             rows.append(urwid.Divider())
             rows.append(urwid.Text(("bold", "Slash commands")))
-            for line in help_data.list_lines(hide={"/list", "/users"}):
+            for line in help_data.list_lines(hide={"/list", "/users", "/target", "/back"}):
                 rows.append(urwid.Text(line))
         else:
             detail = help_data.detail_lines(self._focus)
@@ -1457,7 +1457,10 @@ class SettingsModal(_Modal):
 
     def build(self) -> urwid.Widget:
         items: list[urwid.Widget] = []
-        for name in self._options.names():
+        # Skip line-UI-only options (e.g. notify_new_dms) — they have no
+        # effect in the urwid backend, so showing them in this modal
+        # would just confuse users.
+        for name in self._options.names(include_line_only=False):
             row = _FocusableText(
                 self._row_markup(name),
                 on_activate=lambda n=name: self._edit(n),
@@ -1579,9 +1582,9 @@ class EmojiPrompt(_Modal):
 
     title = "Emoji"
 
-    def __init__(self, *, debounce_ms: int = 0) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._debounce_ms = max(0, int(debounce_ms))
+        self._debounce_ms = 200
         self._search_input = urwid.Edit("search: ")
         self._fallback_input = urwid.Edit("hex/literal: ")
         self._caption = urwid.Text("")
@@ -2670,22 +2673,27 @@ class _UrwidApp:
         for ch in self._ui._channels:
             label = f"☐ {ch.cid} #{ch.name}"
             widest = max(widest, len(label))
-        try:
-            for row in self._ui._client._store.list_channels():  # type: ignore[attr-defined]
-                cid = int(row["cid"])
-                name = row.get("name") or ""
-                label = f"☑ {cid} #{name}"
-                widest = max(widest, len(label))
-        except Exception:
-            pass
-        # DM peers from the store: ``2E0XYZ Matt`` style. Method is
-        # ``list_dm_peers(my_call)``; rows look like
-        # ``{"peer": CALL, "last_ts": ms, "count": N}``.
-        try:
-            for row in self._ui._client._store.list_dm_peers(self._ui._my_call):  # type: ignore[attr-defined]
-                widest = max(widest, len(row.get("peer", "") or "") + 16)
-        except Exception as e:
-            _log.warning("_compute_left_pane_width DM peers: %s", e)
+        # _build_widgets runs before the bootstrap connects, so the
+        # client (and its store) may not exist yet on first call.
+        client = self._ui._client
+        store = getattr(client, "_store", None) if client is not None else None
+        if store is not None:
+            try:
+                for row in store.list_channels():
+                    cid = int(row["cid"])
+                    name = row.get("name") or ""
+                    label = f"☑ {cid} #{name}"
+                    widest = max(widest, len(label))
+            except Exception:
+                pass
+            # DM peers from the store: ``2E0XYZ Matt`` style. Method is
+            # ``list_dm_peers(my_call)``; rows look like
+            # ``{"peer": CALL, "last_ts": ms, "count": N}``.
+            try:
+                for row in store.list_dm_peers(self._ui._my_call):
+                    widest = max(widest, len(row.get("peer", "") or "") + 16)
+            except Exception as e:
+                _log.warning("_compute_left_pane_width DM peers: %s", e)
         return max(24, widest + 6)
 
     # ------------------------------------------------------------------
@@ -3827,8 +3835,7 @@ class _UrwidApp:
     async def _do_react(self, row: _MessageRow) -> None:
         if self._refuse_offline("reacting"):
             return
-        debounce = self._ui._options.emoji_search_debounce_ms
-        modal = EmojiPrompt(debounce_ms=debounce)
+        modal = EmojiPrompt()
         emoji = await self._show_modal(modal)
         if not emoji:
             return
@@ -4530,7 +4537,10 @@ class _UrwidApp:
             if walker is not None:
                 row = self._build_row_from_wire("dm", target, m)
                 self._mount_row_obj(target, walker, row, append=True)
-        else:
+        elif fc != self._ui._my_call:
+            # Self-sent echoes (from another session) don't count toward
+            # unread — match the [Connected] line's "from someone else"
+            # semantics.
             self._unread[target] = self._unread.get(target, 0) + 1
             self._refresh_target_label(target)
             self._refresh_tab_labels()
@@ -4554,13 +4564,19 @@ class _UrwidApp:
             self._refresh_tab_labels()
 
     async def _handle_inbound_dm_batch(self, items: list[dict]) -> None:
-        # Group by peer.
+        # Group by peer; track per-target inbound (non-self) count so
+        # unread badges match the [Connected] line's "from someone else"
+        # count.
         by_peer: dict[str, list[dict]] = {}
+        inbound_counts: dict[str, int] = {}
+        my_call = self._ui._my_call
         for m in items:
             fc = (m.get("fc") or "").upper()
             tc = (m.get("tc") or "").upper()
-            peer = tc if fc == self._ui._my_call else fc
+            peer = tc if fc == my_call else fc
             by_peer.setdefault(peer, []).append(m)
+            if fc != my_call:
+                inbound_counts[peer] = inbound_counts.get(peer, 0) + 1
         active = self._active_target()
         for peer, msgs in by_peer.items():
             target = ("dm", peer)
@@ -4574,9 +4590,11 @@ class _UrwidApp:
                     row = self._build_row_from_wire("dm", target, m, bulk=bulk)
                     self._mount_row_obj(target, walker, row, append=True)
             else:
-                self._unread[target] = self._unread.get(target, 0) + len(msgs)
-                self._refresh_target_label(target)
-                self._refresh_tab_labels()
+                inbound = inbound_counts.get(peer, 0)
+                if inbound:
+                    self._unread[target] = self._unread.get(target, 0) + inbound
+                    self._refresh_target_label(target)
+                    self._refresh_tab_labels()
 
     async def _handle_inbound_post_batch(self, cid: int, items: list[dict]) -> None:
         target = ("ch", str(cid))
@@ -5055,8 +5073,7 @@ class _UrwidApp:
         self._refresh_active_rows()
 
     def action_insert_emoji(self) -> None:
-        debounce = self._ui._options.emoji_search_debounce_ms
-        modal = EmojiPrompt(debounce_ms=debounce)
+        modal = EmojiPrompt()
 
         async def _wait() -> None:
             picked = await self._show_modal(modal)
