@@ -952,6 +952,10 @@ async def _connect_and_run_ui(
     """Run one connect-and-UI cycle. Returns ``"terminal"`` if the link
     dropped without recovery (cli should offer reconnect/quit), otherwise
     ``None`` (clean exit / cancelled connect — cli should stop)."""
+    # Snapshot before client.open(): inbound DMs / subscriptions land
+    # in the store as the connect burst arrives, so reading after open
+    # would always look "non-fresh".
+    is_fresh_connect = store.is_first_connect()
     seq = ConnectSequence(my_call=c.app_call)
 
     # Hold UI rendering until the connect sequence settles so the
@@ -1087,24 +1091,36 @@ async def _connect_and_run_ui(
             ui.render_event(obj)
     pending_events.clear()
     connect_done = True
-    parts = [
-        f"{summary.received_message_count} new DMs",
-        f"{summary.server_post_count} new posts",
-    ]
-    if summary.paused_channels:
-        n = len(summary.paused_channels)
-        parts.append(
-            f"{n} paused channel(s) — see /unpause hint(s) above"
-        )
-    click.echo()
-    click.echo("[Connected] " + ", ".join(parts))
-    if dm_senders:
-        ordered = sorted(dm_senders.items(), key=lambda kv: (-kv[1], kv[0]))
-        click.echo(
-            "[New DMs from "
-            + ", ".join(f"{call} ({n})" for call, n in ordered)
-            + "]"
-        )
+    if is_fresh_connect:
+        # Fresh-DB / first-ever connect: the server hardcodes mc=0 in
+        # `first_time_connect_handler` and replays per-peer `mb` batches
+        # whose arrival can straddle the connect-quiescence window on
+        # slow packet links. A "0 new DMs" or under-counted line would
+        # mislead the user — instead, tell them traffic is incoming.
+        click.echo()
+        click.echo("[Connected]")
+        click.echo()
+        click.echo("First connection, existing DMs will sync in the background.")
+        click.echo()
+    else:
+        parts = [
+            f"{summary.received_message_count} new DMs",
+            f"{summary.server_post_count} new posts",
+        ]
+        if summary.paused_channels:
+            n = len(summary.paused_channels)
+            parts.append(
+                f"{n} paused channel(s) — see /unpause hint(s) above"
+            )
+        click.echo()
+        click.echo("[Connected] " + ", ".join(parts))
+        if dm_senders:
+            ordered = sorted(dm_senders.items(), key=lambda kv: (-kv[1], kv[0]))
+            click.echo(
+                "[New DMs from "
+                + ", ".join(f"{call} ({n})" for call, n in ordered)
+                + "]"
+            )
     try:
         await ui.run()
     finally:

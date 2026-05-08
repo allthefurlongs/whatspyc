@@ -1682,14 +1682,39 @@ def test_notify_new_dms_renders_in_full_for_active_target(
     store.close()
 
 
-def test_notify_new_dms_outbound_echo_always_renders(
+def test_notify_new_dms_outbound_echo_suppressed_when_no_target(
     tmp_path: Path, capsys
 ) -> None:
-    """Our own outbound DMs (server-echoed `m` with fc == my_call) are
-    always rendered in full, regardless of the current target — they
-    aren't 'unread DMs' to be summarised."""
+    """Outbound `m` (fc == my_call) arriving outside the matching `/dm`
+    thread is silently dropped — same suppression as the inbound
+    non-target case, just without the unread accounting (the user
+    already knows they sent it). The only path that emits these is
+    server replay (fresh-DB connect, rolled-back `lm`, second client),
+    none of which the user just typed; rendering them in full would
+    look like a phantom outbound mid-session."""
     ui, store = _make_ui(tmp_path)
     # No /dm target. The DM is from us to M0FOO.
+    ui.render_event(
+        {"t": "m", "fc": "M0ABC", "tc": "M0FOO", "m": "outbound", "ts": 1}
+    )
+    out = capsys.readouterr().out
+    assert "outbound" not in out
+    assert "New DMs from" not in out
+    # And the unread counter isn't bumped either — we don't have
+    # "unread of our own messages".
+    assert ui._unread_dms == {}
+    store.close()
+
+
+def test_notify_new_dms_outbound_renders_when_in_matching_target(
+    tmp_path: Path, capsys
+) -> None:
+    """When the user IS in `/dm M0FOO` and an outbound DM to M0FOO
+    arrives (e.g. echoed back by a server replay, or a freshly-typed
+    send), it renders in full — same path as inbound rows for the
+    active thread."""
+    ui, store = _make_ui(tmp_path)
+    ui._target = ("dm", "M0FOO")
     ui.render_event(
         {"t": "m", "fc": "M0ABC", "tc": "M0FOO", "m": "outbound", "ts": 1}
     )

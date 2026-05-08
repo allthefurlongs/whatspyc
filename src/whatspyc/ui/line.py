@@ -357,10 +357,20 @@ class LineUI:
 
     def _handle_live_dm(self, m: dict) -> None:
         """Live ``m`` event: render in full when it belongs to the current
-        thread (or it's our own outbound echo); otherwise summarise as
-        ``[New DMs from X (N)]`` per the ``notify_new_dms`` option."""
+        thread; otherwise summarise inbound rows as ``[New DMs from X
+        (N)]`` per ``notify_new_dms`` and silently drop outbound rows.
+
+        Outbound rows arriving here aren't fresh local sends — those
+        persist via the send path and the server doesn't echo them back.
+        The only way an `m` with ``fc == my_call`` reaches us is server
+        replay (fresh-DB connect, rolled-back ``lm``, second client).
+        We can't tell those apart from a freshly-typed send on the wire,
+        but we can tell from context: if it's a freshly-typed send, the
+        user is in the matching ``/dm`` thread, so the target check
+        already covers that case. Anything else, suppress.
+        """
         peer, is_outbound = self._dm_peer(m)
-        if is_outbound or self._is_dm_target(peer):
+        if self._is_dm_target(peer):
             self._render_dm(m)
             # Active-target arrival is read on landing — advance the
             # persistent cursor so this row isn't recounted as unread
@@ -368,23 +378,28 @@ class LineUI:
             if not is_outbound:
                 self._client._store.mark_dm_read(peer)  # type: ignore[attr-defined]
             return
+        if is_outbound:
+            return
         self._unread_dms[peer] = self._unread_dms.get(peer, 0) + 1
         if self._options.notify_new_dms:
             print(self._fmt_unread_dm_notice())
 
     def _handle_live_dm_batch(self, items: list[dict]) -> None:
-        """``mb`` event: render target / outbound items in full and
-        coalesce non-target inbound items into a single notification
-        line at the end (instead of one notification per batch member).
+        """``mb`` event: render target items in full, coalesce non-target
+        inbound items into a single notification line at the end (instead
+        of one notification per batch member), and silently drop
+        non-target outbound items — see :meth:`_handle_live_dm`.
         """
         suppressed = 0
         active_inbound_peers: set[str] = set()
         for m in items:
             peer, is_outbound = self._dm_peer(m)
-            if is_outbound or self._is_dm_target(peer):
+            if self._is_dm_target(peer):
                 self._render_dm(m)
                 if not is_outbound:
                     active_inbound_peers.add(peer)
+                continue
+            if is_outbound:
                 continue
             self._unread_dms[peer] = self._unread_dms.get(peer, 0) + 1
             suppressed += 1

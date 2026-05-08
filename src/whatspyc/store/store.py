@@ -821,6 +821,26 @@ class SqliteStore:
         cur = self._conn.execute("SELECT * FROM channels ORDER BY cid")
         return [dict(r) for r in cur.fetchall()]
 
+    def is_first_connect(self) -> bool:
+        """True iff the store has never seen a DM (``last_message == 0``)
+        and has no subscribed channels — the same condition the server
+        uses to take the ``first_time_connect_handler`` branch
+        (``wps/wps.py:329``). The CLI uses this to format the connect
+        summary differently: the server's ``mc`` is hardcoded to 0 in
+        that branch, and the per-peer ``mb`` replays may straddle the
+        connect-quiescence window on slow links, so a count derived from
+        the window misleads the user about how many DMs are coming."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'last_message'"
+        ).fetchone()
+        last_msg = row["value"] if row is not None else 0
+        if last_msg:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM channels WHERE subscribed = 1 LIMIT 1"
+        ).fetchone()
+        return row is None
+
     # ------------------------------------------------------------------
     # Unread cursors (channels + DMs)
     # ------------------------------------------------------------------
