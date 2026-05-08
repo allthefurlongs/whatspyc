@@ -119,7 +119,7 @@ class Config:
     my_call: str | None = None
     name: str | None = None
     state_dir: Path = field(default_factory=lambda: _default_state_dir())
-    ui: str = "line"  # "line" or "textual" or "urwid"
+    ui: str = "urwid"  # "line" or "textual" or "urwid"
     default_profile: str | None = None
     # How many historic messages/posts to replay from the local store when
     # the user switches target. Live arrivals only ever show up after

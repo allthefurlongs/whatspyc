@@ -18,7 +18,7 @@ from textual.widgets import Input, ListView
 
 from whatspyc.store.store import SqliteStore
 from whatspyc.ui.options import SessionOptions
-from whatspyc.ui.tui import (
+from whatspyc.ui.textual_ui import (
     EmojiPrompt,
     MessageRow,
     TextualUI,
@@ -151,6 +151,121 @@ def test_refresh_online_pane_relabels_only_when_name_changes(tmp_path: Path) -> 
                 assert app._online_label_cache["M0AAA"] != first
         finally:
             store.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# Persistent unread cursors
+# ----------------------------------------------------------------------
+
+
+def test_unread_seeded_into_channel_label_at_session_start(tmp_path: Path) -> None:
+    """Channels with stored unread posts left from a previous session
+    must render with the (N) suffix in the channels list pane on first
+    start — without any wire events firing."""
+
+    async def _run() -> None:
+        # Previous session: subscribe + 3 inbound posts in #5; quit
+        # without reading them.
+        s = SqliteStore(tmp_path / "state.sqlite3")
+        s.set_subscription(5, True)
+        s.upsert_post(5, {"ts": 100, "fc": "G7BAR", "p": "a"})
+        s.upsert_post(5, {"ts": 200, "fc": "G7BAR", "p": "b"})
+        s.upsert_post(5, {"ts": 300, "fc": "G7BAR", "p": "c"})
+        s.close()
+
+        ui, store = _make_ui(tmp_path)
+        try:
+            app = _WhatspycApp(ui)
+            ui._app = app
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                # Seed populated _unread from the stored cursor.
+                target = ("ch", "5")
+                assert app._unread.get(target) == 3
+                # Channel list item shows the (3) suffix in its label.
+                lv = app.query_one("#channels", ListView)
+                labels = [
+                    str(item.query_one("Static").content)
+                    for item in lv.children
+                ]
+                assert any("(3)" in label for label in labels), (
+                    f"channel labels should contain '(3)' but were {labels!r}"
+                )
+        finally:
+            store.close()
+
+    asyncio.run(_run())
+
+
+def test_unread_seeded_in_session_driven_mode(tmp_path: Path) -> None:
+    """Reproduce the user's actual flow: client is None at on_mount,
+    set later in _on_client_ready, and _post_connect_setup runs from
+    the bootstrap. Per-channel unread (N) suffix should show on first
+    start with no wire events."""
+    from whatspyc.config import ConnectProfile
+    from whatspyc.ui.textual_ui import TextualUI
+
+    async def _run() -> None:
+        # Pre-seed the store as if a previous session left unread posts.
+        s = SqliteStore(tmp_path / "state.sqlite3")
+        s.set_subscription(5, True)
+        s.upsert_post(5, {"ts": 100, "fc": "G7BAR", "p": "a"})
+        s.upsert_post(5, {"ts": 200, "fc": "G7BAR", "p": "b"})
+        s.upsert_post(5, {"ts": 300, "fc": "G7BAR", "p": "c"})
+        s.close()
+
+        s2 = SqliteStore(tmp_path / "state.sqlite3")
+        online: list[str] = []
+
+        def make_client():
+            return SimpleNamespace(
+                _store=s2,
+                ham_name=lambda call: None,
+                online_users=lambda: list(online),
+                paused_channels=lambda: {},
+                is_auto_reconnect=False,
+                set_delivery_timeout_s=lambda v: None,
+                _online_list=online,
+            )
+
+        async def opener(profile, *, progress, on_event,
+                         on_client_ready=None):
+            c = make_client()
+            if on_client_ready:
+                on_client_ready(c)  # synchronous; sets client + seeds
+            return c, None
+
+        ui = TextualUI(
+            client=None,
+            my_call="M0ABC",
+            options=SessionOptions(),
+            connection_opener=opener,
+            available_profiles=[ConnectProfile(name="X")],
+            initial_profile=ConnectProfile(name="X"),
+            is_offline_profile=lambda p: True,  # take the offline branch
+        )
+        try:
+            app = _WhatspycApp(ui)
+            ui._app = app
+            async with app.run_test() as pilot:
+                # Wait long enough for the bootstrap worker to run and
+                # _post_connect_setup to populate the channels list.
+                await pilot.pause()
+                await pilot.pause()
+                target = ("ch", "5")
+                assert app._unread.get(target) == 3
+                lv = app.query_one("#channels", ListView)
+                labels = [
+                    str(item.query_one("Static").content)
+                    for item in lv.children
+                ]
+                assert any("(3)" in label for label in labels), (
+                    f"channel labels should contain '(3)' but were {labels!r}"
+                )
+        finally:
+            s2.close()
 
     asyncio.run(_run())
 

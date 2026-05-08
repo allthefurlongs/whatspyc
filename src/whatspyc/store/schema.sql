@@ -99,11 +99,25 @@ CREATE TABLE IF NOT EXISTS post_emojis (
 );
 
 CREATE TABLE IF NOT EXISTS channels (
-    cid         INTEGER PRIMARY KEY,
-    subscribed  INTEGER NOT NULL DEFAULT 0,
-    last_post   INTEGER NOT NULL DEFAULT 0,
-    last_emoji  INTEGER NOT NULL DEFAULT 0,
-    last_edit   INTEGER NOT NULL DEFAULT 0
+    cid           INTEGER PRIMARY KEY,
+    subscribed    INTEGER NOT NULL DEFAULT 0,
+    last_post     INTEGER NOT NULL DEFAULT 0,
+    last_emoji    INTEGER NOT NULL DEFAULT 0,
+    last_edit     INTEGER NOT NULL DEFAULT 0,
+    -- Per-channel "read up to" cursor (ms, matches post.ts unit). The
+    -- UI's unread count for a channel is the number of inbound posts
+    -- with ts > last_read_ts. Bumped to MAX(post.ts) when the user
+    -- activates the channel; survives restart so unread badges persist.
+    last_read_ts  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-DM-peer "read up to" cursor (seconds, matching DM ts unit on the
+-- wire). Same role as channels.last_read_ts but for DMs — kept in its
+-- own table because DM peers aren't otherwise modelled as a row (peers
+-- are derived from messages.from_call / to_call).
+CREATE TABLE IF NOT EXISTS dm_read (
+    peer          TEXT PRIMARY KEY,
+    last_read_ts  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS hams (

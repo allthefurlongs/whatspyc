@@ -2188,6 +2188,12 @@ class _WhatspycApp(App):
         # (kind, key) → unread count, displayed as " (N)" suffix in the
         # target list. Cleared on activation.
         self._unread: dict[TargetKey, int] = {}
+        # Set once after ``_seed_unread_from_store`` populates _unread
+        # from the persistent cursors. Guards against re-seeding on
+        # later post_connect_setup runs that might overlap with live
+        # arrivals — re-seeding would double-count any rows that the
+        # live path already incremented.
+        self._unread_seeded = False
 
         # (kind, key) → True once we've confirmed the store has nothing
         # older. Stops us hammering the store every time the cursor
@@ -2372,6 +2378,11 @@ class _WhatspycApp(App):
         connector has set ``self._ui._client``; in legacy mode it fires
         directly from on_mount.
         """
+        # Seed the per-target unread tally from the persistent cursors
+        # before populate computes per-target labels. Idempotent — a
+        # session-driven flow may have already seeded inside
+        # ``_on_client_ready``, ahead of any wire events arriving.
+        self._seed_unread_from_store()
         self._populate_initial_target_lists()
         if self._ui._client is not None:
             self._refresh_online_pane(self._ui._client.online_users())
@@ -2454,6 +2465,12 @@ class _WhatspycApp(App):
             peers = []
         for p in peers:
             self._add_target(("dm", p["peer"]))
+        # Tab badges sum across `_unread`, which `_add_target` may have
+        # just seeded from the persistent cursor. Refresh once after the
+        # whole bootstrap so badges reflect that initial state — without
+        # this, the (N) suffix on the inactive tab would only appear on
+        # the first tab switch.
+        self._refresh_tab_labels()
 
     # ------------------------------------------------------------------
     # Target list — left pane
@@ -2493,8 +2510,41 @@ class _WhatspycApp(App):
         for child in lv.children:
             if child.id == wid:
                 return
+        # ``_target_label`` reads ``_unread`` for the (N) suffix —
+        # ``_seed_unread_from_store`` runs once at session start
+        # (before any wire events flow) and pre-fills counts left over
+        # from the previous session, so the label here picks them up.
         label = self._target_label(target, unsubscribed=unsubscribed)
         lv.append(ListItem(Static(label, markup=True), id=wid))
+
+    def _seed_unread_from_store(self) -> None:
+        """Pre-fill ``_unread`` from the persistent cursors. Called once
+        per session, *before* any wire events are dispatched, so the
+        baseline reflects unread state left over from earlier sessions
+        without double-counting fresh arrivals (which the live
+        increment paths handle separately).
+
+        Idempotent: only fills entries that aren't already present, so
+        a late call after an inbound batch has bumped a target's count
+        won't clobber it.
+        """
+        if self._unread_seeded:
+            return
+        client = self._ui._client
+        if client is None or getattr(client, "_store", None) is None:
+            return
+        store = client._store  # type: ignore[attr-defined]
+        me = self._ui._my_call
+        try:
+            posts = store.unread_post_counts_all(me)
+            dms = store.unread_dm_counts_all(me)
+        except Exception:
+            return
+        for cid, n in posts.items():
+            self._unread.setdefault(("ch", str(cid)), n)
+        for peer, n in dms.items():
+            self._unread.setdefault(("dm", peer), n)
+        self._unread_seeded = True
 
     def _refresh_target_label(self, target: TargetKey) -> None:
         wid = self._target_id(target)
@@ -2505,9 +2555,9 @@ class _WhatspycApp(App):
         item.query_one(Static).update(self._target_label(target))
 
     def _refresh_tab_labels(self) -> None:
-        # Sum unread per kind and badge the *inactive* tab so the user
-        # sees activity in the hidden list. The active tab stays plain
-        # — its per-target rows already show (N) badges of their own.
+        # Sum unread per kind and badge both tabs regardless of which is
+        # active — the count ticks down (and the suffix disappears at 0)
+        # as the user reads individual channels / DMs.
         # ``Button.label`` is a reactive that re-renders but doesn't
         # re-layout — so a label growing from "DMs" to "DMs (3)" keeps
         # the button at its old width and silently clips the suffix.
@@ -2515,7 +2565,6 @@ class _WhatspycApp(App):
         bar = self._w_tabs
         if bar is None:
             return
-        active = getattr(bar, "_active_id", None)
         ch_unread = sum(n for (k, _), n in self._unread.items() if k == "ch" and n)
         dm_unread = sum(n for (k, _), n in self._unread.items() if k == "dm" and n)
         changed = False
@@ -2523,11 +2572,9 @@ class _WhatspycApp(App):
             if not isinstance(child, Button):
                 continue
             if child.id == "tab-channels":
-                show = ch_unread if active != "tab-channels" else 0
-                new_label = f"Channels ({show})" if show else "Channels"
+                new_label = f"Channels ({ch_unread})" if ch_unread else "Channels"
             elif child.id == "tab-dms":
-                show = dm_unread if active != "tab-dms" else 0
-                new_label = f"DMs ({show})" if show else "DMs"
+                new_label = f"DMs ({dm_unread})" if dm_unread else "DMs"
             else:
                 continue
             if str(child.label) != new_label:
@@ -2677,7 +2724,18 @@ class _WhatspycApp(App):
             for (k, t, _), row in self._rows.items():
                 if (k, t) == target:
                     self._refresh_row_label(row)
-        # Activating clears the unread count.
+        # Activating clears the unread count and advances the
+        # persistent read cursor so the count survives 0 across restart
+        # rather than coming back from the store.
+        kind, key = target
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        if kind == "dm":
+            store.mark_dm_read(key)
+        else:
+            try:
+                store.mark_channel_read(int(key))
+            except ValueError:
+                pass
         if self._unread.pop(target, 0):
             self._refresh_target_label(target)
             self._refresh_tab_labels()
@@ -3427,6 +3485,14 @@ class _WhatspycApp(App):
 
         def _on_client_ready(c: WpsClient) -> None:
             self._ui._client = c
+            # Snapshot per-target unread state from the persistent
+            # cursors before any wire events flow. Doing it here (rather
+            # than in _post_connect_setup, after the connect window) is
+            # what avoids double-counting cpb-during-connect rows: the
+            # client persists each row before dispatching the event, so
+            # a later seed would scan the store and re-add the same
+            # rows the live increment paths have already counted.
+            self._seed_unread_from_store()
 
         client, summary = await self._ui._connection_opener(  # type: ignore[misc]
             profile,
@@ -3466,6 +3532,12 @@ class _WhatspycApp(App):
             # Set before client.open() returns so events from the
             # post-handshake reader_task hit a real client.
             self._ui._client = c
+            # Snapshot per-target unread state from the persistent
+            # cursors before any wire events arrive — the client
+            # persists each row before dispatching, so a later seed
+            # would double-count anything the live path has already
+            # incremented. See ``_seed_unread_from_store``.
+            self._seed_unread_from_store()
 
         async def _runner() -> None:
             try:
@@ -4107,6 +4179,10 @@ class _WhatspycApp(App):
                         target, lv, r, append=True,
                         reactions_by_key=reactions_by_key,
                     )
+            # Inbound to the *active* target counts as read on arrival —
+            # advance the persistent cursor so the next session doesn't
+            # count these rows as unread.
+            self._ui._client._store.mark_dm_read(target[1])  # type: ignore[attr-defined]
 
     async def _handle_inbound_post_batch(self, cid: int, items: list[dict]) -> None:
         """Process a wire ``cpb`` (batch posts) payload for one channel.
@@ -4152,6 +4228,8 @@ class _WhatspycApp(App):
                     target, lv, r, append=True,
                     reactions_by_key=reactions_by_key,
                 )
+        # Active-target read-cursor advance — see _handle_inbound_dm_batch.
+        self._ui._client._store.mark_channel_read(int(cid))  # type: ignore[attr-defined]
 
     async def _handle_inbound_dm(self, m: dict, *, batched: bool) -> None:
         fc = m.get("fc")
@@ -4199,6 +4277,8 @@ class _WhatspycApp(App):
         lv = await self._ensure_message_view(target)
         with self._batch_mutate():
             self._mount_row(target, lv, row, append=True)
+        # Active-target read-cursor advance — see _handle_inbound_dm_batch.
+        self._ui._client._store.mark_dm_read(target[1])  # type: ignore[attr-defined]
 
     async def _handle_inbound_post(self, p: dict, *, batched: bool) -> None:
         cid = p.get("cid")
@@ -4233,6 +4313,8 @@ class _WhatspycApp(App):
         lv = await self._ensure_message_view(target)
         with self._batch_mutate():
             self._mount_row(target, lv, row, append=True)
+        # Active-target read-cursor advance — see _handle_inbound_dm_batch.
+        self._ui._client._store.mark_channel_read(int(cid))  # type: ignore[attr-defined]
 
     def _handle_dm_ack(self, obj: dict) -> None:
         msg_id = obj.get("_id")

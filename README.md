@@ -167,7 +167,7 @@ top level is rejected at config-load time.
 | --- | --- | --- | --- | --- |
 | `my_call` | `--my-call` | string | *(required)* | Your callsign — `BASE[-SSID]`, base must be 1–6 alphanumerics including at least one digit, SSID 0–15. The SSID is used as the AX.25 source for the RHP link, but stripped before anything inside the WPS application layer (connect record, message `fc`/`tc`, reaction attribution, self-call comparisons), matching the server's own SSID-strip on the callsign-line handshake. **Required**, in either the file or via the flag. |
 | `name` | `--name` | string | *(required)* | Display name in the type-`c` connect record. **Required**, in either the file or via the flag. |
-| `ui` | `--ui` | string | `"line"` | One of `"line"` (simple stdin/stdout REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. |
+| `ui` | `--ui` | string | `"urwid"` | One of `"line"` (simple stdin/stdout REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. |
 | `state_dir` | `--state-dir` | path | `$XDG_DATA_HOME/whatspyc` (i.e. `~/.local/share/whatspyc`) | Directory holding `state.sqlite3`. Created if missing. |
 | `default_profile` | *(none)* | string \| null | `null` | Name of a configured profile to preselect in the picker / use under `--no-prompt`. Must match one of the `[[connect_profiles]]` names — typos are caught at config-load time. |
 | `history_backfill` | *(none)* | int | `3` | How many historic messages (DM target) or posts (channel target) to replay from the local SQLite store each time you switch target. The same count is the default for `/history` when no explicit count is given. Set to `0` to disable the auto-replay. |
@@ -460,7 +460,12 @@ Behaviour:
 - **Unread counts.** Inbound DMs / posts for a non-active target
   bump a `(N)` counter in the left-pane list label and **don't**
   mount into the centre pane. Activating that target zeroes the
-  counter and pages history in from the local store.
+  counter and pages history in from the local store. The count is
+  persisted in the local store as a per-target *last-read*
+  timestamp, so badges accumulated while you were away survive
+  client restarts — quitting with five unread posts in `#lounge`
+  brings up `lounge (5)` on next launch (and the line UI's
+  `[New posts in …]` notice the next time anything arrives).
 - **Scroll-back.** Cursor up at the top of the message list fetches
   the next older page from the local SQLite store and prepends it
   in chronological order. Stops when the store is exhausted.
@@ -682,10 +687,11 @@ port = 63001
 ```
 
 ```bash
-# terminal 2 — connect with the line UI (default)
+# terminal 2 — connect with the urwid UI (default)
 whatspyc --my-call N0CALL --name Tester --state-dir /tmp/whatspyc-fake
 
-# …or with the textual TUI
+# …or with the line UI / textual TUI
+whatspyc --my-call N0CALL --name Tester --ui line --state-dir /tmp/whatspyc-fake
 whatspyc --my-call N0CALL --name Tester --ui textual --state-dir /tmp/whatspyc-fake
 ```
 

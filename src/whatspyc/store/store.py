@@ -51,6 +51,7 @@ class SqliteStore:
             ("posts", "ets", "INTEGER"),
             ("posts", "is_gap", "INTEGER NOT NULL DEFAULT 0"),
             ("message_emojis", "callsign", "TEXT NOT NULL DEFAULT ''"),
+            ("channels", "last_read_ts", "INTEGER NOT NULL DEFAULT 0"),
         ):
             cols = {
                 row["name"]
@@ -801,6 +802,112 @@ class SqliteStore:
     def list_channels(self) -> list[dict]:
         cur = self._conn.execute("SELECT * FROM channels ORDER BY cid")
         return [dict(r) for r in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Unread cursors (channels + DMs)
+    # ------------------------------------------------------------------
+    #
+    # The UI's unread badge for a target is the number of inbound rows
+    # newer than its `last_read_ts` cursor. Channels store the cursor on
+    # the `channels` row (ms, post.ts unit); DM peers use the `dm_read`
+    # table (seconds, message.ts unit per gotcha 10). Activation in the
+    # UI calls ``mark_*_read`` to advance the cursor to the latest row
+    # currently in the store; inbound rows that arrive later have ts >
+    # cursor and so count toward the next session's unread badge.
+    #
+    # Outbound rows (from_call == my_call) are excluded from the count
+    # — sending a message doesn't make it "unread to yourself".
+
+    def mark_channel_read(self, channel_id: int) -> None:
+        """Advance ``channels.last_read_ts`` to the most recent post.ts.
+        Creates the channels row if missing (the user may have read
+        without having ever subscribed via this client)."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO channels(cid, last_read_ts) VALUES (?,"
+                " COALESCE((SELECT MAX(ts) FROM posts WHERE channel_id = ?), 0))"
+                " ON CONFLICT(cid) DO UPDATE SET last_read_ts = MAX("
+                " channels.last_read_ts,"
+                " COALESCE((SELECT MAX(ts) FROM posts WHERE channel_id = ?), 0))",
+                (int(channel_id), int(channel_id), int(channel_id)),
+            )
+
+    def mark_dm_read(self, peer: str) -> None:
+        """Advance ``dm_read.last_read_ts`` for ``peer`` to the most
+        recent DM ts in either direction with that peer."""
+        p = peer.upper()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO dm_read(peer, last_read_ts) VALUES (?,"
+                " COALESCE((SELECT MAX(ts) FROM messages"
+                "   WHERE from_call = ? OR to_call = ?), 0))"
+                " ON CONFLICT(peer) DO UPDATE SET last_read_ts = MAX("
+                " dm_read.last_read_ts,"
+                " COALESCE((SELECT MAX(ts) FROM messages"
+                "   WHERE from_call = ? OR to_call = ?), 0))",
+                (p, p, p, p, p),
+            )
+
+    def unread_post_count(self, channel_id: int, my_call: str) -> int:
+        """Number of inbound (not-from-me) posts in ``channel_id`` with
+        ts > the channel's last_read_ts."""
+        me = my_call.upper()
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM posts"
+            " WHERE channel_id = ?"
+            "   AND from_call != ?"
+            "   AND ts > COALESCE("
+            "     (SELECT last_read_ts FROM channels WHERE cid = ?), 0)",
+            (int(channel_id), me, int(channel_id)),
+        ).fetchone()
+        return int(row["n"])
+
+    def unread_dm_count(self, peer: str, my_call: str) -> int:
+        """Number of inbound DMs from ``peer`` with ts > peer's
+        last_read_ts. Outbound DMs to ``peer`` are excluded."""
+        p = peer.upper()
+        me = my_call.upper()
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM messages"
+            " WHERE from_call = ?"
+            "   AND to_call = ?"
+            "   AND ts > COALESCE("
+            "     (SELECT last_read_ts FROM dm_read WHERE peer = ?), 0)",
+            (p, me, p),
+        ).fetchone()
+        return int(row["n"])
+
+    def unread_post_counts_all(self, my_call: str) -> dict[int, int]:
+        """Bulk variant for startup: ``{cid: unread}`` for every channel
+        with at least one unread inbound post. Channels with zero unread
+        are absent from the result."""
+        me = my_call.upper()
+        cur = self._conn.execute(
+            "SELECT p.channel_id AS cid, COUNT(*) AS n"
+            " FROM posts p"
+            " LEFT JOIN channels c ON c.cid = p.channel_id"
+            " WHERE p.from_call != ?"
+            "   AND p.ts > COALESCE(c.last_read_ts, 0)"
+            " GROUP BY p.channel_id",
+            (me,),
+        )
+        return {int(r["cid"]): int(r["n"]) for r in cur.fetchall()}
+
+    def unread_dm_counts_all(self, my_call: str) -> dict[str, int]:
+        """Bulk variant for startup: ``{peer: unread}`` for every DM peer
+        with at least one unread inbound DM."""
+        me = my_call.upper()
+        cur = self._conn.execute(
+            "SELECT m.from_call AS peer, COUNT(*) AS n"
+            " FROM messages m"
+            " LEFT JOIN dm_read d ON d.peer = m.from_call"
+            " WHERE m.to_call = ?"
+            "   AND m.from_call != ?"
+            "   AND m.ts > COALESCE(d.last_read_ts, 0)"
+            " GROUP BY m.from_call",
+            (me, me),
+        )
+        return {str(r["peer"]).upper(): int(r["n"]) for r in cur.fetchall()}
 
     # ------------------------------------------------------------------
     # Hams

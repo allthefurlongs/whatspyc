@@ -697,3 +697,144 @@ def test_schema_migration_adds_is_gap_and_ets_to_pre_existing_posts(
     assert row["is_gap"] == 0  # default for legacy rows
     assert row["ets"] is None
     s.close()
+
+
+# ---------------------------------------------------------------------
+# Unread cursors
+# ---------------------------------------------------------------------
+
+
+def test_unread_post_count_excludes_outbound_and_pre_cursor(tmp_path: Path) -> None:
+    """``unread_post_count`` only counts inbound posts strictly newer
+    than the channel's last_read_ts. Outbound posts (from_call == me)
+    never count even before the cursor advances."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    me = "M0ABC"
+    s.set_subscription(5, True)
+    s.upsert_post(5, {"ts": 100, "fc": "G7BAR", "p": "old"})
+    s.upsert_post(5, {"ts": 200, "fc": me, "p": "mine"})
+    s.upsert_post(5, {"ts": 300, "fc": "G7BAR", "p": "new"})
+    # Before any read: two inbound, "mine" excluded.
+    assert s.unread_post_count(5, me) == 2
+    s.mark_channel_read(5)
+    # Cursor jumps to MAX(post.ts) = 300; subsequent unread = 0.
+    assert s.unread_post_count(5, me) == 0
+    # New inbound post arrives → counts as unread again.
+    s.upsert_post(5, {"ts": 400, "fc": "G7BAR", "p": "later"})
+    assert s.unread_post_count(5, me) == 1
+    s.close()
+
+
+def test_unread_dm_count_only_counts_inbound_from_peer(tmp_path: Path) -> None:
+    """Inbound DMs from peer count; outbound DMs *to* peer don't.
+    Cursor advance pushes count to 0, then re-arms on later inbound."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    me = "M0ABC"
+    peer = "G7BAR"
+    s.upsert_message({"_id": "1", "fc": peer, "tc": me, "m": "hi", "ts": 100})
+    s.upsert_message({"_id": "2", "fc": me, "tc": peer, "m": "ack", "ts": 150})
+    s.upsert_message({"_id": "3", "fc": peer, "tc": me, "m": "yo", "ts": 200})
+    # Two inbound from peer; outbound at ts=150 doesn't count.
+    assert s.unread_dm_count(peer, me) == 2
+    s.mark_dm_read(peer)
+    assert s.unread_dm_count(peer, me) == 0
+    s.upsert_message({"_id": "4", "fc": peer, "tc": me, "m": "later", "ts": 300})
+    assert s.unread_dm_count(peer, me) == 1
+    s.close()
+
+
+def test_unread_counts_survive_reopen(tmp_path: Path) -> None:
+    """The whole point of persistence: closing the store and reopening
+    must reproduce the same unread tallies — there's no in-memory
+    state involved."""
+    path = tmp_path / "state.sqlite3"
+    me = "M0ABC"
+    s = SqliteStore(path)
+    s.set_subscription(7, True)
+    s.upsert_post(7, {"ts": 100, "fc": "G7BAR", "p": "a"})
+    s.upsert_post(7, {"ts": 200, "fc": "G7BAR", "p": "b"})
+    s.upsert_message({"_id": "1", "fc": "M0FOO", "tc": me, "m": "hi", "ts": 50})
+    s.close()
+
+    s2 = SqliteStore(path)
+    assert s2.unread_post_count(7, me) == 2
+    assert s2.unread_dm_count("M0FOO", me) == 1
+    # Bulk variants surface the same numbers, keyed for startup seeding.
+    assert s2.unread_post_counts_all(me) == {7: 2}
+    assert s2.unread_dm_counts_all(me) == {"M0FOO": 1}
+    s2.close()
+
+
+def test_mark_dm_read_uses_max_across_directions(tmp_path: Path) -> None:
+    """Cursor advances to the latest DM ts in either direction so a
+    later outbound (which we obviously consider "read") doesn't make
+    earlier inbound look unread on the next call."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    me = "M0ABC"
+    peer = "G7BAR"
+    s.upsert_message({"_id": "1", "fc": peer, "tc": me, "m": "hi", "ts": 100})
+    s.upsert_message({"_id": "2", "fc": me, "tc": peer, "m": "ack", "ts": 200})
+    s.mark_dm_read(peer)
+    # An inbound DM with ts <= 200 (the outbound) must NOT count as
+    # unread — the cursor is at MAX, and the next inbound at ts=150
+    # (back-dated, e.g. from gotcha-11 redelivery) is below it.
+    s.upsert_message({"_id": "3", "fc": peer, "tc": me, "m": "old?", "ts": 150})
+    assert s.unread_dm_count(peer, me) == 0
+    s.close()
+
+
+def test_unread_post_counts_all_groups_by_channel(tmp_path: Path) -> None:
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    me = "M0ABC"
+    s.set_subscription(11, True)
+    s.set_subscription(12, True)
+    s.upsert_post(11, {"ts": 100, "fc": "G7BAR", "p": "a"})
+    s.upsert_post(11, {"ts": 200, "fc": "G7BAR", "p": "b"})
+    s.upsert_post(12, {"ts": 300, "fc": me, "p": "mine"})  # excluded
+    s.upsert_post(12, {"ts": 400, "fc": "G7BAR", "p": "c"})
+    out = s.unread_post_counts_all(me)
+    assert out == {11: 2, 12: 1}
+    # Reading channel 11 drops it from the result.
+    s.mark_channel_read(11)
+    assert s.unread_post_counts_all(me) == {12: 1}
+    s.close()
+
+
+def test_schema_migration_adds_last_read_ts_to_pre_existing_channels(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing db without the new column gets it added on
+    re-open, with default 0 — so historical posts immediately count
+    as unread until the user activates the channel."""
+    path = tmp_path / "state.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE channels (
+            cid INTEGER PRIMARY KEY,
+            subscribed INTEGER NOT NULL DEFAULT 0,
+            last_post INTEGER NOT NULL DEFAULT 0,
+            last_emoji INTEGER NOT NULL DEFAULT 0,
+            last_edit INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO channels(cid, subscribed) VALUES (?, ?)", (8, 1)
+    )
+    conn.commit()
+    conn.close()
+
+    s = SqliteStore(path)
+    cols = {r["name"] for r in s._conn.execute("PRAGMA table_info(channels)")}
+    assert "last_read_ts" in cols
+    # New `dm_read` table is created via CREATE IF NOT EXISTS in the
+    # schema script, so it must also be present after re-open.
+    tables = {
+        r["name"]
+        for r in s._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    assert "dm_read" in tables
+    s.close()

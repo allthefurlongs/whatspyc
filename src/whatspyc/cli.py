@@ -27,7 +27,7 @@ from whatspyc.transport.rhp_tcp import RhpTcpStream
 from whatspyc.transport.rhp_ws import RhpWebSocketStream
 from whatspyc.ui.line import LineUI
 from whatspyc.ui.options import SessionOptions
-from whatspyc.ui.tui import TextualUI
+from whatspyc.ui.textual_ui import TextualUI
 from whatspyc.ui.urwid_ui import UrwidUI
 from whatspyc.wps.client import WpsClient
 from whatspyc.wps.connect_seq import ConnectSequence, ConnectSummary
@@ -247,7 +247,23 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
         click.echo(f"  not a recognised choice: {s!r}")
 
 
-@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+class _VersionedCommand(click.Command):
+    def format_help(self, ctx, formatter):
+        formatter.write(f"Version {__version__}\n")
+        super().format_help(ctx, formatter)
+
+
+@click.command(
+    cls=_VersionedCommand,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help="Connect to a WhatsPac service and drop into an interactive prompt.",
+)
+@click.version_option(
+    __version__,
+    "-v",
+    "--version",
+    message="whatspyc version %(version)s",
+)
 @click.option("--profile", "profile_name", default=None, help="Named connect profile from config.")
 @click.option("--no-prompt", is_flag=True, help="Skip the picker; use default_profile.")
 @click.option(
@@ -936,17 +952,22 @@ async def _connect_and_run_ui(
     # user can read it; non-DM buffered events still replay individually.
     dm_senders: dict[str, int] = {}
     my_upper = c.app_call.upper()  # type: ignore[union-attr]
+    line_unread_dms = getattr(ui, "_unread_dms", None)
     for obj in pending_events:
         t = obj.get("t")
         if t == "m":
             fc = (obj.get("fc") or "").upper()
             if fc and fc != my_upper:
                 dm_senders[fc] = dm_senders.get(fc, 0) + 1
+                if line_unread_dms is not None:
+                    line_unread_dms[fc] = line_unread_dms.get(fc, 0) + 1
         elif t == "mb":
             for m in obj.get("m", []):
                 fc = (m.get("fc") or "").upper()
                 if fc and fc != my_upper:
                     dm_senders[fc] = dm_senders.get(fc, 0) + 1
+                    if line_unread_dms is not None:
+                        line_unread_dms[fc] = line_unread_dms.get(fc, 0) + 1
         else:
             ui.render_event(obj)
     pending_events.clear()

@@ -1,4 +1,4 @@
-"""Urwid-based TUI — a parallel backend to ``ui.tui.TextualUI``.
+"""Urwid-based TUI — a parallel backend to ``ui.textual_ui.TextualUI``.
 
 The Textual UI is feature-rich but heavy: virtual DOM, CSS matching,
 animation timers, cursor-blink redraws. Several of those costs dominate
@@ -16,8 +16,8 @@ loop, and returns when the user quits or the link drops without
 recovery (``exit_reason="terminal"``).
 
 The slash-command, event-dispatch and helper-method shapes deliberately
-parallel ``ui.tui.TextualUI._WhatspycApp`` so a grep for ``_handle_cs``
-or ``_open_subscribe_modal`` lands in both backends. Read ``tui.py``'s
+parallel ``ui.textual_ui.TextualUI._WhatspycApp`` so a grep for ``_handle_cs``
+or ``_open_subscribe_modal`` lands in both backends. Read ``textual_ui.py``'s
 docstrings for the deeper "why" of each handler — most of the comments
 there apply unchanged.
 """
@@ -372,7 +372,7 @@ def _render_row_markup(
 ) -> list:
     """Build a urwid markup list for a single message/post.
 
-    Same content as ``ui.tui._render_row``, returned as a list of
+    Same content as ``ui.textual_ui._render_row``, returned as a list of
     ``(attr, text)`` tuples (urwid's native markup form). Outbound rows
     we sent but haven't seen an ack for are styled with ``dim_*``
     attribute variants; the dim clears once ``delivered_ts`` is set.
@@ -680,7 +680,7 @@ class _TabBar(urwid.WidgetWrap):
 class _MessageRow(urwid.WidgetWrap):
     """One message/post row, mounted in a per-target ``ListBox``.
 
-    Same role and domain state as ``ui.tui.MessageRow``: holds row state
+    Same role and domain state as ``ui.textual_ui.MessageRow``: holds row state
     (body, ts, edit_ts, delivered_ts, received_ts, realtime, lid,
     reactions) so the UI can re-render in place when an edit / ack /
     reaction lands. ``refresh_label`` rebuilds the markup from current
@@ -1106,7 +1106,7 @@ class ActionMenu(_Modal):
 class ReplyToModal(_Modal):
     """Read-only modal showing the parent of a reply row.
 
-    Mirrors :class:`ui.tui.ReplyToModal`: a single rendered line for
+    Mirrors :class:`ui.textual_ui.ReplyToModal`: a single rendered line for
     the parent post/DM, presented in the same format the user would
     see in the thread (timestamp, name + call, body, edit marker,
     reactions). Esc dismisses.
@@ -1911,9 +1911,6 @@ class ProfilePickerModal(_Modal):
         return self._listbox
 
     def _format_label(self, i: int, p: ConnectProfile) -> list:
-        marker = ""
-        if self._default_name and p.name == self._default_name:
-            marker = " (default)"
         if p.name.startswith("<") and p.name.endswith(">"):
             return [
                 ("bold", f"{i}. "),
@@ -1922,12 +1919,19 @@ class ProfilePickerModal(_Modal):
             ]
         user_hops = [s for s in p.connect_script if s.cmd]
         suffix = f"  {len(user_hops)}-hop" if user_hops else "  direct"
-        return [
+        # urwid 4.0.0 truncates a Text canvas at any zero-length markup
+        # span — the row stops painting at that span, falls short of
+        # ``maxcol``, and the surrounding LineBox loses its right border
+        # on that line. Only emit the marker span when there's something
+        # to show.
+        markup: list = [
             ("bold", f"{i}. "),
             ("default", p.name),
-            ("yellow", marker),
-            ("dim", suffix),
         ]
+        if self._default_name and p.name == self._default_name:
+            markup.append(("yellow", " (default)"))
+        markup.append(("dim", suffix))
+        return markup
 
     def keypress(self, size, key):
         if key in ("esc", "q", "Q"):
@@ -1956,7 +1960,7 @@ _ADD_DM_KEY = "__add_dm__"
 class _UrwidApp:
     """Holds the widget tree, dispatches events, owns the MainLoop.
 
-    Parallel to ``ui.tui._WhatspycApp``. The same dicts (``_views``,
+    Parallel to ``ui.textual_ui._WhatspycApp``. The same dicts (``_views``,
     ``_rows``, ``_unread``, ``_history_exhausted``, ``_subscribed_cids``,
     ``_online_items``) are kept and have the same meaning. Method names
     mirror the Textual side wherever possible so the two backends are
@@ -1978,6 +1982,12 @@ class _UrwidApp:
         self._walkers: dict[TargetKey, urwid.SimpleFocusListWalker] = {}
         self._rows: dict[RowKey, _MessageRow] = {}
         self._unread: dict[TargetKey, int] = {}
+        # Set once after ``_seed_unread_from_store`` populates _unread
+        # from the persistent cursors. Guards against re-seeding on
+        # later post_connect_setup runs that might overlap with live
+        # arrivals — re-seeding would double-count any rows that the
+        # live path already incremented.
+        self._unread_seeded = False
         self._history_exhausted: dict[TargetKey, bool] = {}
         self._verbose_dirty: set[TargetKey] = set()
 
@@ -2193,6 +2203,11 @@ class _UrwidApp:
         if self._dms_walker is not None:
             self._dms_walker.clear()
         self._target_items.clear()
+        # Seed the per-target unread tally from the persistent cursors
+        # before populate computes per-target labels. Idempotent — a
+        # session-driven flow may have already seeded inside
+        # ``_on_client_ready``, ahead of any wire events arriving.
+        self._seed_unread_from_store()
         self._populate_initial_target_lists()
         if self._loop is not None:
             try:
@@ -2207,6 +2222,14 @@ class _UrwidApp:
 
         def _on_client_ready(c: WpsClient) -> None:
             self._ui._client = c
+            # Snapshot per-target unread state from the persistent
+            # cursors before any wire events flow. Doing it here (rather
+            # than in _post_connect_setup, after the connect window) is
+            # what avoids double-counting cpb-during-connect rows: the
+            # client persists each row before dispatching the event, so
+            # a later seed would scan the store and re-add the same
+            # rows the live increment paths have already counted.
+            self._seed_unread_from_store()
 
         client, summary = await self._ui._connection_opener(  # type: ignore[misc]
             profile,
@@ -2251,6 +2274,12 @@ class _UrwidApp:
             # pch / o / he / ...) reach handlers with a valid
             # ``self._ui._client`` rather than crashing on ``None``.
             self._ui._client = c
+            # Snapshot per-target unread state from the persistent
+            # cursors before any wire events arrive. The client
+            # persists each row before dispatching, so seeding *after*
+            # the connect window would double-count anything the live
+            # path has already incremented. See ``_seed_unread_from_store``.
+            self._seed_unread_from_store()
 
         async def _runner() -> None:
             try:
@@ -2450,6 +2479,10 @@ class _UrwidApp:
         # bootstrap re-runs ``_post_connect_setup`` once the client
         # is up.
         if self._ui._client is not None:
+            # Seed unread before populate so per-target labels carry
+            # the (N) suffix on first render. In session-driven mode
+            # the seed happened earlier, in ``_on_client_ready``.
+            self._seed_unread_from_store()
             self._populate_initial_target_lists()
 
         # ----- Centre pane: status pane + thread header + per-target ListBox -----
@@ -2756,6 +2789,12 @@ class _UrwidApp:
                     on_activate=self._open_new_dm_modal,
                 ),
             )
+        # Tab badges sum across `_unread`, which `_add_target` may have
+        # just seeded from the persistent cursor. Refresh once after the
+        # whole bootstrap so badges reflect that initial state — without
+        # this, the (N) suffix on the inactive tab would only appear on
+        # the first tab switch.
+        self._refresh_tab_labels()
 
     def _target_id(self, target: TargetKey) -> str:
         kind, key = target
@@ -2791,6 +2830,10 @@ class _UrwidApp:
         if target in self._target_items:
             return
         kind, _ = target
+        # ``_target_label`` reads ``_unread`` for the (N) suffix;
+        # ``_seed_unread_from_store`` runs once at session start
+        # (before any wire events flow) and pre-fills counts left over
+        # from the previous session, so the label here picks them up.
         item = _FocusableText(
             self._target_label(target, unsubscribed=unsubscribed),
             on_activate=lambda t=target: self._on_target_activate(t),
@@ -2801,6 +2844,33 @@ class _UrwidApp:
         elif kind == "dm" and self._dms_walker is not None:
             # Append after the pinned "+ Add DM call…" row.
             self._dms_walker.append(item)
+
+    def _seed_unread_from_store(self) -> None:
+        """Pre-fill ``_unread`` from the persistent cursors. Called once
+        per session, *before* any wire events are dispatched, so the
+        baseline reflects unread state left over from earlier sessions
+        without double-counting fresh arrivals (which the live
+        increment paths handle separately).
+
+        Idempotent: only fills entries that aren't already present.
+        """
+        if self._unread_seeded:
+            return
+        client = self._ui._client
+        if client is None or getattr(client, "_store", None) is None:
+            return
+        store = client._store  # type: ignore[attr-defined]
+        me = self._ui._my_call
+        try:
+            posts = store.unread_post_counts_all(me)
+            dms = store.unread_dm_counts_all(me)
+        except Exception:
+            return
+        for cid, n in posts.items():
+            self._unread.setdefault(("ch", str(cid)), n)
+        for peer, n in dms.items():
+            self._unread.setdefault(("dm", peer), n)
+        self._unread_seeded = True
 
     def _refresh_target_label(self, target: TargetKey) -> None:
         if target not in self._target_items:
@@ -2822,23 +2892,20 @@ class _UrwidApp:
             self._refresh_target_label(t)
 
     def _refresh_tab_labels(self) -> None:
-        # Sum unread per kind and badge the *inactive* tab so the user
-        # sees activity in the hidden list. The active tab stays plain
-        # — its per-target rows already show (N) badges of their own.
+        # Sum unread per kind and badge both tabs regardless of which is
+        # active — the count ticks down (and the suffix disappears at 0)
+        # as the user reads individual channels / DMs.
         bar = self._left_tab_bar
         if bar is None:
             return
-        active = bar.active_id
         ch_unread = sum(n for (k, _), n in self._unread.items() if k == "ch" and n)
         dm_unread = sum(n for (k, _), n in self._unread.items() if k == "dm" and n)
         ch_btn = bar._buttons.get("ch")
         dm_btn = bar._buttons.get("dm")
         if ch_btn is not None:
-            show = ch_unread if active != "ch" else 0
-            ch_btn.set_label(f"Channels ({show})" if show else "Channels")
+            ch_btn.set_label(f"Channels ({ch_unread})" if ch_unread else "Channels")
         if dm_btn is not None:
-            show = dm_unread if active != "dm" else 0
-            dm_btn.set_label(f"DMs ({show})" if show else "DMs")
+            dm_btn.set_label(f"DMs ({dm_unread})" if dm_unread else "DMs")
 
     def _on_target_activate(self, target: TargetKey) -> None:
         kind, key = target
@@ -2892,7 +2959,18 @@ class _UrwidApp:
             self._verbose_dirty.discard(target)
         if self._centre_placeholder is not None:
             self._centre_placeholder.original_widget = lv
-        # Clear unread count.
+        # Activating clears the in-memory unread count and advances the
+        # persistent read cursor so the badge stays at 0 across restart
+        # rather than coming back from the store.
+        kind, key = target
+        store = self._ui._client._store  # type: ignore[attr-defined]
+        if kind == "dm":
+            store.mark_dm_read(key)
+        else:
+            try:
+                store.mark_channel_read(int(key))
+            except ValueError:
+                pass
         if self._unread.get(target):
             self._unread[target] = 0
             self._refresh_target_label(target)
@@ -3129,7 +3207,7 @@ class _UrwidApp:
     def _reply_meta_for_row(self, row: _MessageRow) -> dict | None:
         """Resolve a row's reply metadata against the live store.
 
-        Mirrors :meth:`ui.tui._WhatspycApp._reply_meta_for_row`. Returns
+        Mirrors :meth:`ui.textual_ui._WhatspycApp._reply_meta_for_row`. Returns
         ``None`` for non-reply rows so they pay no DB cost.
         """
         if (
@@ -4537,6 +4615,10 @@ class _UrwidApp:
             if walker is not None:
                 row = self._build_row_from_wire("dm", target, m)
                 self._mount_row_obj(target, walker, row, append=True)
+            # Active-target arrival counts as read on landing — advance
+            # the persistent cursor so this row isn't recounted as unread
+            # next session.
+            self._ui._client._store.mark_dm_read(peer)  # type: ignore[attr-defined]
         elif fc != self._ui._my_call:
             # Self-sent echoes (from another session) don't count toward
             # unread — match the [Connected] line's "from someone else"
@@ -4558,6 +4640,7 @@ class _UrwidApp:
             if walker is not None:
                 row = self._build_row_from_wire("post", target, p)
                 self._mount_row_obj(target, walker, row, append=True)
+            self._ui._client._store.mark_channel_read(cid)  # type: ignore[attr-defined]
         else:
             self._unread[target] = self._unread.get(target, 0) + 1
             self._refresh_target_label(target)
@@ -4589,6 +4672,7 @@ class _UrwidApp:
                 for m in msgs:
                     row = self._build_row_from_wire("dm", target, m, bulk=bulk)
                     self._mount_row_obj(target, walker, row, append=True)
+                self._ui._client._store.mark_dm_read(peer)  # type: ignore[attr-defined]
             else:
                 inbound = inbound_counts.get(peer, 0)
                 if inbound:
@@ -4608,6 +4692,7 @@ class _UrwidApp:
             for p in items:
                 row = self._build_row_from_wire("post", target, p, bulk=bulk)
                 self._mount_row_obj(target, walker, row, append=True)
+            self._ui._client._store.mark_channel_read(cid)  # type: ignore[attr-defined]
         else:
             self._unread[target] = self._unread.get(target, 0) + len(items)
             self._refresh_target_label(target)

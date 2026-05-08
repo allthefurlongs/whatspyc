@@ -791,9 +791,9 @@ def test_non_rhp_transport_does_not_require_engine() -> None:
 # ----------------------------------------------------------------------
 
 
-def test_ui_default_is_line() -> None:
+def test_ui_default_is_urwid() -> None:
     c = cfg_mod.parse({})
-    assert c.ui == "line"
+    assert c.ui == "urwid"
 
 
 def test_ui_accepts_three_values() -> None:

@@ -220,7 +220,7 @@ def test_line_ui_renders_reply_prefix_for_dm(tmp_path: Path, capsys) -> None:
 
 
 def test_textual_render_row_emits_yellow_reply_prefix() -> None:
-    from whatspyc.ui.tui import _render_row
+    from whatspyc.ui.textual_ui import _render_row
 
     line = _render_row(
         kind="dm",

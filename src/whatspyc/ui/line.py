@@ -41,20 +41,29 @@ class LineUI:
         self._options = options or SessionOptions()
         self._offline = offline
         self._target: tuple[str, str] | None = None  # ("dm", call) or ("ch", str(cid))
-        # Per-peer count of inbound live DMs that have arrived since the
-        # user last visited that thread. Drives the [New DMs from X (N)]
-        # notification shown in place of the full body when the user
-        # isn't currently /dm'd into that peer. Cleared per-peer on
-        # /dm CALL. Independent of the connect-time aggregation in
-        # cli.py — that prints once and is forgotten; this tracker only
-        # follows live arrivals after the connect window closes.
-        self._unread_dms: dict[str, int] = {}
-        # Per-channel count of inbound live posts (cp / cpb) for
-        # channels other than the current /ch target. Drives the
-        # [New posts in CID:#name (N)] notification. Cleared per-cid
-        # on /ch CID. Outbound echoes (own posts) are excluded — they
-        # always render in full regardless of target.
-        self._unread_posts: dict[int, int] = {}
+        # Per-peer count of inbound DMs the user hasn't read in a /dm
+        # session yet. Drives the [New DMs from X (N)] notification line
+        # shown in place of the full body when the user isn't currently
+        # /dm'd into that peer. Cleared per-peer on /dm CALL via
+        # ``store.mark_dm_read`` (cursor-based: anything older than the
+        # peer's last_read_ts cursor is treated as already-seen).
+        # Seeded at construction from the persistent cursor so unread
+        # DMs accumulated across restarts are still represented.
+        # Independent of the connect-time aggregation in cli.py — that
+        # prints once and is forgotten; this tracker continues to follow
+        # live arrivals after the connect window closes.
+        self._unread_dms: dict[str, int] = dict(
+            client._store.unread_dm_counts_all(my_call)  # type: ignore[attr-defined]
+        )
+        # Per-channel count of inbound posts (cp / cpb) for channels
+        # other than the current /ch target. Drives the
+        # [New posts in CID:#name (N)] notification line. Cleared
+        # per-cid on /ch CID via ``store.mark_channel_read``. Outbound
+        # echoes are excluded both in the live increment path and in
+        # the persistent count.
+        self._unread_posts: dict[int, int] = dict(
+            client._store.unread_post_counts_all(my_call)  # type: ignore[attr-defined]
+        )
         self._stop = asyncio.Event()
         # Set to "terminal" when the link drops with no auto-reconnect or
         # after auto-reconnect gives up; the cli reads this after run()
@@ -254,8 +263,10 @@ class LineUI:
     ) -> None:
         mark = "*" if subscribed else " "
         label = f"#{info.name}" if info and info.name else ""
+        unread = self._unread_posts.get(cid, 0)
+        unread_s = f" ({unread})" if unread else ""
         paused = f" ({paused_count} paused)" if paused_count else ""
-        print(f"   [{mark}]   {cid:<3}  {label}{paused}")
+        print(f"   [{mark}]   {cid:<3}  {label}{unread_s}{paused}")
 
     def _print_dm_threads(self) -> None:
         print("DM threads:  /dm <call> to switch")
@@ -267,7 +278,10 @@ class LineUI:
             print("  (no DM threads yet)")
             return
         for r in rows:
-            print(f"  {self._fmt_user(r['peer'])}")
+            peer = r["peer"]
+            unread = self._unread_dms.get(peer, 0)
+            unread_s = f" ({unread})" if unread else ""
+            print(f"  {self._fmt_user(peer)}{unread_s}")
 
     def _show_history(
         self, target: tuple[str, str], n: int, *, verbose: bool | None = None
@@ -340,6 +354,11 @@ class LineUI:
         peer, is_outbound = self._dm_peer(m)
         if is_outbound or self._is_dm_target(peer):
             self._render_dm(m)
+            # Active-target arrival is read on landing — advance the
+            # persistent cursor so this row isn't recounted as unread
+            # next session.
+            if not is_outbound:
+                self._client._store.mark_dm_read(peer)  # type: ignore[attr-defined]
             return
         self._unread_dms[peer] = self._unread_dms.get(peer, 0) + 1
         if self._options.notify_new_dms:
@@ -351,13 +370,20 @@ class LineUI:
         line at the end (instead of one notification per batch member).
         """
         suppressed = 0
+        active_inbound_peers: set[str] = set()
         for m in items:
             peer, is_outbound = self._dm_peer(m)
             if is_outbound or self._is_dm_target(peer):
                 self._render_dm(m)
+                if not is_outbound:
+                    active_inbound_peers.add(peer)
                 continue
             self._unread_dms[peer] = self._unread_dms.get(peer, 0) + 1
             suppressed += 1
+        # Coalesce the active-target cursor advance so a 50-item mb
+        # batch doesn't fire 50 mark_dm_read calls.
+        for peer in active_inbound_peers:
+            self._client._store.mark_dm_read(peer)  # type: ignore[attr-defined]
         if suppressed and self._options.notify_new_dms:
             print(self._fmt_unread_dm_notice())
 
@@ -415,8 +441,11 @@ class LineUI:
             self._render_post(cid, p)
             return
         cid_int = int(cid)
-        if self._is_outbound_post(p) or self._is_ch_target(cid_int):
+        is_outbound = self._is_outbound_post(p)
+        if is_outbound or self._is_ch_target(cid_int):
             self._render_post(cid_int, p)
+            if not is_outbound:
+                self._client._store.mark_channel_read(cid_int)  # type: ignore[attr-defined]
             return
         self._unread_posts[cid_int] = self._unread_posts.get(cid_int, 0) + 1
         if self._options.notify_new_posts:
@@ -432,12 +461,18 @@ class LineUI:
             return
         cid_int = int(cid)
         suppressed = 0
+        active_inbound_seen = False
         for p in items:
-            if self._is_outbound_post(p) or self._is_ch_target(cid_int):
+            is_outbound = self._is_outbound_post(p)
+            if is_outbound or self._is_ch_target(cid_int):
                 self._render_post(cid_int, p)
+                if not is_outbound:
+                    active_inbound_seen = True
                 continue
             self._unread_posts[cid_int] = self._unread_posts.get(cid_int, 0) + 1
             suppressed += 1
+        if active_inbound_seen:
+            self._client._store.mark_channel_read(cid_int)  # type: ignore[attr-defined]
         if suppressed and self._options.notify_new_posts:
             print(self._fmt_unread_posts_notice())
 
@@ -1288,10 +1323,11 @@ class LineUI:
             peer = args[0].upper()
             self._target = ("dm", peer)
             # Switching into the thread counts as "reading" any
-            # accumulated unread DMs from that peer — drop them from
-            # the running notice tally so subsequent [New DMs from ...]
-            # lines no longer mention this peer.
+            # accumulated unread DMs from that peer — drop the in-memory
+            # tally and bump the persistent cursor so the count doesn't
+            # come back on next start.
             self._unread_dms.pop(peer, None)
+            self._client._store.mark_dm_read(peer)  # type: ignore[attr-defined]
             self._show_history(self._target, self._history_backfill)
         elif cmd == "/ch" and len(args) == 1:
             cid = self._resolve_channel(args[0])
@@ -1301,12 +1337,13 @@ class LineUI:
             previous_target = self._target
             self._target = ("ch", str(cid))
             # Switching into the channel counts as "reading" any
-            # accumulated unread posts there — drop them from the
-            # running notice tally. Done here even when the subscribe
-            # prompt declines (we revert the target below) — a brief
-            # reset is harmless and avoids stale counts hanging on a
-            # channel the user just glanced at.
+            # accumulated unread posts there — drop the in-memory tally
+            # and bump the persistent cursor. Done here even when the
+            # subscribe prompt declines (we revert the target below) —
+            # a brief reset is harmless and avoids stale counts hanging
+            # on a channel the user just glanced at.
             self._unread_posts.pop(cid, None)
+            self._client._store.mark_channel_read(cid)  # type: ignore[attr-defined]
             # History (from local store) goes first so the user has whatever
             # context they already have on screen, then the paused notice
             # or subscribe prompt sits right above the prompt where it

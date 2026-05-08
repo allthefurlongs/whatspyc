@@ -504,6 +504,149 @@ def test_inbound_dm_to_active_target_mounts_row(tmp_path: Path) -> None:
         store.close()
 
 
+def test_unread_seeded_from_store_at_session_start(tmp_path: Path) -> None:
+    """Persistent unread cursors should drive per-target badges on
+    first start. Seed + populate means a channel with stored unread
+    posts shows a (N) suffix in the channels list immediately, before
+    any live event arrives."""
+    db = tmp_path / "state.sqlite3"
+    s = SqliteStore(db)
+    s.set_subscription(5, True)
+    s.upsert_post(5, {"ts": 100, "fc": "G7BAR", "p": "a"})
+    s.upsert_post(5, {"ts": 200, "fc": "G7BAR", "p": "b"})
+    s.upsert_post(5, {"ts": 300, "fc": "G7BAR", "p": "c"})
+    s.close()
+
+    ui, app, store = _make_app(tmp_path)
+    try:
+        target = ("ch", "5")
+        assert app._unread.get(target) == 3
+        # Per-target row label includes the count.
+        assert any(
+            "(3)" in str(getattr(w._w, "text", "")) or
+            "(3)" in str(w._w)
+            for w in app._channels_walker
+        )
+    finally:
+        store.close()
+
+
+def test_unread_seeded_in_session_driven_path(tmp_path: Path) -> None:
+    """Session-driven mode: client is None at _build_widgets time, then
+    set in _on_client_ready (which seeds), then _post_connect_setup
+    populates the lists. Ensures the seed reaches _unread before the
+    channel row is rendered."""
+    from whatspyc.config import ConnectProfile
+    from whatspyc.ui.urwid_ui import UrwidUI as _UrwidUI
+    from whatspyc.ui.urwid_ui import _UrwidApp as _UrwidApp_
+
+    db = tmp_path / "state.sqlite3"
+    s = SqliteStore(db)
+    s.set_subscription(5, True)
+    s.upsert_post(5, {"ts": 100, "fc": "G7BAR", "p": "a"})
+    s.upsert_post(5, {"ts": 200, "fc": "G7BAR", "p": "b"})
+    s.upsert_post(5, {"ts": 300, "fc": "G7BAR", "p": "c"})
+    s.close()
+
+    s2 = SqliteStore(db)
+    online: list[str] = []
+
+    def make_client():
+        return SimpleNamespace(
+            _store=s2,
+            _name="Tester",
+            ham_name=lambda call: None,
+            online_users=lambda: list(online),
+            paused_channels=lambda: {},
+            is_auto_reconnect=False,
+            set_delivery_timeout_s=lambda v: None,
+            auto_backfill_post_count=10,
+            _online_list=online,
+            close=lambda: asyncio.sleep(0),
+        )
+
+    async def opener(profile, *, progress, on_event, on_client_ready=None):
+        c = make_client()
+        if on_client_ready:
+            on_client_ready(c)
+        return c, None
+
+    ui = _UrwidUI(
+        None,
+        my_call="M0ABC",
+        channels=[ChannelInfo(cid=5, name="lounge")],
+        history_backfill=3,
+        options=SessionOptions(),
+        offline=False,
+        connection_opener=opener,
+        available_profiles=[ConnectProfile(name="X")],
+    )
+    app = _UrwidApp_(ui)
+    ui._app = app
+    app._build_widgets()  # client None → populate skipped
+    assert app._unread == {}
+
+    # Simulate the session-driven connect: opener calls
+    # _on_client_ready (which sets client + seeds), then we run
+    # _post_connect_setup as the bootstrap would after a successful
+    # connect.
+    asyncio.run(opener(None, progress=lambda *a, **k: None,
+                       on_event=lambda obj: asyncio.sleep(0),
+                       on_client_ready=lambda c: (
+                           setattr(ui, "_client", c),
+                           app._seed_unread_from_store(),
+                       )))
+    app._post_connect_setup()
+
+    target = ("ch", "5")
+    assert app._unread.get(target) == 3
+    # Per-target row label includes the count.
+    label_str = "".join(
+        seg if isinstance(seg, str) else seg[1]
+        for seg in app._target_label(target)
+    )
+    assert "(3)" in label_str
+    s2.close()
+
+
+def test_unread_no_double_count_when_cpb_arrives_after_seed(
+    tmp_path: Path,
+) -> None:
+    """Regression: the client persists rows *before* dispatching, so
+    if seeding ran *after* an inbound batch, the seed query would scan
+    the just-persisted rows and add to ``_unread`` what the live
+    increment already added. Seeding once, ahead of any wire events,
+    keeps the count honest."""
+    ui, app, store = _make_app(tmp_path)
+    try:
+        # _make_app's offline-style construction has already seeded
+        # (via _build_widgets → _seed_unread_from_store on the empty
+        # store). Now simulate cpb landing for a fresh subscribed
+        # channel: 3 posts, persisted, then dispatched.
+        store.set_subscription(11, True)
+        for ts in (1000, 2000, 3000):
+            store.upsert_post(
+                11, {"ts": ts, "fc": "G7BAR", "p": f"p{ts}"},
+                realtime=False,
+            )
+
+        async def _run() -> None:
+            await app._dispatch_event(
+                {"t": "cpb", "cid": 11, "p": [
+                    {"ts": 1000, "fc": "G7BAR", "p": "p1000"},
+                    {"ts": 2000, "fc": "G7BAR", "p": "p2000"},
+                    {"ts": 3000, "fc": "G7BAR", "p": "p3000"},
+                ]}
+            )
+        asyncio.run(_run())
+        target = ("ch", "11")
+        # Seed already done with 0 (no rows existed at seed time);
+        # live increment adds exactly 3 — not 6.
+        assert app._unread.get(target) == 3
+    finally:
+        store.close()
+
+
 def test_inbound_dm_to_inactive_target_bumps_unread(tmp_path: Path) -> None:
     ui, app, store = _make_app(tmp_path)
     try:
