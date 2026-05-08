@@ -3364,19 +3364,20 @@ class _WhatspycApp(App):
     # ------------------------------------------------------------------
 
     def action_focus_input(self) -> None:
-        # Esc also cancels an in-progress reply: the pending state is
-        # cleared and the prompt restored before refocusing the input.
-        # Edits don't get the same treatment — leaving them in flight
-        # is consistent with the existing behaviour where the user can
-        # alter or finish them at their own pace.
-        if self._pending_reply is not None:
+        # Esc also cancels an in-progress reply or edit: the pending
+        # state is cleared and the prompt/input restored before
+        # refocusing the input. The edit case had the row body
+        # pre-filled by ``_begin_edit``, so we clear the input value
+        # along with the pending state.
+        if self._pending_reply is not None or self._pending_edit is not None:
             self._pending_reply = None
-            self._refresh_prompt()
+            self._pending_edit = None
             try:
                 inp = self.query_one("#input", Input)
                 inp.value = ""
             except Exception:
                 pass
+            self._refresh_prompt()
         if self._w_input is not None:
             self._w_input.focus()
 
@@ -3715,7 +3716,7 @@ class _WhatspycApp(App):
             return
         if self._pending_edit:
             kind = self._pending_edit["kind"]
-            inp.placeholder = f"editing {kind}> "
+            inp.placeholder = f"editing {kind} (Esc cancel edit)> "
             return
         # Reply mode: surface the parent's call and the cancel hint in
         # the placeholder so the user sees what they're replying to.

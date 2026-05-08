@@ -2661,7 +2661,7 @@ class _UrwidApp:
         target = self._ui._target
         prefix = "(offline) " if self._ui._offline else ""
         if self._pending_edit is not None:
-            return [("yellow", f"{prefix}edit> ")]
+            return [("yellow", f"{prefix}edit (Esc cancel)> ")]
         # Reply-mode caption sandwiches a parent-call hint inside the
         # normal label so the user sees both the active thread and
         # what they're replying to. Esc cancels — see
@@ -2699,6 +2699,21 @@ class _UrwidApp:
         if self._pending_reply is None:
             return
         self._pending_reply = None
+        if self._input is not None:
+            self._input.set_edit_text("")
+        self._refresh_input_caption()
+
+    def _cancel_pending_edit(self) -> None:
+        """Drop edit mode and restore the standard input caption.
+
+        Called from the global Esc handler when ``_pending_edit`` is
+        set. The input was pre-filled with the row body in
+        ``_begin_edit``; clear it so the user isn't left with stale
+        text in a normal prompt. Idempotent.
+        """
+        if self._pending_edit is None:
+            return
+        self._pending_edit = None
         if self._input is not None:
             self._input.set_edit_text("")
         self._refresh_input_caption()
@@ -5120,11 +5135,11 @@ class _UrwidApp:
             self.action_unsub_channel()
             return True
         if key == "esc":
-            # Esc cancels an in-progress reply before refocusing the
-            # input. Edits aren't cancelled the same way — staying in
-            # edit mode across an Esc is consistent with the existing
-            # "type when ready" UX.
+            # Esc cancels an in-progress reply or edit before
+            # refocusing the input. The pre-filled row body stays in
+            # the prompt while editing, so cancelling clears it too.
             self._cancel_pending_reply()
+            self._cancel_pending_edit()
             self._focus_input()
             return True
         if key == "tab":
