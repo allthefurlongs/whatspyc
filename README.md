@@ -169,6 +169,7 @@ top level is rejected at config-load time.
 | `name` | `--name` | string | *(required)* | Display name in the type-`c` connect record. **Required**, in either the file or via the flag. |
 | `ui` | `--ui` | string | `"urwid"` | One of `"line"` (simple stdin/stdout REPL), `"textual"` (Textual multi-pane TUI), or `"urwid"` (urwid multi-pane TUI — lighter on slow hardware). See [TUI key bindings](#tui-key-bindings) below for the textual/urwid panes. |
 | `state_dir` | `--state-dir` | path | `$XDG_DATA_HOME/whatspyc` (i.e. `~/.local/share/whatspyc`) | Directory holding `state.sqlite3`. Created if missing. |
+| `node_state_dir` | *(none)* | path \| null | `null` | Root for per-callsign state directories used in `--nodecmd` mode (packet-node deployment, where one binary serves many users). Each call lands at `node_state_dir/<CALL>/` with its own `state.sqlite3` and `name.txt`. Required when running with `--nodecmd`; ignored otherwise. See [Packet-node deployment (`--nodecmd`)](#packet-node-deployment---nodecmd). |
 | `default_profile` | *(none)* | string \| null | `null` | Name of a configured profile to preselect in the picker / use under `--no-prompt`. Must match one of the `[[connect_profiles]]` names — typos are caught at config-load time. |
 | `history_backfill` | *(none)* | int | `3` | How many historic messages (DM target) or posts (channel target) to replay from the local SQLite store each time you switch target. The same count is the default for `/history` when no explicit count is given. Set to `0` to disable the auto-replay. |
 | `auto_backfill_post_count` | *(none)* | int \| null | `null` | Cap for paused (`pch`) channels at connect time and the default offered by `/sub`'s "how many historic posts?" prompt. When set: paused channels are auto-pulled at this cap; the `/sub` prompt's default reflects this value (capped at the actual `pc`). When unset/0: paused channels stay manual via `/unpause`, and `/sub` defaults to 10. |
@@ -371,6 +372,68 @@ Profile num (v for profile details, q to quit) [2]:
 Press Enter for the default; type `1` / `fake` / `2` / `via-mb7npw` to
 override; type `v` to re-display the list with transport details and
 each hop on its own line; type `q` to quit without connecting.
+
+## Packet-node deployment (`--nodecmd`)
+
+`--nodecmd` runs whatspyc as a command spawned by a packet node — one
+binary shared by many users, each reaching the node over a packet
+terminal. In this mode:
+
+- The user's callsign is read from **stdin** as the first line, with no
+  prompt printed (long-standing packet convention: the node hands the
+  callsign to the program automatically).
+- State is kept per-callsign under a configured root: `node_state_dir`
+  (top-level config key) holds a directory per call, e.g.
+  `node_state_dir/M0ABC/state.sqlite3`. The dir is created on first use.
+- The display name is read from `node_state_dir/<CALL>/name.txt`. If the
+  file is missing or empty, whatspyc writes `Please enter your name: `
+  to stdout and reads one line from stdin, then saves it for next time.
+- The UI is locked to `--ui line` — the only backend that talks raw
+  stdin/stdout cleanly over a packet link.
+
+`--nodecmd` rejects flags whose values would be ignored or override
+the per-call data: `--my-call`, `--state-dir`, and `--ui textual` /
+`--ui urwid` all error out at startup. The `--name` flag and any
+top-level `name = …` config key are ignored — only the per-call
+`name.txt` is consulted.
+
+```toml
+# ~/.config/whatspyc/config.toml on the node
+node_state_dir = "/var/lib/whatspyc/users"
+default_profile = "wps-loopback"   # see below
+
+[[connect_profiles]]
+name = "wps-loopback"
+transport = "direct-tcp"
+host = "127.0.0.1"
+port = 63001
+```
+
+Per-call state-dir layout:
+
+```
+/var/lib/whatspyc/users/
+  M0ABC/
+    state.sqlite3
+    name.txt
+  G7BAR/
+    state.sqlite3
+    name.txt
+```
+
+The on-stdin protocol is two lines on first use, one line afterwards:
+
+```
+M0ABC               <- callsign (always)
+Matt Tester         <- name (only on the very first run for that call)
+```
+
+> **Operator note — non-interactive profile selection.** For
+> `--nodecmd` to actually run unattended you also need to skip the
+> profile picker. Either set `default_profile` in config and pass
+> `--no-prompt`, or only define a single profile so the picker has
+> nothing to ask. `--nodecmd` doesn't add any validation here — that's
+> a deploy-time concern.
 
 ## Environment variables
 

@@ -119,6 +119,10 @@ class Config:
     my_call: str | None = None
     name: str | None = None
     state_dir: Path = field(default_factory=lambda: _default_state_dir())
+    # Root for per-callsign state directories used in ``--nodecmd`` mode
+    # (packet-node deployment, where one binary is shared by many users).
+    # Unused outside ``--nodecmd``.
+    node_state_dir: Path | None = None
     ui: str = "urwid"  # "line" or "textual" or "urwid"
     default_profile: str | None = None
     # How many historic messages/posts to replay from the local store when
@@ -387,6 +391,13 @@ def parse(raw: dict) -> Config:
         cfg.ui = v
     if "state_dir" in raw:
         cfg.state_dir = Path(raw["state_dir"])
+    if "node_state_dir" in raw:
+        v = raw["node_state_dir"]
+        if not isinstance(v, str) or not v:
+            raise ValueError(
+                f"config: node_state_dir must be a non-empty string path, got {v!r}"
+            )
+        cfg.node_state_dir = Path(v).expanduser()
     if "history_backfill" in raw:
         v = raw["history_backfill"]
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:

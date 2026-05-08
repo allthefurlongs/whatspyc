@@ -69,6 +69,72 @@ def _is_offline_profile(p: ConnectProfile) -> bool:
     return p.name == OFFLINE_PROFILE_NAME
 
 
+def _apply_nodecmd_mode(
+    c: cfg_mod.Config,
+    *,
+    ui_mode: str | None,
+    my_call_cli: str | None,
+    state_dir_cli: Path | None,
+) -> None:
+    """Apply ``--nodecmd`` mode in place: read callsign + (first-use) name
+    from stdin, derive a per-call state dir, force ``ui = "line"``.
+
+    Designed for packet-node deployment: the node hands the user's
+    callsign to the program on stdin (a long-standing convention) and the
+    program then drives a basic line UI over a packet terminal. Rejects
+    every flag whose value would override the stdin / per-call data
+    rather than silently ignoring them — operators should know if a
+    flag is being lost.
+    """
+    if ui_mode is not None and ui_mode != "line":
+        raise click.UsageError(
+            f"--nodecmd forces --ui line; --ui {ui_mode!r} cannot be used with it"
+        )
+    if my_call_cli is not None:
+        raise click.UsageError(
+            "--nodecmd takes the callsign from stdin; --my-call is not allowed"
+        )
+    if state_dir_cli is not None:
+        raise click.UsageError(
+            "--nodecmd derives state-dir from node_state_dir/<CALL>; "
+            "--state-dir is not allowed"
+        )
+    if c.node_state_dir is None:
+        raise click.UsageError(
+            "--nodecmd requires `node_state_dir` set in "
+            f"{cfg_mod.config_path()} — that's the root directory each "
+            "per-call state dir is created under"
+        )
+
+    raw_call = sys.stdin.readline()
+    call = raw_call.strip().upper()
+    if not call:
+        raise click.UsageError("--nodecmd: no callsign on stdin")
+
+    state_dir = Path(c.node_state_dir) / call
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    name_path = state_dir / "name.txt"
+    name: str | None = None
+    if name_path.exists():
+        existing = name_path.read_text(encoding="utf-8").strip()
+        if existing:
+            name = existing
+    if name is None:
+        sys.stdout.write("Please enter your name: ")
+        sys.stdout.flush()
+        raw_name = sys.stdin.readline()
+        name = raw_name.strip()
+        if not name:
+            raise click.UsageError("--nodecmd: no name on stdin")
+        name_path.write_text(name + "\n", encoding="utf-8")
+
+    c.my_call = call
+    c.name = name
+    c.state_dir = state_dir
+    c.ui = "line"
+
+
 def _build_stream_for(profile: ConnectProfile, my_call: str) -> AsyncByteStream:
     rhp_cfg = RhpConfig(
         pfam="ax25" if profile.ax_level.upper() == "L2" else "netrom",
@@ -307,6 +373,15 @@ class _VersionedCommand(click.Command):
     "slow hardware).",
 )
 @click.option(
+    "--nodecmd",
+    is_flag=True,
+    default=False,
+    help="Packet-node mode: read callsign from stdin (unprompted), "
+    "prompt for name on first use, store per-call state under "
+    "node_state_dir/<CALL>. Forces --ui line; rejects --my-call "
+    "and --state-dir.",
+)
+@click.option(
     "--log-level",
     default=None,
     help="Python logging level. Wins over config / WHATSPYC_LOG env var.",
@@ -326,17 +401,29 @@ class _VersionedCommand(click.Command):
     "pane, line UI → stderr. 'pane' is rejected with --ui line.",
 )
 def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_port, ax_level,
-         my_call, name, remote, state_dir, ui_mode, log_level, log_file,
+         my_call, name, remote, state_dir, ui_mode, nodecmd, log_level, log_file,
          log_console) -> None:
     """Connect to a WhatsPac service and drop into an interactive prompt."""
-    click.echo(
-        f"\nwhatspyc (v{__version__}) text-only WhatsPac client - WhatsPac is designed for "
-        "GUI experience, try it at http://whatspac.oarc.uk/\n"
-    )
+    # `--nodecmd` reads the callsign from stdin with no prompt printed
+    # first — that's the convention packet nodes follow. Skip the banner
+    # in that mode so the program's first stdout write is either the
+    # name prompt (first run for that call) or the connect output.
+    if not nodecmd:
+        click.echo(
+            f"\nwhatspyc (v{__version__}) text-only WhatsPac client - WhatsPac is designed for "
+            "GUI experience, try it at http://whatspac.oarc.uk/\n"
+        )
     try:
         c = cfg_mod.load()
     except ValueError as exc:
         raise click.UsageError(str(exc)) from None
+    if nodecmd:
+        _apply_nodecmd_mode(
+            c,
+            ui_mode=ui_mode,
+            my_call_cli=my_call,
+            state_dir_cli=state_dir,
+        )
     # Precedence: CLI flag > config key > env var (WHATSPYC_LOG, handled in
     # log.setup) > hardcoded WARNING. log_file has no env var.
     effective_ui = ui_mode or c.ui
