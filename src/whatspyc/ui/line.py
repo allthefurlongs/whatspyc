@@ -18,7 +18,14 @@ from typing import Callable
 
 from whatspyc.config import ChannelInfo
 from whatspyc.ui import help as help_data
-from whatspyc.ui import reply_prefix_text, resolve_reply_meta, ts_to_ms
+from whatspyc.ui import (
+    at_calls_from_row,
+    at_calls_prefix,
+    parse_post_mentions,
+    reply_prefix_text,
+    resolve_reply_meta,
+    ts_to_ms,
+)
 from whatspyc.ui.options import SessionOptions
 from whatspyc.wps.client import WpsClient
 
@@ -328,6 +335,7 @@ class LineUI:
                         r["channel_id"], r["from_call"], r["ts"], r["body"],
                         reply_prefix=self._reply_prefix("ch", str(int(key)), r),
                         lid=r["lid"],
+                        at_calls=at_calls_from_row(r),
                     )
 
     def _dm_peer(self, m: dict) -> tuple[str, bool]:
@@ -512,10 +520,18 @@ class LineUI:
             print(self._fmt_post_verbose(row))
             return
         target_key = str(int(cid)) if cid is not None else ""
+        # Prefer the persisted row's at_calls (already JSON-decoded) so
+        # cpb-replays render mentions even when the inbound dict on
+        # this code path doesn't carry them. Fall back to the wire
+        # dict for the synthetic local-mount case.
+        at_list = at_calls_from_row(row) if row else []
+        if not at_list and isinstance(p.get("at"), list):
+            at_list = [str(c).upper() for c in p.get("at") or []]
         self._print_post(
             cid, p.get("fc"), p.get("ts"), p.get("p"),
             reply_prefix=self._reply_prefix("ch", target_key, p),
             lid=row.get("lid") if row else None,
+            at_calls=at_list,
         )
 
     def _lookup_message(self, m: dict) -> dict | None:
@@ -560,10 +576,15 @@ class LineUI:
         *,
         reply_prefix: str = "",
         lid: int | None = None,
+        at_calls: list[str] | None = None,
     ) -> None:
         prefix = self._channel_prefix(int(cid)) if cid is not None else ""
         id_part = f"id:{lid} " if lid is not None else ""
-        print(f"{prefix}{id_part}{self._fmt_ts(ts)} {self._fmt_call(fc)}: {reply_prefix}{body}")
+        at_pref = at_calls_prefix(at_calls or [])
+        print(
+            f"{prefix}{id_part}{self._fmt_ts(ts)} {self._fmt_call(fc)}: "
+            f"{at_pref}{reply_prefix}{body}"
+        )
 
     def _reply_prefix(self, kind: str, target_key: str, row: dict) -> str:
         """Plain-text reply preview prefix for one row, or ``""``.
@@ -612,7 +633,10 @@ class LineUI:
         head = f"{prefix}ID: {lid} - {self._fmt_ts(ts)}"
         if middle:
             head = f"{head} - {middle}"
-        return f"{head} - {self._fmt_call(fc)}: {reply_prefix}{body}"
+        # DM rows have no at_calls column (the helper returns []); only
+        # post rows produce a non-empty mention prefix.
+        at_pref = at_calls_prefix(at_calls_from_row(row))
+        return f"{head} - {self._fmt_call(fc)}: {at_pref}{reply_prefix}{body}"
 
     def _verbose_status(self, row: dict) -> str | None:
         """Compute the middle 'state' segment of the verbose line.
@@ -866,9 +890,10 @@ class LineUI:
         body = obj.get("p", row.get("body", ""))
         fc = row.get("from_call")
         reply_pref = self._reply_prefix("ch", str(int(cid)), row)
+        at_pref = at_calls_prefix(at_calls_from_row(row))
         return (
             f"{prefix}{self._fmt_ts(edts)} {self._fmt_call(fc)}: "
-            f"{reply_pref}[EDITED] {body}"
+            f"{at_pref}{reply_pref}[EDITED] {body}"
         )
 
     def _paused_hint(self, cid: int, paused: int) -> str:
@@ -909,7 +934,11 @@ class LineUI:
                 # them talking past whatever's in the 700-post backlog.
                 print(self._paused_hint(cid, paused))
                 return
-            await self._client.post(cid, text)
+            body, at_calls = parse_post_mentions(text)
+            kwargs: dict = {}
+            if at_calls:
+                kwargs["at_calls"] = at_calls
+            await self._client.post(cid, body, **kwargs)
 
     def _is_subscribed(self, cid: int) -> bool:
         try:
@@ -1289,11 +1318,16 @@ class LineUI:
             if paused:
                 print(self._paused_hint(cid, paused))
                 return
+            reply_body, reply_ats = parse_post_mentions(" ".join(args[1:]))
+            extra: dict = {}
+            if reply_ats:
+                extra["at_calls"] = reply_ats
             await self._client.post(
                 cid,
-                " ".join(args[1:]),
+                reply_body,
                 reply_ts=int(row["ts"]),
                 reply_from=row["from_call"],
+                **extra,
             )
         elif cmd == "/react" and len(args) == 2:
             if self._refuse_offline("/react"):

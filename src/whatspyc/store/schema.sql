@@ -84,6 +84,12 @@ CREATE TABLE IF NOT EXISTS posts (
     -- doesn't replay edits/reactions whose target posts fell into the
     -- gap and will never arrive.
     is_gap       INTEGER NOT NULL DEFAULT 0,
+    -- JSON-encoded list of callsigns the post is addressed at, from the
+    -- wire's `at` field (web-client @-mention picker). NULL when no
+    -- mentions. The web client renders these as standalone styled tags
+    -- *before* the post body — they never appear inside `body`. Set on
+    -- the original `cp`; not editable (`cped` carries no `at`).
+    at_calls     TEXT,
     PRIMARY KEY (channel_id, ts)
 );
 

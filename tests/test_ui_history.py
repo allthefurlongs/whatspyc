@@ -340,7 +340,7 @@ def test_plain_text_to_unsubscribed_channel_is_blocked(tmp_path: Path, capsys) -
     ui._target = ("ch", "5")  # never subscribed
     posts: list = []
 
-    async def _fake_post(cid: int, text: str) -> None:
+    async def _fake_post(cid: int, text: str, **kwargs) -> None:
         posts.append((cid, text))
 
     ui._client.post = _fake_post  # type: ignore[attr-defined]
@@ -485,7 +485,7 @@ def test_plain_text_to_announcements_channel_is_blocked(
     ui._target = ("ch", "100")
     posts: list = []
 
-    async def _fake_post(cid: int, text: str) -> None:
+    async def _fake_post(cid: int, text: str, **kwargs) -> None:
         posts.append((cid, text))
 
     ui._client.post = _fake_post  # type: ignore[attr-defined]
@@ -508,7 +508,7 @@ def test_plain_text_to_paused_channel_is_blocked(tmp_path: Path, capsys) -> None
     ui._client._paused_channels[7] = 50  # type: ignore[attr-defined]
     posts: list = []
 
-    async def _fake_post(cid: int, text: str) -> None:
+    async def _fake_post(cid: int, text: str, **kwargs) -> None:
         posts.append((cid, text))
 
     ui._client.post = _fake_post  # type: ignore[attr-defined]

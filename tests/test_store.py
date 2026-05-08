@@ -143,6 +143,68 @@ def test_lookup_post_by_lid_round_trips(tmp_path: Path) -> None:
     s.close()
 
 
+def test_post_at_calls_round_trip_and_sticky(tmp_path: Path) -> None:
+    """``upsert_post`` persists the wire ``at`` array as JSON-encoded
+    ``at_calls``. Once set, it's sticky on subsequent upserts that omit
+    it (mirroring the web client's behaviour where ``cped`` doesn't
+    carry ``at`` and a cpb-replay round-trips the original value)."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(7, True)
+    s.upsert_post(
+        7,
+        {"ts": 100, "fc": "T3EST", "p": "hi", "at": ["M0ABC", "G7BAR"]},
+    )
+    row = s.lookup_post(7, 100)
+    assert row is not None
+    import json
+
+    assert json.loads(row["at_calls"]) == ["M0ABC", "G7BAR"]
+    # cpb-replay path: same row, no `at` on the dict — must not unset.
+    s.upsert_post(7, {"ts": 100, "fc": "T3EST", "p": "hi"})
+    row = s.lookup_post(7, 100)
+    assert row is not None
+    assert json.loads(row["at_calls"]) == ["M0ABC", "G7BAR"]
+    # Empty list is treated the same as missing — the wire never sends
+    # an empty list (web client only sets `at` when the picker has
+    # entries), so this is a harmless no-op rather than an erase.
+    s.upsert_post(7, {"ts": 100, "fc": "T3EST", "p": "hi", "at": []})
+    row = s.lookup_post(7, 100)
+    assert row is not None
+    assert json.loads(row["at_calls"]) == ["M0ABC", "G7BAR"]
+    s.close()
+
+
+def test_post_at_calls_uppercased(tmp_path: Path) -> None:
+    """Callsigns persist uppercase regardless of wire casing — matches
+    every other identity field (fc/tc/rfc) and the server's identity
+    rules."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(7, True)
+    s.upsert_post(
+        7,
+        {"ts": 100, "fc": "T3EST", "p": "hi", "at": ["m0abc", "g7BaR"]},
+    )
+    row = s.lookup_post(7, 100)
+    assert row is not None
+    import json
+
+    assert json.loads(row["at_calls"]) == ["M0ABC", "G7BAR"]
+    s.close()
+
+
+def test_post_at_calls_absent_when_no_mentions(tmp_path: Path) -> None:
+    """No `at` on the wire → at_calls is NULL, not an empty string or
+    "[]". Lets the render path tell "no mentions" from "explicit empty
+    list" cleanly even though the wire never produces the latter."""
+    s = SqliteStore(tmp_path / "state.sqlite3")
+    s.set_subscription(7, True)
+    s.upsert_post(7, {"ts": 100, "fc": "T3EST", "p": "hi"})
+    row = s.lookup_post(7, 100)
+    assert row is not None
+    assert row["at_calls"] is None
+    s.close()
+
+
 def test_post_rowid_survives_upsert_edit(tmp_path: Path) -> None:
     """Editing a post via upsert (same cid+ts) keeps the rowid stable —
     that's what makes the lid a usable handle for /editpost across

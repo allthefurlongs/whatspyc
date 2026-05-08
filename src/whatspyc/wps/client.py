@@ -360,7 +360,8 @@ class WpsClient:
         return msg_id
 
     async def post(self, channel_id: int, text: str, *, reply_ts: int | None = None,
-                   reply_from: str | None = None) -> int:
+                   reply_from: str | None = None,
+                   at_calls: list[str] | None = None) -> int:
         ts = int(time.time() * 1000)
         body = {
             "t": "cp",
@@ -373,6 +374,11 @@ class WpsClient:
             body["rts"] = reply_ts
         if reply_from:
             body["rfc"] = reply_from.upper()
+        if at_calls:
+            # Wire form is a JSON array of callsigns (web client:
+            # ``Ae.at = [...b.map(le => le.c)]``). Uppercase to match
+            # the server's identity rules and other outbound frames.
+            body["at"] = [c.upper() for c in at_calls]
         await self._send(body)
         self._store.upsert_post(channel_id, body)
         self._schedule_post_timeout(channel_id, ts)
@@ -544,6 +550,19 @@ class WpsClient:
             body["rts"] = row["reply_ts"]
         if row.get("reply_from"):
             body["rfc"] = row["reply_from"]
+        # Mention list is JSON-encoded in the row; decode + restore.
+        # `cped` resend skips this — the web client's edit frame
+        # doesn't carry `at` (mentions are immutable across edits).
+        at_raw = row.get("at_calls")
+        if at_raw:
+            try:
+                import json as _json
+
+                decoded = _json.loads(at_raw) if isinstance(at_raw, str) else at_raw
+                if isinstance(decoded, list) and decoded:
+                    body["at"] = [str(c).upper() for c in decoded]
+            except (TypeError, ValueError):
+                pass
         await self._send(body)
         self._schedule_post_timeout(int(channel_id), int(ts))
 

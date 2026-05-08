@@ -41,8 +41,10 @@ from whatspyc import log as log_mod
 _log = logging.getLogger(__name__)
 from whatspyc.config import ChannelInfo, ConnectProfile
 from whatspyc.ui import (
+    at_calls_from_row,
     emoji_for_display,
     emoji_to_wire,
+    parse_post_mentions,
     resolve_reply_meta,
     ts_to_ms,
 )
@@ -148,6 +150,14 @@ PALETTE: list[tuple[str, ...]] = [
     # `yellow` is the bright/light yellow on most terminals; `brown`
     # would be the duller variant.
     ("reply", "yellow", ""),
+    # `[@CALL]` mention tags. urwid's 16-colour palette has no
+    # "purple", but `light magenta` renders as a vivid purple on
+    # virtually every modern terminal (xterm, iTerm, Windows Terminal,
+    # tmux, etc. — the conventional ANSI mapping for code 13). A
+    # bolded variant covers self-mentions so the user can spot their
+    # own call without a second colour.
+    ("mention", "light magenta", ""),
+    ("mention_self", "light magenta,bold", ""),
     # ----- Focus variants for every attr that can appear in a row -----
     # Same trick as the header bar: the row's outer ``AttrMap`` has a
     # ``focus_map`` dict that re-maps each named attr to its
@@ -171,6 +181,11 @@ PALETTE: list[tuple[str, ...]] = [
     # vanish — flip to `dark gray` for the focused variant.
     ("focus_edited", "dark gray", "light gray"),
     ("focus_reply", "brown", "light gray"),
+    # On the focused-row light-gray background, the bright
+    # `light magenta` would stay legible but blend with the highlight;
+    # `dark magenta` keeps the same hue family and reads cleanly.
+    ("focus_mention", "dark magenta", "light gray"),
+    ("focus_mention_self", "dark magenta,bold", "light gray"),
 ]
 
 
@@ -197,6 +212,8 @@ FOCUS_MAP: dict[Any, str] = {
     "dim_default": "focus_dim_default",
     "edited": "focus_edited",
     "reply": "focus_reply",
+    "mention": "focus_mention",
+    "mention_self": "focus_mention_self",
 }
 
 
@@ -369,6 +386,7 @@ def _render_row_markup(
     show_edits: bool = True,
     reactions: list[dict] | None = None,
     reply_meta: dict | None = None,
+    at_calls: list[str] | None = None,
 ) -> list:
     """Build a urwid markup list for a single message/post.
 
@@ -386,6 +404,17 @@ def _render_row_markup(
     ts_attr_dim = pending
     parts: list = []
     reply_text = _reply_prefix_text(reply_meta)
+    # Pre-build the mention markup so both branches can splice it in
+    # the same spot (between ``actor: `` and the reply / body). All
+    # tags use the `mention` (purple/light-magenta) attr; self-
+    # mentions get the bolded variant so the user can spot their own
+    # call at a glance. The attrs map to focus_* equivalents via the
+    # row's FOCUS_MAP so the highlight covers them too.
+    at_markup: list = []
+    for c in at_calls or []:
+        c_up = c.upper()
+        attr = "mention_self" if c_up == my_call else "mention"
+        at_markup.append((attr, f"[@{c_up}] "))
     if verbose:
         head: list = [(body_attr, f"ID: {lid} - "), _ts_text(ts, dim=ts_attr_dim)]
         status = _verbose_status(
@@ -403,6 +432,7 @@ def _render_row_markup(
         parts.append((body_attr, " - "))
         parts.append(actor)
         parts.append((body_attr, ": "))
+        parts.extend(at_markup)
         if reply_text:
             parts.append(("reply", reply_text))
         parts.append((body_attr, body))
@@ -411,6 +441,7 @@ def _render_row_markup(
         parts.append((body_attr, " "))
         parts.append(actor)
         parts.append((body_attr, ": "))
+        parts.extend(at_markup)
         if reply_text:
             parts.append(("reply", reply_text))
         parts.append((body_attr, body))
@@ -708,6 +739,7 @@ class _MessageRow(urwid.WidgetWrap):
         reply_id: str | None = None,
         reply_ts: int | None = None,
         reply_from: str | None = None,
+        at_calls: list[str] | None = None,
     ) -> None:
         self.kind = kind
         self.tkey = target_key
@@ -724,6 +756,10 @@ class _MessageRow(urwid.WidgetWrap):
         self.reply_id = reply_id
         self.reply_ts = reply_ts
         self.reply_from = reply_from
+        # Mention list — set on the original `cp` and immutable across
+        # edits (the `cped` wire frame doesn't carry `at`), so this
+        # never changes after construction.
+        self.at_calls: list[str] = list(at_calls or [])
         self._render_key: tuple | None = None
         self._text = urwid.Text("", wrap="space")
         # ``focus_map`` is a dict so the highlight covers attribute-
@@ -777,6 +813,7 @@ class _MessageRow(urwid.WidgetWrap):
                 reactions_signature,
                 bool(self.from_call and self.from_call.upper() == my_call and self.delivered_ts is None),
                 reply_sig,
+                tuple(self.at_calls),
             )
             if key == self._render_key:
                 return
@@ -797,6 +834,7 @@ class _MessageRow(urwid.WidgetWrap):
             show_edits=show_edits,
             reactions=self.reactions,
             reply_meta=reply_meta,
+            at_calls=self.at_calls,
         )
         self._text.set_text(markup)
         self._render_key = key  # None if uncacheable
@@ -3103,6 +3141,7 @@ class _UrwidApp:
             reply_id=row.get("reply_id") or row.get("r"),
             reply_ts=row.get("reply_ts") or row.get("rts"),
             reply_from=row.get("reply_from") or row.get("rfc"),
+            at_calls=at_calls_from_row(row),
         )
         # Wire mouse-click → action menu so clicking a row opens the
         # Edit/Resend/React menu (same as Enter on the keyboard).
@@ -3998,23 +4037,26 @@ class _UrwidApp:
             else:
                 cid = int(reply["target_key"])
                 parent_ts = int(reply["natural_key"])
+                body, at_calls = parse_post_mentions(text)
+                extra: dict = {"at_calls": at_calls} if at_calls else {}
                 ts = await c.post(
                     cid,
-                    text,
+                    body,
                     reply_ts=parent_ts,
                     reply_from=reply["parent_call"],
+                    **extra,
                 )
-                await self._handle_inbound_post(
-                    {
-                        "cid": cid,
-                        "fc": self._ui._my_call,
-                        "ts": ts,
-                        "p": text,
-                        "rts": parent_ts,
-                        "rfc": reply["parent_call"],
-                    },
-                    batched=False,
-                )
+                local_frame: dict = {
+                    "cid": cid,
+                    "fc": self._ui._my_call,
+                    "ts": ts,
+                    "p": body,
+                    "rts": parent_ts,
+                    "rfc": reply["parent_call"],
+                }
+                if at_calls:
+                    local_frame["at"] = at_calls
+                await self._handle_inbound_post(local_frame, batched=False)
         except ValueError as exc:
             self._status_error(("yellow", f"[{exc}]"))
 
@@ -4087,18 +4129,22 @@ class _UrwidApp:
                         ("yellow", f"can't post to ch:{cid}: not subscribed (use /sub first)")
                     )
                     return
-                ts = await c.post(cid, text)
+                body, at_calls = parse_post_mentions(text)
+                extra: dict = {"at_calls": at_calls} if at_calls else {}
+                ts = await c.post(cid, body, **extra)
                 # Same optimistic-mount trick as DMs — server only
                 # acks via ``cpr``, doesn't echo ``cp`` back to sender.
-                await self._handle_inbound_post(
-                    {
-                        "cid": cid,
-                        "fc": self._ui._my_call,
-                        "ts": ts,
-                        "p": text,
-                    },
-                    batched=False,
-                )
+                # Mount with the stripped body + at so the local row
+                # matches what was sent and what the store now holds.
+                local_frame: dict = {
+                    "cid": cid,
+                    "fc": self._ui._my_call,
+                    "ts": ts,
+                    "p": body,
+                }
+                if at_calls:
+                    local_frame["at"] = at_calls
+                await self._handle_inbound_post(local_frame, batched=False)
         except Exception as e:
             self._status_error(("red", f"[send] {e}"))
 
@@ -4745,6 +4791,15 @@ class _UrwidApp:
                         row = None
                     if row is not None:
                         return row
+        # Wire `at` is a list; mirror the persisted JSON-string shape so
+        # at_calls_from_row decodes uniformly when this fallback row
+        # flows into _build_row.
+        at_wire = wire.get("at")
+        at_serialised = None
+        if isinstance(at_wire, list) and at_wire:
+            import json as _json
+
+            at_serialised = _json.dumps([str(c).upper() for c in at_wire])
         return {
             "id": wire.get("_id"),
             "ts": wire.get("ts"),
@@ -4758,6 +4813,7 @@ class _UrwidApp:
             "reply_id": wire.get("r"),
             "reply_ts": wire.get("rts"),
             "reply_from": wire.get("rfc"),
+            "at_calls": at_serialised,
         }
 
     def _mount_row_obj(

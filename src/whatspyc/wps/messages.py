@@ -381,7 +381,7 @@ class MessageEmojiBatch:
 @dataclass
 class ChannelPost:
     TYPE: ClassVar[str] = "cp"
-    _WIRE_KEYS: ClassVar[dict[str, str]] = {"post": "p"}
+    _WIRE_KEYS: ClassVar[dict[str, str]] = {"post": "p", "at_calls": "at"}
     _SERVER_ONLY: ClassVar[set[str]] = {"delivery_ts"}
 
     channel_id: int
@@ -391,6 +391,12 @@ class ChannelPost:
     reply_ts: int | None = None
     reply_from: str | None = None
     gap: int | None = None
+    # `at` on the wire — list of callsigns the post addresses (web-client
+    # @-mention picker). The web client stores these out-of-band from the
+    # body and renders them as styled tags before the body. Set on the
+    # original `cp`; the matching `cped` wire frame doesn't carry it, so
+    # mentions are immutable once a post is created.
+    at_calls: list[str] | None = None
     delivery_ts: int | None = None
 
 

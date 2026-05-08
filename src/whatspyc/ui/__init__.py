@@ -178,3 +178,72 @@ def emoji_to_wire(s: str) -> str:
     if len(s) == 1:
         return format(ord(s), "x")
     return s
+
+
+# AX.25 callsign: 1–6 alphanumerics, optional `-N` (N is 1–2 digits).
+_AT_TOKEN = re.compile(r"@([A-Za-z0-9]{1,6}(?:-[0-9]{1,2})?)(?=\s|$)")
+
+
+def parse_post_mentions(text: str) -> tuple[str, list[str]]:
+    """Strip leading ``@CALL`` tokens from ``text`` and return them
+    alongside the remaining body.
+
+    A token is ``@`` immediately followed by an AX.25-shaped callsign
+    (1–6 alphanumerics, optional ``-N`` SSID), followed by whitespace
+    or end-of-string. Tokens are consumed left-to-right until a
+    non-mention is encountered; everything after the last mention is
+    returned verbatim. Callsigns are uppercased and de-duplicated
+    (preserving first-seen order). The web client renders ``cp.at`` as
+    standalone styled tags before the post body, so we mirror that by
+    keeping mentions out of the body text entirely.
+    """
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    pos = 0
+    while True:
+        # Skip leading whitespace before each candidate token.
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        m = _AT_TOKEN.match(text, pos)
+        if not m:
+            break
+        call = m.group(1).upper()
+        if call not in seen_set:
+            seen.append(call)
+            seen_set.add(call)
+        pos = m.end()
+    return text[pos:].lstrip(), seen
+
+
+def at_calls_from_row(row: dict) -> list[str]:
+    """Decode a post row's ``at_calls`` column to a list of callsigns.
+
+    The store persists the list as a JSON-encoded string (``NULL`` when
+    no mentions). Returns ``[]`` for empty / missing / malformed values
+    so render code never has to handle the absence case.
+    """
+    raw = row.get("at_calls")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(c).upper() for c in raw]
+    try:
+        import json
+
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [str(c).upper() for c in decoded]
+
+
+def at_calls_prefix(at_calls: list[str]) -> str:
+    """Format a mention list as ``[@CALL] [@CALL] `` for plain-text
+    rendering — placed between the actor (``<Name, CALL>:``) and the
+    body. Empty list returns ``""`` so callers can unconditionally
+    concatenate.
+    """
+    if not at_calls:
+        return ""
+    return "".join(f"[@{c}] " for c in at_calls)

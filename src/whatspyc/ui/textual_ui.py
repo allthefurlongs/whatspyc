@@ -53,7 +53,13 @@ from whatspyc import log as log_mod
 from whatspyc.config import ChannelInfo, ConnectProfile
 from whatspyc.ui import emoji_for_display
 from whatspyc.ui import help as help_data
-from whatspyc.ui import resolve_reply_meta, ts_to_ms
+from whatspyc.ui import (
+    at_calls_from_row,
+    at_calls_prefix,
+    parse_post_mentions,
+    resolve_reply_meta,
+    ts_to_ms,
+)
 from whatspyc.ui.emoji_catalog import (
     EmojiEntry,
     build_catalog,
@@ -391,6 +397,7 @@ def _render_row(
     show_edits: bool = True,
     reactions: list[dict] | None = None,
     reply_meta: dict | None = None,
+    at_calls: list[str] | None = None,
 ) -> str:
     """Build a Rich-marked-up line for a single message/post.
 
@@ -419,6 +426,18 @@ def _render_row(
             edit_marker = f" [grey50]\\[Edited {edts_str}][/]"
 
     reply_pref = _reply_prefix_markup(reply_meta)
+    # All mention tags render in purple (CSS name — Rich also accepts
+    # `purple4`/`medium_purple` etc., but the bare CSS name is the
+    # safe form across both Rich and Textual). Self-mentions also pick
+    # up `bold` so the user spots their own call at a glance without
+    # needing a second colour.
+    at_markup = ""
+    for c in at_calls or []:
+        c_up = c.upper()
+        if c_up == my_call:
+            at_markup += f"[bold purple]\\[@{c_up}][/] "
+        else:
+            at_markup += f"[purple]\\[@{c_up}][/] "
     if verbose:
         head = f"ID: {lid} - {_fmt_ts(ts)}"
         status = _verbose_status(
@@ -432,9 +451,9 @@ def _render_row(
         )
         if status:
             head = f"{head} - [grey50]{status}[/]"
-        line = f"{head} - {actor}: {reply_pref}{body}"
+        line = f"{head} - {actor}: {at_markup}{reply_pref}{body}"
     else:
-        line = f"{_fmt_ts(ts)} {actor}: {reply_pref}{body}"
+        line = f"{_fmt_ts(ts)} {actor}: {at_markup}{reply_pref}{body}"
 
     if is_mine and delivered_ts is None:
         line = f"[dim]{line}[/]"
@@ -479,6 +498,7 @@ class MessageRow(ListItem):
         reply_id: str | None = None,
         reply_ts: int | None = None,
         reply_from: str | None = None,
+        at_calls: list[str] | None = None,
     ) -> None:
         # Keep a direct reference to the Static so refresh_label can
         # update it without going through query_one — query_one only
@@ -499,6 +519,10 @@ class MessageRow(ListItem):
         self.reply_id = reply_id
         self.reply_ts = reply_ts
         self.reply_from = reply_from
+        # Mention list lives next to the row so refresh_label can pass
+        # it straight into ``_render_row``. ``cped`` doesn't carry
+        # ``at`` so this never changes after construction.
+        self.at_calls: list[str] = list(at_calls or [])
         # `[{emoji, callsign, emoji_ts}, ...]` — populated from the
         # store on mount and mutated in place by inbound mem/cpem
         # handlers. The outbound react path writes through to the
@@ -562,6 +586,7 @@ class MessageRow(ListItem):
                     for r in self.reactions
                 ),
                 reply_sig,
+                tuple(self.at_calls),
             )
             if key == self._render_key:
                 return
@@ -582,6 +607,7 @@ class MessageRow(ListItem):
             show_edits=show_edits,
             reactions=self.reactions,
             reply_meta=reply_meta,
+            at_calls=self.at_calls,
         )
         self._render_key = key
         self._static.update(text)
@@ -2997,6 +3023,7 @@ class _WhatspycApp(App):
             reply_id=row.get("reply_id") or row.get("r"),
             reply_ts=row.get("reply_ts") or row.get("rts"),
             reply_from=row.get("reply_from") or row.get("rfc"),
+            at_calls=at_calls_from_row(row),
         )
 
     def _lookup_reactions(
@@ -4300,6 +4327,15 @@ class _WhatspycApp(App):
             except Exception:
                 row = None
         if row is None:
+            # at_calls is stored as a JSON string when persisted; the
+            # fallback row mirrors that shape so at_calls_from_row
+            # decodes uniformly. Wire `at` is a list, so json-encode here.
+            at_wire = p.get("at")
+            at_serialised = None
+            if isinstance(at_wire, list) and at_wire:
+                import json as _json
+
+                at_serialised = _json.dumps([str(c).upper() for c in at_wire])
             row = {
                 "channel_id": cid,
                 "from_call": p.get("fc"),
@@ -4309,6 +4345,7 @@ class _WhatspycApp(App):
                 "lid": None,
                 "reply_ts": p.get("rts"),
                 "reply_from": p.get("rfc"),
+                "at_calls": at_serialised,
             }
         lv = await self._ensure_message_view(target)
         with self._batch_mutate():
@@ -4747,6 +4784,7 @@ class _WhatspycApp(App):
             show_edits=self._ui._options.show_edits,
             reactions=reactions,
             reply_meta=None,
+            at_calls=at_calls_from_row(parent) if parent_kind == "ch" else None,
         )
         if parent_kind == "dm":
             header = f"[bold]Reply-to message from {parent.get('from_call') or ''}[/]"
@@ -4875,18 +4913,22 @@ class _WhatspycApp(App):
                     if paused:
                         self._write_to_active(self._paused_hint(cid, paused))
                         return
-                    ts = await c.post(cid, text)
+                    body, at_calls = parse_post_mentions(text)
+                    extra: dict = {"at_calls": at_calls} if at_calls else {}
+                    ts = await c.post(cid, body, **extra)
                     # Server only sends back a `cpr` ack — never echoes the
                     # `cp` frame to the sender — so mount the row locally.
-                    await self._handle_inbound_post(
-                        {
-                            "cid": cid,
-                            "fc": self._ui._my_call,
-                            "ts": ts,
-                            "p": text,
-                        },
-                        batched=False,
-                    )
+                    # Pass the stripped body + at so the local row matches
+                    # what the wire and the store hold.
+                    local_frame: dict = {
+                        "cid": cid,
+                        "fc": self._ui._my_call,
+                        "ts": ts,
+                        "p": body,
+                    }
+                    if at_calls:
+                        local_frame["at"] = at_calls
+                    await self._handle_inbound_post(local_frame, batched=False)
         except Exception as exc:
             self._status_error(f"[red][error][/] {exc}")
 
@@ -4931,23 +4973,26 @@ class _WhatspycApp(App):
             else:
                 cid = int(reply["target_key"])
                 parent_ts = int(reply["natural_key"])
+                body, at_calls = parse_post_mentions(text)
+                extra: dict = {"at_calls": at_calls} if at_calls else {}
                 ts = await c.post(
                     cid,
-                    text,
+                    body,
                     reply_ts=parent_ts,
                     reply_from=reply["parent_call"],
+                    **extra,
                 )
-                await self._handle_inbound_post(
-                    {
-                        "cid": cid,
-                        "fc": self._ui._my_call,
-                        "ts": ts,
-                        "p": text,
-                        "rts": parent_ts,
-                        "rfc": reply["parent_call"],
-                    },
-                    batched=False,
-                )
+                local_frame: dict = {
+                    "cid": cid,
+                    "fc": self._ui._my_call,
+                    "ts": ts,
+                    "p": body,
+                    "rts": parent_ts,
+                    "rfc": reply["parent_call"],
+                }
+                if at_calls:
+                    local_frame["at"] = at_calls
+                await self._handle_inbound_post(local_frame, batched=False)
         except ValueError as exc:
             self._status_error(f"[yellow][{exc}][/]")
 

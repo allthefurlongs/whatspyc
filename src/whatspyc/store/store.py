@@ -50,6 +50,7 @@ class SqliteStore:
             ("posts", "delivered_ts", "INTEGER"),
             ("posts", "ets", "INTEGER"),
             ("posts", "is_gap", "INTEGER NOT NULL DEFAULT 0"),
+            ("posts", "at_calls", "TEXT"),
             ("message_emojis", "callsign", "TEXT NOT NULL DEFAULT ''"),
             ("channels", "last_read_ts", "INTEGER NOT NULL DEFAULT 0"),
         ):
@@ -480,11 +481,23 @@ class SqliteStore:
     ) -> None:
         rt = None if realtime is None else (1 if realtime else 0)
         is_gap = 1 if p.get("g") else 0
+        # `at` arrives as a JSON list on the wire; persist as a JSON
+        # string so the column round-trips losslessly. Empty / missing
+        # → NULL so render code can distinguish "no mentions" from
+        # "explicit empty list" (the wire never sends an empty list).
+        at_raw = p.get("at")
+        if isinstance(at_raw, list) and at_raw:
+            import json as _json
+
+            at_calls = _json.dumps([str(c).upper() for c in at_raw])
+        else:
+            at_calls = None
         with self._conn:
             self._conn.execute(
                 "INSERT INTO posts(channel_id, ts, from_call, body, edit_ts, ets,"
-                " reply_ts, reply_from, received_ts, realtime, delivered_ts, is_gap)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " reply_ts, reply_from, received_ts, realtime, delivered_ts, is_gap,"
+                " at_calls)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(channel_id, ts) DO UPDATE SET body=excluded.body,"
                 " edit_ts=COALESCE(excluded.edit_ts, posts.edit_ts),"
                 # ets is server-monotonic; bump rather than overwrite so a
@@ -503,7 +516,11 @@ class SqliteStore:
                 " delivered_ts=COALESCE(posts.delivered_ts, excluded.delivered_ts),"
                 # Gap flag is sticky — once a post has been observed as a
                 # gap-marker on any code path, leave it set.
-                " is_gap=MAX(posts.is_gap, excluded.is_gap)",
+                " is_gap=MAX(posts.is_gap, excluded.is_gap),"
+                # at_calls is set on the original `cp`; cped/cpb-replay
+                # frames don't carry it, so a later upsert that omits it
+                # can't unset an observed mention list.
+                " at_calls=COALESCE(posts.at_calls, excluded.at_calls)",
                 (
                     channel_id,
                     p["ts"],
@@ -517,6 +534,7 @@ class SqliteStore:
                     rt,
                     delivered_ts,
                     is_gap,
+                    at_calls,
                 ),
             )
             self._conn.execute(
