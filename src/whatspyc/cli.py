@@ -702,6 +702,7 @@ async def _run_session_driven(
         bell_on_activity=c.bell_on_activity,
         notify_new_dms=c.notify_new_dms,
         notify_new_posts=c.notify_new_posts,
+        notify_user_conn=c.notify_user_conn,
     )
     # Picker entries: <offline> at index 0, then configured profiles.
     available = [_OFFLINE_PROFILE] + list(c.connect_profiles)
@@ -910,6 +911,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
         bell_on_activity=c.bell_on_activity,
         notify_new_dms=c.notify_new_dms,
         notify_new_posts=c.notify_new_posts,
+        notify_user_conn=c.notify_user_conn,
     )
     if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]
@@ -993,6 +995,7 @@ async def _connect_and_run_ui(
         bell_on_activity=c.bell_on_activity,
         notify_new_dms=c.notify_new_dms,
         notify_new_posts=c.notify_new_posts,
+        notify_user_conn=c.notify_user_conn,
     )
     if c.ui == "textual":
         ui = TextualUI(  # type: ignore[arg-type]

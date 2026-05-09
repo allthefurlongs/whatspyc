@@ -194,6 +194,13 @@ class Config:
     # (cped) are unaffected and always render. Ignored by the textual
     # / urwid backends.
     notify_new_posts: bool = True
+    # Line UI only. When True (default), uc/ud events print
+    # ``[user] CALL connected`` / ``... disconnected`` lines. False →
+    # silent (the client's in-memory online roster is still updated;
+    # /who reflects the current set). Toggleable per session via
+    # ``/set notify_user_conn``. Ignored by the textual / urwid
+    # backends — they have their own roster pane.
+    notify_user_conn: bool = True
     # Where Python logging writes. ``None`` keeps the default basicConfig
     # destination (stderr); a path routes records to a file (and creates
     # the parent dir if missing). Useful with ``--ui textual`` /
@@ -496,6 +503,13 @@ def parse(raw: dict) -> Config:
                 f"config: notify_new_posts must be a boolean, got {v!r}"
             )
         cfg.notify_new_posts = v
+    if "notify_user_conn" in raw:
+        v = raw["notify_user_conn"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"config: notify_user_conn must be a boolean, got {v!r}"
+            )
+        cfg.notify_user_conn = v
     if "log_file" in raw:
         v = raw["log_file"]
         if not isinstance(v, str) or not v:

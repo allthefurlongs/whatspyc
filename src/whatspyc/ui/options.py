@@ -64,75 +64,52 @@ class _OptionSpec:
 _SPECS: dict[str, _OptionSpec] = {
     "show_acks": _OptionSpec(
         name="show_acks",
-        description="Show [ack] line when a DM/post is delivered to the server.",
+        description="Show [ack] when DM/post delivered to server.",
         parse=_parse_bool,
         format=_format_bool,
         line_only=True,
     ),
     "show_edits": _OptionSpec(
         name="show_edits",
-        description=(
-            "Mark edited DMs/posts with a grey [Edited <ts>] suffix "
-            "(textual/urwid in-place; line UI emits a separate [EDITED] "
-            "line on real-time med/cped). Off → row updates silently."
-        ),
+        description="Display when a post/DM has been edited.",
         parse=_parse_bool,
         format=_format_bool,
     ),
     "verbose_history": _OptionSpec(
         name="verbose_history",
-        description=(
-            "Render messages/posts in verbose form (id, timestamp, "
-            "delivery state). /vhistory is always verbose regardless."
-        ),
+        description="Display messages with more metadata.",
         parse=_parse_bool,
         format=_format_bool,
     ),
     "delivery_timeout_s": _OptionSpec(
         name="delivery_timeout_s",
-        description=(
-            "Seconds before an outbound DM/post with no ack flips from "
-            "'Delivering...' to 'NOT DELIVERED' in verbose render."
-        ),
+        description='Secs before unacked msg shows as "not delivered".',
         parse=_parse_positive_int,
         format=_format_int,
     ),
     "bell_on_activity": _OptionSpec(
         name="bell_on_activity",
-        description=(
-            "Ring the terminal bell on every real-time DM (m) or "
-            "channel post (cp). Batch arrivals (mb/cpb) do not ring."
-        ),
+        description="Ring terminal bell on real-time post or DM.",
         parse=_parse_bool,
         format=_format_bool,
     ),
     "notify_new_dms": _OptionSpec(
         name="notify_new_dms",
-        description=(
-            "Line UI only. When on (default), live DMs that aren't for "
-            "the current /dm target are summarised as "
-            "[New DMs from CALL (N)] instead of printing the body — "
-            "/dm CALL clears that peer's count and shows the thread. "
-            "Off → fully silent; the row is still stored, /dm CALL to "
-            "read. DMs for the active target and your own echoes are "
-            "always rendered in full."
-        ),
+        description="Print when new DMs arrive outside your target.",
         parse=_parse_bool,
         format=_format_bool,
         line_only=True,
     ),
     "notify_new_posts": _OptionSpec(
         name="notify_new_posts",
-        description=(
-            "Line UI only. When on (default), live channel posts in "
-            "channels other than the current /ch target are summarised "
-            "as [New posts in CID:#name (N)] instead of printing the "
-            "body — /ch CID clears that channel's count and shows "
-            "history. Off → fully silent; the post is still stored, "
-            "/ch CID to read. Posts in the active channel and your own "
-            "echoes are always rendered in full. Edits (cped) are "
-            "unaffected — they always print regardless."
-        ),
+        description="Print when new posts arrive outside your target.",
+        parse=_parse_bool,
+        format=_format_bool,
+        line_only=True,
+    ),
+    "notify_user_conn": _OptionSpec(
+        name="notify_user_conn",
+        description="Print when a user connects or disconnects.",
         parse=_parse_bool,
         format=_format_bool,
         line_only=True,
@@ -158,6 +135,7 @@ class SessionOptions:
         bell_on_activity: bool = True,
         notify_new_dms: bool = True,
         notify_new_posts: bool = True,
+        notify_user_conn: bool = True,
     ) -> None:
         self.show_acks = show_acks
         self.show_edits = show_edits
@@ -166,6 +144,7 @@ class SessionOptions:
         self.bell_on_activity = bell_on_activity
         self.notify_new_dms = notify_new_dms
         self.notify_new_posts = notify_new_posts
+        self.notify_user_conn = notify_user_conn
 
     @classmethod
     def names(cls, *, include_line_only: bool = True) -> list[str]:

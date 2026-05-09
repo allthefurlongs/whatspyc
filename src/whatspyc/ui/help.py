@@ -254,7 +254,7 @@ COMMANDS: dict[str, CommandHelp] = {
     "/history": CommandHelp(
         name="/history",
         usage="/history [N]",
-        summary="Show messages in compact form (TUI: refresh in place; line: replay N).",
+        summary="Show messages in compact form.",
         details=(
             "Line UI: re-prints the last N messages (DM target) or "
             "posts (channel target) from the local store. Without N, "
@@ -271,7 +271,7 @@ COMMANDS: dict[str, CommandHelp] = {
     "/vhistory": CommandHelp(
         name="/vhistory",
         usage="/vhistory [N]",
-        summary="Show messages in verbose form (TUI: refresh in place; line: one-shot replay).",
+        summary="Show messages in verbose form.",
         details=(
             "Line UI: like /history but always renders the verbose "
             "form (local id, timestamp, delivery state for outbound, "

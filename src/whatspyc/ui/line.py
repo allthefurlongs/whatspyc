@@ -118,9 +118,11 @@ class LineUI:
             else:
                 print(f"[{ref}] {state}")
         elif t == "uc":
-            print(f"[user] {self._fmt_user(obj.get('c'))} connected")
+            if self._options.notify_user_conn:
+                print(f"[user] {self._fmt_user(obj.get('c'))} connected")
         elif t == "ud":
-            print(f"[user] {self._fmt_user(obj.get('c'))} disconnected")
+            if self._options.notify_user_conn:
+                print(f"[user] {self._fmt_user(obj.get('c'))} disconnected")
         elif t == "o":
             print(f"[online] {', '.join(self._fmt_user(c) for c in obj.get('o', []))}")
         elif t == "pch":
@@ -1150,11 +1152,11 @@ class LineUI:
         ``/set NAME VALUE`` updates one for the running session."""
         if not args:
             print("Session settings (use /set NAME VALUE to change):")
-            for n in self._options.names():
-                print(
-                    f"  {n} = {self._options.format(n)}"
-                    f"   {self._options.describe(n)}"
-                )
+            names = self._options.names()
+            pairs = [(n, f"{n} = {self._options.format(n)}") for n in names]
+            width = max(len(p) for _, p in pairs)
+            for n, head in pairs:
+                print(f"  {head:<{width}}  {self._options.describe(n)}")
             return
         name = args[0]
         if name not in self._options.names():
