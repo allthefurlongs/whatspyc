@@ -4,7 +4,7 @@ Two sinks are independently controllable:
 
 * ``log_file`` — append records to a rotating-free flat file.
 * ``log_console`` — one of ``"stderr"`` (the historic default for the line
-  UI), ``"pane"`` (route through the TUI's status pane via callbacks the
+  UI), ``"pane"`` (route through the TUI's log pane via callbacks the
   TUI registers on mount), or ``"off"`` (no console sink at all).
 
 ``"auto"`` is resolved upstream in ``cli.main`` to ``"pane"`` for ``--ui
@@ -107,7 +107,7 @@ def remove_pane_handler(handler: logging.Handler | None) -> None:
 
 
 class _PaneLogHandler(logging.Handler):
-    """Bridges a logging record into the TUI status pane.
+    """Bridges a logging record into the TUI log pane.
 
     The pane has ``markup=True`` so the colour prefix is rendered as
     Rich markup. ERROR / CRITICAL go through the error callback, which

@@ -175,8 +175,9 @@ top level is rejected at config-load time.
 | `default_profile` | *(none)* | string \| null | `null` | Name of a configured profile to preselect in the picker / use under `--no-prompt`. Must match one of the `[[connect_profiles]]` names — typos are caught at config-load time. |
 | `history_backfill` | *(none)* | int | `3` | How many historic messages (DM target) or posts (channel target) to replay from the local SQLite store each time you switch target. The same count is the default for `/history` when no explicit count is given. Set to `0` to disable the auto-replay. |
 | `auto_backfill_post_count` | *(none)* | int \| null | `null` | Cap for paused (`pch`) channels at connect time and the default offered by `/sub`'s "how many historic posts?" prompt. When set: paused channels are auto-pulled at this cap; the `/sub` prompt's default reflects this value (capped at the actual `pc`). When unset/0: paused channels stay manual via `/unpause`, and `/sub` defaults to 10. |
-| `auto_reconnect` | *(none)* | bool | `false` | When the link drops unexpectedly (EOF / read error), should the client transparently rebuild it? Off by default — the session ends and you re-run `whatspyc`. Turn on for unattended runs that need to ride out temporary node / transport hiccups. The `connect_sequence` replays automatically on every reconnect. See [Reconnect behaviour](#reconnect-behaviour). |
-| `reconnect_max_retries` | *(none)* | int | `0` | Cap on consecutive reconnect attempts when `auto_reconnect` is on. `0` means retry forever. Anything > 0 gives up after that many failed attempts and prints `[link] giving up after N reconnect attempts`. Ignored when `auto_reconnect = false`. |
+| `auto_reconnect` | `--auto-reconnect` | bool | `false` | When the link drops unexpectedly (EOF / read error), should the client transparently rebuild it? Off by default — the session ends and you re-run `whatspyc`. Turn on for unattended runs that need to ride out temporary node / transport hiccups. The `connect_sequence` replays automatically on every reconnect. CLI flag accepts `true`/`false` (and the usual click synonyms — `yes`/`no`, `1`/`0`). See [Reconnect behaviour](#reconnect-behaviour). |
+| `reconnect_max_retries` | `--reconnect-max-retries` | int | `0` | Cap on consecutive reconnect attempts when `auto_reconnect` is on. `0` means retry forever. Anything > 0 gives up after that many failed attempts and prints `[link] giving up after N reconnect attempts`. Ignored when `auto_reconnect = false`. |
+| `max_inactivity_mins` | *(none)* | int \| null | `null` | Application-level idle hangup, mirroring the web client's `timeoutTriggeredDisconnect`. After this many minutes with no user-initiated outbound traffic (DM, post, subscribe, reaction, etc.), the client closes the link and does **not** auto-reconnect — printing `[link] silence-disconnect — no traffic for too long`. Background keep-alives don't count as activity. `null` (default) disables the guard so the link only drops on real network/transport faults. Set to e.g. `240` to match the web client's hardcoded 4-hour cap. |
 | `show_acks` | *(none)* | bool | `true` | Display the `[ack] [dm:CALL] msg LID …` / `[ack] [ch:N #name] post LID …` confirmation each time the server acknowledges a delivered DM (`mr`) or post (`cpr`). The `LID` is the local row id (same handle `/retrydm` / `/retrypost` take). Toggleable per session via `/set show_acks on|off` — useful confirmation on a slow link, noisy on a fast one. Note this only suppresses the *positive* ack line; the `[timeout] …` notice (see `delivery_timeout_s`) still prints when an ack fails to arrive in time. |
 | `show_edits` | *(none)* | bool | `true` | Mark edited DMs/posts so an edit is visible after the fact. **Textual / urwid:** the row's body keeps its original timestamp and gains a grey ` [Edited 2026-05-07 10:05:12]` suffix using the edit's `edts`; the marker is in-place and applies to every edited row in view (live, history backfill, connect-batch). **Line UI:** prints a separate `[EDITED] <new body>` line on real-time `med` / `cped` only — connect-batch edits (`medb` / `cpedb`) update silently because they're catch-up, not "live". Off → no marker is shown anywhere; the local store still updates so `/history` reflects the new body. Toggleable per session via `/set show_edits on|off`; flipping it repaints mounted rows in the textual / urwid backends. |
 | `verbose_history` | *(none)* | bool | `false` | Default rendering style for `/history`, target-switch backfill, and live arrivals. Compact form: `100 #lounge> [ts] <Bob, M6HKD>: msg`. Verbose form: `100 #lounge> ID: 71 - [ts] - Received real-time in 7s - <Bob, M6HKD>: msg` (inbound realtime), and `Delivered to server in 23s` / `Delivering...` / `NOT DELIVERED` for outbound. Toggleable per session via `/set verbose_history on|off`. `/vhistory` is always verbose regardless. |
@@ -187,7 +188,7 @@ top level is rejected at config-load time.
 | `notify_user_conn` | *(none)* | bool | `true` | **Line UI only.** When a `uc` / `ud` event arrives, emit a `[user] CALL connected` / `[user] CALL disconnected` line. Set to `false` to be fully silent for those events — the in-memory online roster is still updated, so `/who` reflects the current set. Toggleable per session via `/set notify_user_conn on\|off`. The textual / urwid backends have their own roster pane and ignore this option (it does not appear in their Settings modal). |
 | `log_level` | `--log-level` | string | `WARNING` | Python logging level (`CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `NOTSET`, case-insensitive). Resolution order: `--log-level` > `log_level` config key > `WHATSPYC_LOG` env var > built-in `WARNING`. |
 | `log_file` | `--log-file` | path \| null | `null` | Append log records to this file. Additive — the console sink (see `log_console`) is unaffected, so any combination of file + console + neither is valid. The parent directory is created if missing. CLI flag wins over the config key; no env var. |
-| `log_console` | `--log-console` | string | `"auto"` | Where the console-shaped log sink writes. Independent of `log_file`. Values: `"auto"` → status pane in TUI, stderr in line UI; `"stderr"` → always stderr (corrupts the TUI surface — opt-in only); `"pane"` → status pane (TUI only; line UI is **rejected** at startup); `"off"` → no console sink, file only (or silent if `log_file` is unset). In pane mode, `WARNING` and below appear in the pane (yellow for warnings); `ERROR`+ auto-shows the pane if it's hidden. |
+| `log_console` | `--log-console` | string | `"auto"` | Where the console-shaped log sink writes. Independent of `log_file`. Values: `"auto"` → log pane in TUI, stderr in line UI; `"stderr"` → always stderr (corrupts the TUI surface — opt-in only); `"pane"` → log pane (TUI only; line UI is **rejected** at startup); `"off"` → no console sink, file only (or silent if `log_file` is unset). In pane mode, `WARNING` and below appear in the pane (yellow for warnings); `ERROR`+ auto-shows the pane if it's hidden. |
 | `low_power_mode` | *(none)* | bool | `false` | Bundled "run on slow hardware" preset. When `true`, fills in any unset perf knob with a low-cost default: `textual_fps = 15`, `textual_animations = false`, `textual_smooth_scroll = false`. Per-knob explicit settings always win over the preset. Only affects `--ui textual`; urwid has no equivalent costs (no FPS cap, no animations, no compositor) so `low_power_mode` is a no-op there. Restart required (the underlying knobs all are). |
 | `textual_fps` | *(none)* | int (1–60) | `60` | Frame-rate cap for the Textual driver. Sets `TEXTUAL_FPS` before app startup. Drop to 30 / 15 on slow hardware to cut idle CPU. Textual-only. **Restart required** — Textual reads the env var once during `App.__init__`. |
 | `textual_animations` | *(none)* | bool | `true` | Disable Textual's animations (sets `TEXTUAL_ANIMATIONS=0`). Saves cycles on slow terminals where eased transitions look janky anyway. Textual-only. **Restart required.** |
@@ -468,18 +469,17 @@ the `textual_*` perf knobs (`textual_fps` etc.), which are Textual-only.
 
 The urwid backend deliberately uses a different set of Ctrl-bindings
 than Textual to avoid collisions with the terminal/tty layer:
-`Ctrl+X` for quit (Textual: `Ctrl+Q`), `Ctrl+L` for the status pane
-(Textual: `Ctrl+S`), `F1` for help (Textual: `Ctrl+H`). `Ctrl+S` /
-`Ctrl+Q` are XOFF / XON flow control on most terminals (and can be
-intercepted by tmux / screen / ssh sessions); `Ctrl+H` is backspace.
-The Textual backend papers over those collisions with its own
-keymap; urwid takes the simpler route of using safer keys.
+`Ctrl+X` for quit (Textual: `Ctrl+Q`), `F1` for help (Textual:
+`Ctrl+H`). `Ctrl+Q` is XON flow control on most terminals (and can
+be intercepted by tmux / screen / ssh sessions); `Ctrl+H` is
+backspace. The Textual backend papers over those collisions with
+its own keymap; urwid takes the simpler route of using safer keys.
 
 Layout:
 
 ```
 ┌─Header───────────────────────────────────────────┐
-├Tabs───┬─Status pane (Ctrl+L, hidden by default)──┤
+├Tabs───┬─Log pane (Ctrl+L, hidden by default)─────┤
 │Ch DM  ├───────────────────────────────────────────┤
 ├───────┤ Per-target message ListView              │
 │ch list│  (arrow-key selectable, auto-loads older │
@@ -504,7 +504,7 @@ Layout:
 | `Enter` (in message list) | ✓ | ✓ | Open action menu — Edit / Resend / React / Reply, plus *View Full Reply-To* on rows that reply to a DM/post in the local store (Edit & Resend disabled for messages you didn't send). Picking *Reply* enters reply mode: the input prompt gains a `(REPLY TO: CALL, Esc cancel reply)` suffix; the next plain-text submit is sent as a reply, Esc cancels and restores the standard prompt. |
 | `Ctrl+H` (textual) / `F1` (both) | ✓ | ✓ | Modal help screen — key bindings + slash commands |
 | `Ctrl+D` | ✓ | ✓ | Toggle detailed (verbose) render — live re-renders every mounted row |
-| `Ctrl+S` (textual) / `Ctrl+L` (urwid) | ✓ | ✓ | Toggle the status pane — chronological log of acks, edits, and link events |
+| `Ctrl+L` | ✓ | ✓ | Toggle the log pane — chronological log of acks, edits, and link events |
 | `Ctrl+E` | ✓ | ✓ | Searchable, tabbed emoji picker — opens the same modal used for reactions. Tabs select a CLDR group (`★ Quick`, Smileys, People, Animals, Food, Travel, Activity, Objects, Symbols, Flags); People has a second tab strip for subgroups. Type into the search box to filter the full catalogue across every group, ↑↓←→ inside the grid, PgUp/PgDn to page, Home/End for ends, Enter to insert |
 | `Ctrl+O` | ✓ | ✓ | Open the Settings modal |
 | `Ctrl+U` | ✓ | ✓ | Unsubscribe from the active channel (with confirm) |
@@ -519,7 +519,7 @@ Behaviour:
   false` the body just changes silently. When an `mr` / `cpr` ack
   arrives for one of your sends, the row gets a `✓` (compact mode) or
   `Delivered in Xs` (verbose mode) suffix.
-- **Status pane (Ctrl+S in textual / Ctrl+L in urwid).** Hidden by default. When open, every ack
+- **Log pane (Ctrl+L).** Hidden by default. When open, every ack
   and edit also lands in a chronological log at the top of the
   centre pane. The message-row tick is updated regardless of whether
   this pane is visible.

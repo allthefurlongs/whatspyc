@@ -395,6 +395,21 @@ class _VersionedCommand(click.Command):
     "and --state-dir.",
 )
 @click.option(
+    "--auto-reconnect",
+    type=click.BOOL,
+    default=None,
+    help="Override the `auto_reconnect` config key. Accepts true/false. "
+    "When on, the client transparently rebuilds the link with exponential "
+    "backoff after an unexpected drop.",
+)
+@click.option(
+    "--reconnect-max-retries",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Override the `reconnect_max_retries` config key. Cap on consecutive "
+    "reconnect attempts when --auto-reconnect is on; 0 means retry forever.",
+)
+@click.option(
     "--log-level",
     default=None,
     help="Python logging level. Wins over config / WHATSPYC_LOG env var.",
@@ -423,8 +438,8 @@ class _VersionedCommand(click.Command):
     "at its default location.",
 )
 def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_port, ax_level,
-         my_call, name, remote, state_dir, ui_mode, nodecmd, log_level, log_file,
-         log_console, conf) -> None:
+         my_call, name, remote, state_dir, ui_mode, nodecmd, auto_reconnect,
+         reconnect_max_retries, log_level, log_file, log_console, conf) -> None:
     """Connect to a WhatsPac service and drop into an interactive prompt."""
     # `--nodecmd` reads the callsign from stdin with no prompt printed
     # first — that's the convention packet nodes follow. Skip the banner
@@ -458,7 +473,7 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
     elif effective_console == "pane" and not _is_full_screen_ui:
         raise click.UsageError(
             "log_console = 'pane' requires --ui textual or --ui urwid "
-            "(the line UI has no status pane to write to)."
+            "(the line UI has no log pane to write to)."
         )
     log.setup(
         level=log_level or c.log_level,
@@ -475,6 +490,10 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
         c.state_dir = state_dir
     if ui_mode is not None:
         c.ui = ui_mode
+    if auto_reconnect is not None:
+        c.auto_reconnect = auto_reconnect
+    if reconnect_max_retries is not None:
+        c.reconnect_max_retries = reconnect_max_retries
     if not c.my_call:
         raise click.UsageError("--my-call is required (or set in ~/.config/whatspyc/config.toml)")
     if not c.name:
@@ -633,6 +652,7 @@ def _make_connection_opener(c: cfg_mod.Config, store: SqliteStore):
                 auto_reconnect=False,
                 reconnect_max_retries=0,
                 delivery_timeout_s=c.delivery_timeout_s,
+                keepalive_max_minutes=c.max_inactivity_mins,
             )
             state["client"] = client
             if on_client_ready is not None:
@@ -657,6 +677,7 @@ def _make_connection_opener(c: cfg_mod.Config, store: SqliteStore):
             auto_reconnect=c.auto_reconnect,
             reconnect_max_retries=c.reconnect_max_retries,
             delivery_timeout_s=c.delivery_timeout_s,
+            keepalive_max_minutes=c.max_inactivity_mins,
         )
         state["client"] = client
         if on_client_ready is not None:
@@ -902,6 +923,7 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
         auto_reconnect=False,
         reconnect_max_retries=0,
         delivery_timeout_s=c.delivery_timeout_s,
+        keepalive_max_minutes=c.max_inactivity_mins,
     )
     options = SessionOptions(
         show_acks=c.show_acks,
@@ -986,6 +1008,7 @@ async def _connect_and_run_ui(
         auto_reconnect=c.auto_reconnect,
         reconnect_max_retries=c.reconnect_max_retries,
         delivery_timeout_s=c.delivery_timeout_s,
+        keepalive_max_minutes=c.max_inactivity_mins,
     )
     options = SessionOptions(
         show_acks=c.show_acks,

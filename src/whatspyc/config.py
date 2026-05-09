@@ -146,6 +146,13 @@ class Config:
     # gives up after that many failed attempts and emits a
     # ``_reconnect_giveup`` event.
     reconnect_max_retries: int = 0
+    # Application-level idle hangup. If no user-initiated traffic (DM,
+    # post, subscribe, reaction, etc.) flows for this many minutes the
+    # client closes the link and does NOT auto-reconnect — mirrors the
+    # web client's ``timeoutTriggeredDisconnect``. Background keep-
+    # alives don't count as activity. ``None`` (default) disables the
+    # guard so the link only drops on real network/transport faults.
+    max_inactivity_mins: int | None = None
     # Display the ``[ack]`` line each time the server confirms delivery of
     # a DM (`mr`) or a post (`cpr`). Useful confirmation on a slow link;
     # noisy on a fast one. Toggleable per session via ``/set show_acks``.
@@ -212,7 +219,7 @@ class Config:
     # so a config-less user keeps the historic behaviour.
     log_level: str | None = None
     # Where the console-shaped log sink writes:
-    # ``"auto"`` (default) → status pane in TUI, stderr in line UI;
+    # ``"auto"`` (default) → log pane in TUI, stderr in line UI;
     # ``"stderr"`` / ``"pane"`` / ``"off"`` force the choice. Independent
     # of ``log_file`` — both can be active. ``"pane"`` with a line UI is
     # incoherent and the CLI refuses to start.
@@ -453,6 +460,17 @@ def parse(raw: dict) -> Config:
                 f"integer (0 = unlimited), got {v!r}"
             )
         cfg.reconnect_max_retries = v
+    if "max_inactivity_mins" in raw:
+        v = raw["max_inactivity_mins"]
+        if v is None:
+            cfg.max_inactivity_mins = None
+        elif isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise ValueError(
+                "config: max_inactivity_mins must be a positive integer "
+                f"(or omitted to disable), got {v!r}"
+            )
+        else:
+            cfg.max_inactivity_mins = v
     if "show_acks" in raw:
         v = raw["show_acks"]
         if not isinstance(v, bool):

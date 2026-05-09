@@ -1075,7 +1075,7 @@ _KEYBINDING_HELP_LINES = [
     "  Up at top of list  load older messages from local store",
     "  F1                 open this help screen",
     "  Ctrl-X / Ctrl-C    quit (with confirm)",
-    "  Ctrl-L             toggle the status pane (above the message log)",
+    "  Ctrl-L             toggle the log pane (above the message log)",
     "  Ctrl-D             toggle verbose history (id, timestamps, delivery state)",
     "  Ctrl-E             open the Emoji picker, insert at the input cursor",
     "  Ctrl-O             open the Settings modal (live /set replacement)",
@@ -2040,9 +2040,10 @@ class _UrwidApp:
         self._online_label_cache: dict[str, str] = {}
         self._online_count_label: urwid.Text | None = None
 
-        # Status pane (RichLog-equivalent).
+        # Status pane (RichLog-equivalent). Visible by default — Ctrl-L
+        # toggles it off. Forced visible while offline regardless.
         self._status_walker: urwid.SimpleFocusListWalker | None = None
-        self._status_visible: bool = ui._offline  # always visible while offline
+        self._status_visible: bool = True
 
         # Centre pane content switcher and thread header.
         self._centre_placeholder: urwid.WidgetPlaceholder | None = None
@@ -2086,6 +2087,12 @@ class _UrwidApp:
         # we'd otherwise stack a new modal for each `_disconnect` while
         # the previous reconnect cycle is still settling.
         self._reconnect_handling: bool = False
+        # Set by the `_reconnected` synthetic-event handler so the next
+        # wire type-`c` reply can emit a `[Connected] N new DMs, M new
+        # posts` line — the auto-reconnect path skips the
+        # `_run_connect_modal` summary, so without this we'd silently
+        # drop back into the session with no recap.
+        self._reconnect_summary_pending: bool = False
 
     # ------------------------------------------------------------------
     # Public surface — called by UrwidUI.
@@ -3437,7 +3444,7 @@ class _UrwidApp:
             return
         if self._status_visible:
             self._status_holder.original_widget = urwid.AttrMap(
-                urwid.LineBox(self._status_listbox, title="status"),
+                urwid.LineBox(self._status_listbox, title="Log"),
                 None,
             )
         else:
@@ -4513,23 +4520,27 @@ class _UrwidApp:
         elif t == "he":
             self._schedule_he_refresh()
         elif t == "c" and "n" not in obj:
-            # Server's type-`c` reply (no client-form `n`/`c` fields).
-            # Routed to the active message pane like textual, so the
-            # connect summary stays with the conversation context.
-            mc = obj.get("mc", 0)
-            pc = obj.get("pc", 0)
-            v = obj.get("v", "")
-            self._write_to_active(
-                [("green", "[connect]"), f" mc={mc} pc={pc} v={v}"]
-            )
+            # Initial connect's `[Connected]` summary is emitted by the
+            # connect-modal runner with the full ConnectSequence-derived
+            # counts; only print here for auto-reconnect, where no such
+            # runner is involved.
+            if self._reconnect_summary_pending:
+                self._reconnect_summary_pending = False
+                summary = ConnectSummary(
+                    server_post_count=obj.get("pc", 0),
+                    received_message_count=obj.get("mc", 0),
+                    paused_channels=[],
+                    online_users=[],
+                )
+                self._status_write(
+                    ("connect_line", _format_connected_line(summary))
+                )
         elif t == "_disconnect":
             line = [
                 ("disconnect_line", "[link]"),
                 f" disconnected ({obj.get('reason') or ''})",
             ]
-            self._write_to_active(line)
-            if self._status_visible:
-                self._status_write(line)
+            self._status_error(line)
             if self._ui.session_driven:
                 self._on_link_dropped()
             elif not self._ui._client.is_auto_reconnect:
@@ -4541,9 +4552,7 @@ class _UrwidApp:
                 ("reconnect_line", "[link]"),
                 f" reconnect attempt {attempt} in {delay:.1f}s",
             ]
-            self._write_to_active(line)
-            if self._status_visible:
-                self._status_write(line)
+            self._status_error(line)
             if self._active_connect_modal is not None:
                 self._active_connect_modal.add_line(
                     ("reconnect_line", f"Reconnect attempt {attempt} in {delay:.1f}s")
@@ -4553,9 +4562,7 @@ class _UrwidApp:
                 ("reconnect_line", "[link]"),
                 f" reconnect attempt {obj.get('attempt')} failed: {obj.get('error') or obj.get('exc') or ''}",
             ]
-            self._write_to_active(line)
-            if self._status_visible:
-                self._status_write(line)
+            self._status_error(line)
             if self._active_connect_modal is not None:
                 self._active_connect_modal.add_line(
                     (
@@ -4569,9 +4576,8 @@ class _UrwidApp:
                 ("green", "[link]"),
                 f" reconnected (attempt {obj.get('attempt')})",
             ]
-            self._write_to_active(line)
-            if self._status_visible:
-                self._status_write(line)
+            self._status_error(line)
+            self._reconnect_summary_pending = True
             # Server-side subscription state may have shifted across
             # the link drop; rebuild the cache lazily on next consult.
             self._invalidate_subscribed_cids()
@@ -4597,9 +4603,7 @@ class _UrwidApp:
                 ("disconnect_line", "[link]"),
                 f" giving up after {obj.get('attempts')} reconnect attempts",
             ]
-            self._write_to_active(line)
-            if self._status_visible:
-                self._status_write(line)
+            self._status_error(line)
             if self._ui.session_driven:
                 if self._active_connect_modal is not None:
                     self._active_connect_modal.add_line(
@@ -4622,9 +4626,7 @@ class _UrwidApp:
                 ("disconnect_line", "[link]"),
                 " silence-disconnect — no traffic for too long",
             ]
-            self._write_to_active(line)
-            if self._status_visible:
-                self._status_write(line)
+            self._status_error(line)
             if self._ui.session_driven:
                 self._on_link_dropped()
             else:

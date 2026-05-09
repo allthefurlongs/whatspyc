@@ -3,7 +3,7 @@
 Layout::
 
     ┌─Header───────────────────────────────────────────┐
-    ├Tabs───┬─Status pane (Ctrl+S, hidden by default)──┤
+    ├Tabs───┬─Log pane (Ctrl+L, hidden by default)─────┤
     │Ch DM  ├─Thread header (active channel / DM)──────┤
     ├───────┼───────────────────────────────────────────┤
     │ch list│ Per-target message ListView              │
@@ -686,7 +686,7 @@ _KEYBINDING_HELP_LINES = [
     "  Enter (message)    Open action menu (Edit / Resend / React)",
     "  F1                 This help screen",
     "  Ctrl+D             Toggle detailed render (live)",
-    "  Ctrl+S             Toggle the status pane (acks / edits log)",
+    "  Ctrl+L             Toggle the log pane (acks / edits log)",
     "  Ctrl+U             Unsubscribe highlighted channel (with confirm)",
     "  Ctrl+O             Open the Options (session settings) modal",
     "  Ctrl+E             Open searchable emoji picker, insert at cursor",
@@ -2150,7 +2150,7 @@ class _WhatspycApp(App):
     #online-header { background: $boost; padding: 0 1; }
     #online { height: 10; border-top: solid $accent; }
     #right { layout: vertical; height: 1fr; }
-    #status { height: 8; border: round $accent; display: none; }
+    #status { height: 8; border: round $accent; }
     #thread-header { background: $boost; padding: 0 1; }
     #message-switcher { height: 1fr; border: round $accent; }
     #empty-msgs { padding: 1 2; color: $text-muted; }
@@ -2177,7 +2177,7 @@ class _WhatspycApp(App):
         # "delete-forward" by default; ListView swallows arrow/letter
         # keys) doesn't preempt the global toggle.
         Binding("ctrl+d", "toggle_verbose", "Detailed View", priority=True),
-        Binding("ctrl+s", "toggle_status", "Status Pane", priority=True),
+        Binding("ctrl+l", "toggle_status", "Log", priority=True),
         # priority=True so the focused Input (which binds ctrl+u to
         # "delete to start of line") doesn't preempt the app binding.
         # Clicking a channel moves focus to the Input, so without
@@ -2307,6 +2307,12 @@ class _WhatspycApp(App):
         # we'd otherwise stack a new modal for each `_disconnect` while
         # the previous reconnect cycle is still settling.
         self._reconnect_handling: bool = False
+        # Set by the `_reconnected` synthetic-event handler so the next
+        # wire type-`c` reply can emit a `[Connected] N new DMs, M new
+        # posts` line — the auto-reconnect path skips the
+        # `_run_connect_modal` summary, so without this we'd silently
+        # drop back into the session with no recap.
+        self._reconnect_summary_pending: bool = False
 
     # ------------------------------------------------------------------
     # Compose / mount
@@ -2356,6 +2362,7 @@ class _WhatspycApp(App):
         # call ``query_one`` per event.
         self._w_input = self.query_one("#input", Input)
         self._w_status = self.query_one("#status", RichLog)
+        self._w_status.border_title = "Log"
         self._w_thread_header = self.query_one("#thread-header", Static)
         self._w_online = self.query_one("#online", ListView)
         self._w_online_header = self.query_one("#online-header", Static)
@@ -3269,7 +3276,7 @@ class _WhatspycApp(App):
         self._refresh_thread_header()
 
     # ------------------------------------------------------------------
-    # Status pane (Ctrl+S)
+    # Log pane (Ctrl+L)
     # ------------------------------------------------------------------
 
     def action_toggle_status(self) -> None:
@@ -3592,7 +3599,7 @@ class _WhatspycApp(App):
             # Also write the summary into the status pane so the user
             # has a record after the modal disappears. Don't force the
             # pane visible — the user explicitly asked for this not to
-            # toggle on visibility (use Ctrl-S if you want to see it).
+            # toggle on visibility (use Ctrl-L if you want to see it).
             self._status_write(f"[green]{connected_line}[/]")
             modal.dismiss(("ok", summary))
 
@@ -4034,14 +4041,22 @@ class _WhatspycApp(App):
                 )
         # Connect / disconnect (link state)
         elif t == "c" and "n" not in obj:
-            self._write_to_active(
-                f"[connect] mc={obj.get('mc', 0)} pc={obj.get('pc', 0)} v={obj.get('v')}"
-            )
+            # Initial connect's `[Connected]` summary is emitted by the
+            # connect-modal runner with the full ConnectSequence-derived
+            # counts; only print here for auto-reconnect, where no such
+            # runner is involved.
+            if self._reconnect_summary_pending:
+                self._reconnect_summary_pending = False
+                summary = ConnectSummary(
+                    server_post_count=obj.get("pc", 0),
+                    received_message_count=obj.get("mc", 0),
+                    paused_channels=[],
+                    online_users=[],
+                )
+                self._status_write(f"[green]{_format_connected_line(summary)}[/]")
         elif t == "_disconnect":
             line = f"[red][link][/] disconnected ({obj.get('reason', '')})"
-            self._write_to_active(line)
-            if self._status_visible():
-                self._status_write(line)
+            self._status_error(line)
             if self._ui.session_driven:
                 self._on_link_dropped()
             elif not self._ui._client.is_auto_reconnect:
@@ -4051,9 +4066,7 @@ class _WhatspycApp(App):
                 f"[yellow][link][/] reconnect attempt {obj.get('attempt')} in "
                 f"{obj.get('delay'):.1f}s"
             )
-            self._write_to_active(line)
-            if self._status_visible():
-                self._status_write(line)
+            self._status_error(line)
             if self._active_connect_modal is not None:
                 self._active_connect_modal.add_line(
                     f"[yellow]Reconnect attempt {obj.get('attempt')} in "
@@ -4064,9 +4077,7 @@ class _WhatspycApp(App):
                 f"[yellow][link][/] reconnect attempt {obj.get('attempt')} failed: "
                 f"{obj.get('exc')}"
             )
-            self._write_to_active(line)
-            if self._status_visible():
-                self._status_write(line)
+            self._status_error(line)
             if self._active_connect_modal is not None:
                 self._active_connect_modal.add_line(
                     f"[yellow]Attempt {obj.get('attempt')} failed: "
@@ -4074,9 +4085,8 @@ class _WhatspycApp(App):
                 )
         elif t == "_reconnected":
             line = f"[green][link][/] reconnected (attempt {obj.get('attempt')})"
-            self._write_to_active(line)
-            if self._status_visible():
-                self._status_write(line)
+            self._status_error(line)
+            self._reconnect_summary_pending = True
             # Server-side subscription state may have shifted across the
             # link drop; rebuild the cache lazily on next consult.
             self._invalidate_subscribed_cids()
@@ -4101,9 +4111,7 @@ class _WhatspycApp(App):
                 f"[red][link][/] giving up after {obj.get('attempts')} "
                 "reconnect attempts"
             )
-            self._write_to_active(line)
-            if self._status_visible():
-                self._status_write(line)
+            self._status_error(line)
             if self._ui.session_driven:
                 if self._active_connect_modal is not None:
                     self._active_connect_modal.add_line(

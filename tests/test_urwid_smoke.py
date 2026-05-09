@@ -1719,8 +1719,8 @@ def test_ctrl_l_is_not_intercepted_by_redraw_command(tmp_path: Path) -> None:
 
 def test_unhandled_input_swallows_global_keys_when_modal_open(tmp_path: Path) -> None:
     """When a modal is layered on top, the App's global Ctrl-bindings
-    must NOT fire underneath — otherwise pressing Ctrl-S inside the
-    EmojiPrompt would toggle the status pane behind it."""
+    must NOT fire underneath — otherwise pressing Ctrl-L inside the
+    EmojiPrompt would toggle the log pane behind it."""
     ui, app, store = _make_app(tmp_path)
     try:
         # Push a sentinel modal entry. _on_unhandled_input only checks
