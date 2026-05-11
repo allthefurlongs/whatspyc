@@ -1,6 +1,6 @@
 import os
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 # `websockets` truncates DEBUG-level frame dumps to MAX_LOG_SIZE chars
 # (default 75) with `...` in the middle. That clip-marker hides the

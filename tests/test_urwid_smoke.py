@@ -1640,15 +1640,16 @@ def test_message_row_left_click_opens_action_menu(tmp_path: Path) -> None:
 
 def test_focus_cycle_excludes_online_users(tmp_path: Path) -> None:
     """The online-users list is informational only (no actions),
-    so Tab cycling skips it: input → tabs → targets → messages →
-    input. An earlier version included an ``online`` stop, making
-    Tab take an extra hop with no payoff."""
+    so Tab cycling skips it: input → tabs → targets → log →
+    messages → input. An earlier version included an ``online``
+    stop, making Tab take an extra hop with no payoff."""
     ui, app, store = _make_app(tmp_path)
     try:
         # Online not in the cycle.
         assert "online" not in app._FOCUS_ORDER
-        # All four expected stops present.
-        assert app._FOCUS_ORDER == ("input", "tabs", "targets", "messages")
+        # All five expected stops present, in visual top-to-bottom
+        # order for the centre column (log above messages).
+        assert app._FOCUS_ORDER == ("input", "tabs", "targets", "log", "messages")
     finally:
         store.close()
 

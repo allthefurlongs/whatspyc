@@ -682,6 +682,7 @@ _KEYBINDING_HELP_LINES = [
     "  ← / →              In tab strip: switch Channels / DMs",
     "  ↑ / ↓              In a list: navigate items",
     "  ↑ at top of msgs   Auto-load the next older page from the store",
+    "  ↑ / ↓ / PgUp/PgDn  In the log pane (when focused): scroll the log",
     "  Enter (target)     Pin target as the send target, focus input",
     "  Enter (message)    Open action menu (Edit / Resend / React)",
     "  F1                 This help screen",
@@ -2093,7 +2094,12 @@ class ProfilePickerModal(ModalScreen[ConnectProfile | None]):
 # ----------------------------------------------------------------------
 
 
-_FOCUS_CYCLE = ["input", "msg-active", "tab-strip", "target-active", "online"]
+# Tab cycle stops. The online-users list is deliberately left OUT —
+# online rows are informational only (no actions), so a Tab stop
+# there would just be an extra hop without payoff. The centre
+# column's order is ``status`` (top, when visible) → ``msg-active``,
+# matching the visual top-to-bottom layout.
+_FOCUS_CYCLE = ["input", "tab-strip", "target-active", "status", "msg-active"]
 
 
 class StaticFooter(Footer):
@@ -2332,7 +2338,15 @@ class _WhatspycApp(App):
                     yield ListView(id="channels")
                     yield ListView(id="dms")
                 yield Static("Online (0)", id="online-header")
-                yield ListView(id="online")
+                # Online is informational only — disable focus so Tab
+                # navigation skips it entirely and a stray click can't
+                # park focus on a dead pane. Removing it from
+                # ``_FOCUS_CYCLE`` alone isn't enough: Textual's screen
+                # focus chain still treats any ``can_focus`` widget as
+                # a potential Tab target.
+                online_lv = ListView(id="online")
+                online_lv.can_focus = False
+                yield online_lv
             with Vertical(id="right"):
                 yield RichLog(id="status", wrap=True, markup=True, highlight=False)
                 yield Static("", id="thread-header")
@@ -3406,8 +3420,14 @@ class _WhatspycApp(App):
             if current_id:
                 return self.query_one(f"#{current_id}", ListView)
             return None
-        if step == "online":
-            return self._w_online
+        if step == "status":
+            # Only land on the Log pane when it's actually visible —
+            # Ctrl+L can hide it and a Tab cycle that focuses an
+            # invisible widget is a dead stop for the user.
+            pane = self._w_status
+            if pane is not None and pane.display:
+                return pane
+            return None
         return None
 
     def _focus_step(self, delta: int) -> None:
@@ -3426,8 +3446,8 @@ class _WhatspycApp(App):
                 idx = cycle.index("tab-strip")
             elif focused_id == active_target:
                 idx = cycle.index("target-active")
-            elif focused_id == "online":
-                idx = cycle.index("online")
+            elif focused_id == "status":
+                idx = cycle.index("status")
             else:
                 idx = -1
         except ValueError:

@@ -1067,12 +1067,13 @@ class HelpScreen(_Modal):
 
 
 _KEYBINDING_HELP_LINES = [
-    "  Tab / Shift-Tab    cycle focus: input → tab strip → target list → message list",
+    "  Tab / Shift-Tab    cycle focus: input → tab strip → target list → message list → log (when shown)",
     "  Esc                focus the input box",
     "  Enter (input)      send / submit slash command / submit pending edit",
     "  Enter (target row) pin as send target, focus input",
     "  Enter (message)    open Edit/Resend/React menu",
     "  Up at top of list  load older messages from local store",
+    "  Up/Dn/PgUp/PgDn    in the log pane (when focused): scroll through entries",
     "  F1                 open this help screen",
     "  Ctrl-X / Ctrl-C    quit (with confirm)",
     "  Ctrl-L             toggle the log pane (above the message log)",
@@ -3468,7 +3469,13 @@ class _UrwidApp:
     def _status_write(self, markup: Any) -> None:
         if self._status_walker is None:
             return
-        self._status_walker.append(urwid.Text(markup))
+        # Selectable wrapper so the Log ListBox can navigate / scroll
+        # via the keyboard once the user Tabs to it. urwid.Text alone
+        # is non-selectable, leaving ListBox unable to move its focus
+        # in response to Up/Down/PgUp/PgDn — the keys would fall
+        # through to the unhandled-input fallback that scrolls the
+        # *message* list, which is the wrong pane.
+        self._status_walker.append(_FocusableText(markup))
         if self._status_walker:
             self._status_walker.set_focus(len(self._status_walker) - 1)
 
@@ -3480,8 +3487,16 @@ class _UrwidApp:
         self._status_write(markup)
 
     def action_toggle_status(self) -> None:
+        # If the user is currently focused on the Log pane, hiding it
+        # would leave focus pointing at a removed Pile child. Move
+        # focus back to the input first so the cycle remains valid.
+        was_focused_on_log = (
+            self._status_visible and self._current_focus_step() == "log"
+        )
         self._status_visible = not self._status_visible
         self._refresh_status_pane()
+        if was_focused_on_log and not self._status_visible:
+            self._focus_input()
 
     # ------------------------------------------------------------------
     # Refusal helper for offline mode.
@@ -5263,12 +5278,15 @@ class _UrwidApp:
     # ---- Focus cycling ----
 
     # Tab cycle stops. ``input`` lives in the Frame footer; ``tabs``
-    # and ``targets`` are positions 0 and 1 of the left Pile;
-    # ``messages`` is the right column. The online users list is
-    # deliberately left OUT of the cycle — there are no actions on
-    # online rows (they're informational), so a Tab stop there would
-    # just be an extra hop without payoff.
-    _FOCUS_ORDER = ("input", "tabs", "targets", "messages")
+    # and ``targets`` are positions 0 and 1 of the left Pile; the
+    # centre column holds ``log`` (status pane, top) above
+    # ``messages`` — cycle order matches the visual top-to-bottom
+    # layout of the centre column. ``log`` is only included in the
+    # cycle when it's visible (Ctrl-L toggles it). The online users
+    # list is deliberately left OUT of the cycle — there are no
+    # actions on online rows (they're informational), so a Tab stop
+    # there would just be an extra hop without payoff.
+    _FOCUS_ORDER = ("input", "tabs", "targets", "log", "messages")
 
     def _focus_step(self, delta: int) -> None:
         if self._frame is None:
@@ -5278,8 +5296,15 @@ class _UrwidApp:
             idx = self._FOCUS_ORDER.index(cur)
         except ValueError:
             idx = 0
-        new = self._FOCUS_ORDER[(idx + delta) % len(self._FOCUS_ORDER)]
-        self._set_focus_step(new)
+        # Skip stops that aren't presently usable (e.g. the Log pane
+        # is hidden via Ctrl-L). Bound the search by the cycle length
+        # so a fully-empty cycle can't loop forever.
+        for offset in range(1, len(self._FOCUS_ORDER) + 1):
+            new = self._FOCUS_ORDER[(idx + delta * offset) % len(self._FOCUS_ORDER)]
+            if new == "log" and not self._status_visible:
+                continue
+            self._set_focus_step(new)
+            return
 
     def _current_focus_step(self) -> str:
         """Best-effort detection of which Tab-stop currently has focus."""
@@ -5298,6 +5323,16 @@ class _UrwidApp:
             return "input"
         # Body Columns: 0=left pane, 1=vertical separator, 2=centre pane.
         if cols.focus_position == 2:
+            # Inside the centre Pile, position 0 is the status holder
+            # *when visible* (the Pile drops it from contents while
+            # hidden so the message box reclaims the space).
+            if self._centre_pane is not None and self._status_visible:
+                try:
+                    focused = self._centre_pane.focus
+                    if focused is self._status_holder:
+                        return "log"
+                except (IndexError, AttributeError):
+                    pass
             return "messages"
         # Left column (the Pile). Inspect Pile.focus_position to narrow
         # down to tabs / targets.
@@ -5360,6 +5395,23 @@ class _UrwidApp:
                                 break
                     except (IndexError, ValueError):
                         pass
+            except (IndexError, ValueError):
+                pass
+            return
+        if step == "log":
+            # Same shape as ``messages`` but pin focus on the status
+            # holder. Skipped from the cycle when hidden, but a direct
+            # set call from elsewhere is a no-op rather than an error
+            # if the pane has been collapsed in the meantime.
+            if not self._status_visible:
+                return
+            try:
+                cols.focus_position = 2
+                if self._centre_pane is not None:
+                    for i, (w, _) in enumerate(self._centre_pane.contents):
+                        if w is self._status_holder:
+                            self._centre_pane.focus_position = i
+                            break
             except (IndexError, ValueError):
                 pass
             return
