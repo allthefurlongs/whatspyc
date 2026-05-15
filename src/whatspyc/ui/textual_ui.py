@@ -691,6 +691,7 @@ _KEYBINDING_HELP_LINES = [
     "  Ctrl+U             Unsubscribe highlighted channel (with confirm)",
     "  Ctrl+O             Open the Options (session settings) modal",
     "  Ctrl+E             Open searchable emoji picker, insert at cursor",
+    "  Ctrl+Y             Toggle copy mode (release mouse for native select+copy)",
     "  Ctrl+C / Ctrl+Q    Quit",
 ]
 
@@ -2311,6 +2312,11 @@ class _WhatspycApp(App):
         # priority=True so the focused Input doesn't claim Ctrl+E for
         # its built-in "cursor to end of line" action.
         Binding("ctrl+e", "insert_emoji", "Emoji", priority=True),
+        # Ctrl+Y toggles "copy mode": release Textual's mouse capture so
+        # the terminal handles mouse drags natively (select + copy). Not
+        # Ctrl+I — that's the same byte as Tab and would clash with pane
+        # nav. priority=True so the focused Input can't claim it.
+        Binding("ctrl+y", "toggle_copy_mode", "Copy Mode", priority=True),
         Binding("escape", "focus_input", "Focus input", show=False),
         Binding("tab", "focus_next_pane", "Next pane", show=False),
         Binding("shift+tab", "focus_prev_pane", "Prev pane", show=False),
@@ -2361,6 +2367,13 @@ class _WhatspycApp(App):
         # Re-entrancy guard for the quit-confirm modal so a second Ctrl+Q
         # while the prompt is already up is a no-op.
         self._quit_confirm_open = False
+
+        # Copy mode: when True, Textual's mouse capture is off so the
+        # terminal performs native text selection (and the OS copy-on-
+        # select / Shift+Insert / Cmd+C paths work against the centre
+        # pane). Default False (select mode — clicks open the action
+        # menu as before). Toggled by Ctrl+Y.
+        self._copy_mode: bool = False
 
         # Suppress ListView.Highlighted handling during programmatic
         # mutation of a list (mounting rows, prepending older history).
@@ -3478,6 +3491,37 @@ class _WhatspycApp(App):
         active = self._active_target()
         self._verbose_dirty = {t for t in self._views if t != active}
         self._refresh_active_rows()
+
+    def action_toggle_copy_mode(self) -> None:
+        # Flip Textual's mouse capture so the terminal performs native
+        # text selection. _enable_mouse_support / _disable_mouse_support
+        # are technically private on the driver but exposed identically
+        # on LinuxDriver and WindowsDriver — both just send the SGR
+        # mouse-mode toggles (`\x1b[?1000h/l` etc). No public equivalent
+        # in Textual 8.x.
+        driver = self._driver
+        self._copy_mode = not self._copy_mode
+        if self._copy_mode:
+            try:
+                driver._disable_mouse_support()  # type: ignore[attr-defined]
+            except Exception:
+                # Headless driver / future Textual: degrade to a no-op
+                # toggle rather than crashing the UI.
+                pass
+            self._status_write(
+                "[cyan][copy mode][/] mouse capture off — drag to select, "
+                "Ctrl+Y to return to select mode"
+            )
+        else:
+            try:
+                driver._enable_mouse_support()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            self._status_write(
+                "[cyan][select mode][/] mouse capture on — click a message "
+                "to open its action menu"
+            )
+        self._refresh_footer()
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

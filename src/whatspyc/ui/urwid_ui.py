@@ -1082,6 +1082,7 @@ _KEYBINDING_HELP_LINES = [
     "  Ctrl-E             open the Emoji picker, insert at the input cursor",
     "  Ctrl-O             open the Settings modal (live /set replacement)",
     "  Ctrl-U             unsubscribe from the active channel (with confirm)",
+    "  Ctrl-Y             toggle copy mode (release mouse for native select+copy)",
 ]
 
 
@@ -2197,6 +2198,13 @@ class _UrwidApp:
 
         # he debounce.
         self._he_alarm: Any = None
+
+        # Copy mode: when True, urwid's mouse tracking is disabled and
+        # the terminal performs native text selection so the user can
+        # drag-to-copy from the message pane. Default False (select
+        # mode — clicks open the action menu as before). Toggled by
+        # Ctrl+Y.
+        self._copy_mode: bool = False
 
         # Frame outer widget.
         self._frame: urwid.Frame | None = None
@@ -5317,6 +5325,9 @@ class _UrwidApp:
         if key == "ctrl u":
             self.action_unsub_channel()
             return True
+        if key == "ctrl y":
+            self.action_toggle_copy_mode()
+            return True
         if key == "esc":
             # Esc cancels an in-progress reply or edit before
             # refocusing the input. The pre-filled row body stays in
@@ -5440,6 +5451,35 @@ class _UrwidApp:
         if cid is None:
             return
         self._open_unsubscribe_modal(cid)
+
+    def action_toggle_copy_mode(self) -> None:
+        # Flip mouse tracking on the urwid screen so the terminal
+        # performs native text selection (drag to highlight, terminal's
+        # copy-on-select / Shift+Insert / Cmd+C). ``set_mouse_tracking``
+        # is the documented urwid API for this. Keyboard navigation
+        # (Enter on a row) keeps working in both modes — only the
+        # mouse-click path is gated.
+        if self._loop is None:
+            return
+        self._copy_mode = not self._copy_mode
+        try:
+            self._loop.screen.set_mouse_tracking(not self._copy_mode)
+        except Exception:
+            # If the screen rejects the toggle (e.g. a future urwid
+            # backend without that method), revert the flag so a retry
+            # is consistent rather than silently flipping mouse state.
+            self._copy_mode = not self._copy_mode
+            return
+        if self._copy_mode:
+            self._status_write(
+                "[copy mode] mouse capture off — drag to select, "
+                "Ctrl-Y to return to select mode"
+            )
+        else:
+            self._status_write(
+                "[select mode] mouse capture on — click a message to "
+                "open its action menu"
+            )
 
     # ---- Focus cycling ----
 

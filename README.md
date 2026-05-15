@@ -508,6 +508,7 @@ Layout:
 | `Ctrl+E` | ✓ | ✓ | Searchable, tabbed emoji picker — opens the same modal used for reactions. Tabs select a CLDR group (`★ Quick`, Smileys, People, Animals, Food, Travel, Activity, Objects, Symbols, Flags); People has a second tab strip for subgroups. Type into the search box to filter the full catalogue across every group, ↑↓←→ inside the grid, PgUp/PgDn to page, Home/End for ends, Enter to insert |
 | `Ctrl+O` | ✓ | ✓ | Open the Settings modal |
 | `Ctrl+U` | ✓ | ✓ | Unsubscribe from the active channel (with confirm) |
+| `Ctrl+Y` | ✓ | ✓ | Toggle **copy mode** — releases the TUI's mouse capture so the terminal performs native text selection (drag to highlight, then the terminal's copy-on-select / `Shift+Insert` / `Cmd+C` works against the centre pane). Default is select mode (clicks on a message open its action menu). Keyboard navigation (`Enter` on a row) works in both modes — copy mode only gates the mouse-click path. Note: while copy mode is on, *all* TUI mouse interaction is disabled (left-pane clicks, scroll wheel, etc.) — toggle back to select mode to use them. |
 | `Ctrl+C` / `Ctrl+Q` (textual) / `Ctrl+X` (urwid) | ✓ | ✓ | Quit (with confirm) |
 
 Behaviour:
