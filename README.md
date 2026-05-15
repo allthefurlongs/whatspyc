@@ -389,6 +389,9 @@ terminal. In this mode:
 - State is kept per-callsign under a configured root: `node_state_dir`
   (top-level config key) holds a directory per call, e.g.
   `node_state_dir/M0ABC/state.sqlite3`. The dir is created on first use.
+  Any SSID on the inbound callsign is stripped for the dir name, so an
+  operator connecting once as `M0ABC` and once as `M0ABC-2` lands in
+  the same store regardless of how the node spells it.
 - The display name is read from `node_state_dir/<CALL>/name.txt`. If the
   file is missing or empty, whatspyc writes `Please enter your name: `
   to stdout and reads one line from stdin, then saves it for next time.
@@ -432,12 +435,60 @@ M0ABC               <- callsign (always)
 Matt Tester         <- name (only on the very first run for that call)
 ```
 
-> **Operator note — non-interactive profile selection.** For
-> `--nodecmd` to actually run unattended you also need to skip the
-> profile picker. Either set `default_profile` in config and pass
-> `--no-prompt`, or only define a single profile so the picker has
-> nothing to ask. `--nodecmd` doesn't add any validation here — that's
-> a deploy-time concern.
+### Reference: installing as a BPQ node command via systemd
+
+The following socket-activated systemd unit pair runs `whatspyc --nodecmd`
+on each inbound connection, and the matching `bpq32.cfg` snippet exposes
+it to BPQ users as the `WHATSPAC` application.
+
+`/etc/systemd/system/whatspyc-node@.service`:
+
+```
+[Unit]
+Description=Whatspyc Node Command
+
+[Service]
+WorkingDirectory=/home/matt/whatspyc-logs
+ExecStart=/home/matt/whatspyc-venv/bin/whatspyc --nodecmd --log-level WARNING --log-file /home/matt/whatspyc-logs/whatspyc-node.log
+StandardInput=socket
+User=matt
+Group=matt
+```
+
+`/etc/systemd/system/whatspyc-node.socket`:
+
+```
+[Unit]
+Description=Whatspyc Node Command Socket
+
+[Socket]
+ListenStream=5904
+Accept=yes
+
+[Install]
+WantedBy=sockets.target
+```
+
+`bpq32.cfg`:
+
+```
+PORT
+ PORTNUM=1
+ ID=Telnet
+ DRIVER=TELNET
+ CONFIG
+  SECURETELNET=1
+  CMDPORT 5904   ; For whatspac command
+ENDPORT
+
+APPLICATION 1,WHATSPAC,C 1 HOST 0 S
+```
+
+The `APPLICATION` line should specify your telnet port number after the
+`C`, and after `HOST` the number should be the offset of the `CMDPORT`
+serving whatspyc, e.g. if whatspyc is listening on port 5904 and you
+have `CMDPORT 5904` it will be 0, but if you have `CMDPORT 5903,5904`
+it would be 1, and so on.
 
 ## Environment variables
 

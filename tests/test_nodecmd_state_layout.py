@@ -55,6 +55,52 @@ def test_callsign_uppercased_and_stripped(tmp_path: Path, monkeypatch) -> None:
     assert c.state_dir == root / "M0ABC"
 
 
+def test_state_dir_strips_ssid(tmp_path: Path, monkeypatch) -> None:
+    """The state dir is keyed on the bare callsign so one operator gets one
+    store regardless of which SSID their node hands us. ``my_call`` keeps
+    the SSID for AX.25 addressing (gotcha 14)."""
+    root = tmp_path / "node-state"
+    monkeypatch.setattr("sys.stdin", io.StringIO("2E0HKD-2\nMatt\n"))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+
+    c = Config(node_state_dir=root)
+    cli._apply_nodecmd_mode(
+        c, ui_mode=None, my_call_cli=None, state_dir_cli=None
+    )
+
+    assert c.my_call == "2E0HKD-2"
+    assert c.state_dir == root / "2E0HKD"
+
+
+def test_state_dir_shared_across_ssids_for_same_operator(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Same operator connecting once with SSID and once without lands in
+    the same state dir — no duplicate stores, no re-prompt for name."""
+    root = tmp_path / "node-state"
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("2E0HKD-2\nMatt\n"))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    c1 = Config(node_state_dir=root)
+    cli._apply_nodecmd_mode(
+        c1, ui_mode=None, my_call_cli=None, state_dir_cli=None
+    )
+
+    # Second run, bare call on stdin, no name line — name.txt from the
+    # first run must already be in place.
+    monkeypatch.setattr("sys.stdin", io.StringIO("2E0HKD\n"))
+    fake_stdout = io.StringIO()
+    monkeypatch.setattr("sys.stdout", fake_stdout)
+    c2 = Config(node_state_dir=root)
+    cli._apply_nodecmd_mode(
+        c2, ui_mode=None, my_call_cli=None, state_dir_cli=None
+    )
+
+    assert c1.state_dir == c2.state_dir == root / "2E0HKD"
+    assert c2.name == "Matt"
+    assert "Please enter your name:" not in fake_stdout.getvalue()
+
+
 def test_second_run_does_not_reprompt_when_name_txt_exists(
     tmp_path: Path, monkeypatch
 ) -> None:

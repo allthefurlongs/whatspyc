@@ -122,7 +122,12 @@ def _apply_nodecmd_mode(
     if not call:
         raise click.UsageError("--nodecmd: no callsign on stdin")
 
-    state_dir = Path(c.node_state_dir) / call
+    # State dir is keyed on the bare callsign so a single operator gets one
+    # store regardless of which SSID their node hands us (some nodes pass
+    # `2E0HKD`, some `2E0HKD-2`). `my_call` still keeps the SSID for the
+    # AX.25 source address — see gotcha 14.
+    bare_call = call.split("-", 1)[0]
+    state_dir = Path(c.node_state_dir) / bare_call
     state_dir.mkdir(parents=True, exist_ok=True)
 
     name_path = state_dir / "name.txt"
