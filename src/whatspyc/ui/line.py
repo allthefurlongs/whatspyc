@@ -124,7 +124,10 @@ class LineUI:
             if self._options.notify_user_conn:
                 print(f"[user] {self._fmt_user(obj.get('c'))} disconnected")
         elif t == "o":
-            print(f"[online] {', '.join(self._fmt_user(c) for c in obj.get('o', []))}")
+            users = obj.get("o", [])
+            print(f"online ({len(users)}):")
+            for call in users:
+                print(f"  {self._fmt_user(call)}")
         elif t == "pch":
             for ch in obj.get("ch", []):
                 cid = ch.get("cid")
