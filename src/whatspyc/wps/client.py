@@ -321,9 +321,10 @@ class WpsClient:
 
     @property
     def auto_backfill_post_count(self) -> int | None:
-        """The configured auto-pull cap for paused (`pch`) channels at
-        connect time. UIs read this to provide a sensible default for the
-        ``/sub`` historic-count prompt."""
+        """Default post count offered by the ``/sub`` and ``/unpause``
+        modal prompts. UIs read this to seed the historic-count Edit.
+        Does NOT trigger automatic unpause on ``pch`` — the user has to
+        confirm explicitly via the modal or ``/unpause``."""
         return self._auto_backfill_post_count
 
     # ------------------------------------------------------------------
@@ -1383,10 +1384,6 @@ class WpsClient:
                 if not isinstance(cid, int) or not isinstance(pt, int):
                     continue
                 self._paused_channels[cid] = pt
-                if self._auto_backfill_post_count is not None:
-                    n = min(pt, self._auto_backfill_post_count)
-                    if n > 0:
-                        await self.unpause_channel(cid, post_count=n)
 
         async def _on_he(o: dict) -> None:
             for h in o.get("h", []):

@@ -664,9 +664,11 @@ async def test_auto_backfill_no_longer_fires_on_subscribe_ack(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_auto_backfill_fires_on_pch(tmp_path: Path) -> None:
-    """With auto_backfill_post_count set, a `pch` triggers a `cu` for each
-    paused channel, capped at the configured count."""
+async def test_pch_does_not_auto_unpause(tmp_path: Path) -> None:
+    """`pch` populates the local paused-channels map but never auto-fires
+    a `cu` — even when ``auto_backfill_post_count`` is set. Unpause is
+    explicit (UI modal or ``/unpause``); auto-pulling would race the
+    user's confirm and skip the modal entirely."""
     store = SqliteStore(tmp_path / "state.sqlite3")
     stream = _FakeStream()
     client = WpsClient(
@@ -684,20 +686,14 @@ async def test_auto_backfill_fires_on_pch(tmp_path: Path) -> None:
             {"t": "pch", "ch": [{"cid": 0, "pt": 712}, {"cid": 6, "pt": 5}]}
         )
     )
-    for _ in range(40):
+    # Give the dispatch loop a few ticks; assert it never sends a cu.
+    for _ in range(20):
         await asyncio.sleep(0.01)
-        cu_frames = [s for s in stream.sent if b'"t":"cu"' in s]
-        if len(cu_frames) >= 2:
-            break
     cu_frames = [s for s in stream.sent if b'"t":"cu"' in s]
-    assert len(cu_frames) == 2
-    # 712 was capped to 20; 5 < 20, kept as 5.
-    cid0 = next(s for s in cu_frames if b'"cid":0' in s)
-    cid6 = next(s for s in cu_frames if b'"cid":6' in s)
-    assert b'"pc":20' in cid0
-    assert b'"pc":5' in cid6
-    # Both cleared from local state after firing.
-    assert client.paused_channels() == {}
+    assert cu_frames == [], "client must not auto-unpause on pch"
+    # Local state mirrors the server's pch so UIs can render the suffix
+    # and the modal knows the pending count.
+    assert client.paused_channels() == {0: 712, 6: 5}
     await client.close()
     store.close()
 

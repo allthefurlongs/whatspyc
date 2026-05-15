@@ -2667,8 +2667,7 @@ class _WhatspycApp(App):
                 check = "☐"
             name = self._channel_name(cid)
             label = f"{check} {cid} #{name}" if name else f"{check} {cid}"
-            paused_suffix = f" [yellow]\\[{paused} paused][/]" if paused else ""
-            return f"{label}{unread_suffix}{paused_suffix}"
+            return f"{label}{unread_suffix}"
         return f"{_fmt_user(key, self._ui._client.ham_name)}{unread_suffix}"
 
     def _add_target(self, target: TargetKey, *, unsubscribed: bool = False) -> None:

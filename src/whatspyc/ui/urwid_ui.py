@@ -535,8 +535,9 @@ class _FocusableText(urwid.WidgetWrap):
         *,
         on_activate: Callable[[], None] | None = None,
         focus_attr: str | dict | None = None,
+        wrap: str = "space",
     ) -> None:
-        self._text = urwid.Text(markup, wrap="space")
+        self._text = urwid.Text(markup, wrap=wrap)
         self._on_activate = on_activate
         # ``focus_map`` is a dict by default so every named attribute
         # in the markup gets its own focused variant; passing a bare
@@ -3006,14 +3007,11 @@ class _UrwidApp:
             else:
                 box = "☑"
                 box_attr = "subscribe_check"
-            markup: list = [
+            return [
                 (box_attr, f"{box} "),
                 ("default", f"{cid} #{name}"),
                 ("unread_badge", suffix),
             ]
-            if paused:
-                markup.append(("yellow", f" [{paused} paused]"))
-            return markup
         # DM.
         ham = self._ui._client.ham_name(key)
         label = f"{key}" if not ham else f"{key} ({ham})"
@@ -3032,9 +3030,14 @@ class _UrwidApp:
         # ``_seed_unread_from_store`` runs once at session start
         # (before any wire events flow) and pre-fills counts left over
         # from the previous session, so the label here picks them up.
+        # ``wrap="clip"``: target-list rows must stay single-line — a
+        # wrapped row would break the left pane's vertical alignment
+        # against the message pane (the ListBox treats each row as one
+        # cell tall). Overlong labels get clipped at the column edge.
         item = _FocusableText(
             self._target_label(target, unsubscribed=unsubscribed),
             on_activate=lambda t=target: self._on_target_activate(t),
+            wrap="clip",
         )
         self._target_items[target] = item
         if kind == "ch" and self._channels_walker is not None:
