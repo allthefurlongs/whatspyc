@@ -231,7 +231,7 @@ def _format_connected_line(summary: ConnectSummary) -> str:
     ]
     if summary.paused_channels:
         n = len(summary.paused_channels)
-        parts.append(f"{n} paused channel(s) — see /unpause hint(s) above")
+        parts.append(f"{n} paused channel(s)")
     return "[Connected] " + ", ".join(parts)
 
 
@@ -1323,6 +1323,129 @@ class SubscribeModal(_Modal):
                 self.dismiss(n)
                 return None
             # Forward other keys (typing) to the Pile so the Edit gets them.
+            return key
+        return key
+
+
+class UnpauseModal(_Modal):
+    """Two-stage unpause flow.
+
+    Stage 1: "{ref} paused — {pending} new posts. Unpause? [y/N]".
+    Stage 2: "How many of {pending} to fetch? [Enter = default]".
+    Dismisses with ``None`` on cancel and ``int > 0`` on confirm.
+
+    Unlike :class:`SubscribeModal` there is no waiting-for-ack stage:
+    the pending count comes from the cached ``pch`` headers, so y jumps
+    straight to the count prompt.
+    """
+
+    title = "Unpause"
+
+    def __init__(
+        self,
+        *,
+        cid: int,
+        ref: str,
+        pending: int,
+        default_count_for: Callable[[int], int],
+    ) -> None:
+        super().__init__()
+        self._cid = cid
+        self._ref = ref
+        self._pending = pending
+        self._default_count_for = default_count_for
+        self._stage = "confirm"
+        self._count_input: urwid.Edit | None = None
+        self._body_pile: urwid.Pile | None = None
+
+    def build(self) -> urwid.Widget:
+        self._body_pile = urwid.Pile([])
+        self._render_stage()
+        return urwid.Filler(self._body_pile, valign="top")
+
+    def _render_stage(self) -> None:
+        assert self._body_pile is not None
+        widgets: list[urwid.Widget] = []
+        if self._stage == "confirm":
+            widgets.append(
+                urwid.Text(
+                    [("bold", f"{self._ref} paused — {self._pending} new posts")]
+                )
+            )
+            widgets.append(urwid.Divider())
+            widgets.append(urwid.Text("Unpause?"))
+            widgets.append(urwid.Divider())
+            widgets.append(
+                urwid.Text(
+                    [
+                        ("yellow", "  y"), ("default", " → unpause   "),
+                        ("yellow", "n"), ("default", " or "),
+                        ("yellow", "Esc"), ("default", " → cancel"),
+                    ]
+                )
+            )
+        elif self._stage == "count":
+            widgets.append(
+                urwid.Text(
+                    f"How many of {self._pending} pending posts to fetch?"
+                )
+            )
+            default = self._default_count_for(self._pending)
+            self._count_input = urwid.Edit(
+                f"  count [Enter = {default}]: ",
+            )
+            widgets.append(self._count_input)
+            widgets.append(urwid.Divider())
+            widgets.append(urwid.Text(("dim", "  Enter to submit · Esc to cancel")))
+        self._body_pile.contents = [(w, ("pack", None)) for w in widgets]
+        if self._stage == "count" and self._count_input is not None:
+            self._body_pile.focus_position = len(widgets) - 3
+        self._refresh_shell_selectability()
+
+    def _refresh_shell_selectability(self) -> None:
+        # See SubscribeModal._refresh_shell_selectability for why this
+        # nudge is required — LineBox caches _selectable on an empty Pile.
+        if self.shell is None:
+            return
+        try:
+            linebox = self.shell._w.original_widget
+            inner_pile = linebox._w
+            for w, _opts in inner_pile.contents:
+                if isinstance(w, urwid.Columns):
+                    w._contents_modified()
+            inner_pile._contents_modified()
+        except (AttributeError, IndexError):
+            pass
+
+    def keypress(self, size, key):
+        if key == "esc":
+            self.dismiss(None)
+            return None
+        if self._stage == "confirm":
+            if key in ("y", "Y"):
+                self._stage = "count"
+                self._render_stage()
+                return None
+            if key in ("n", "N"):
+                self.dismiss(None)
+                return None
+            return key
+        if self._stage == "count":
+            if key == "enter" and self._count_input is not None:
+                raw = self._count_input.edit_text.strip()
+                if not raw:
+                    n = self._default_count_for(self._pending)
+                else:
+                    try:
+                        n = int(raw)
+                    except ValueError:
+                        return None
+                    if n <= 0:
+                        return None
+                    if n > self._pending:
+                        n = self._pending
+                self.dismiss(n)
+                return None
             return key
         return key
 
@@ -2871,12 +2994,26 @@ class _UrwidApp:
             except ValueError:
                 cid = -1
             name = self._channel_name(cid) or ""
-            box = "☐" if unsubscribed else "☑"
-            return [
-                ("subscribe_check" if not unsubscribed else "dim", f"{box} "),
+            paused = 0
+            if not unsubscribed and self._ui._client is not None:
+                paused = self._ui._client.paused_channels().get(cid, 0)
+            if paused:
+                box = "⏸"
+                box_attr = "yellow"
+            elif unsubscribed:
+                box = "☐"
+                box_attr = "dim"
+            else:
+                box = "☑"
+                box_attr = "subscribe_check"
+            markup: list = [
+                (box_attr, f"{box} "),
                 ("default", f"{cid} #{name}"),
                 ("unread_badge", suffix),
             ]
+            if paused:
+                markup.append(("yellow", f" [{paused} paused]"))
+            return markup
         # DM.
         ham = self._ui._client.ham_name(key)
         label = f"{key}" if not ham else f"{key} ({ham})"
@@ -2975,14 +3112,14 @@ class _UrwidApp:
                 cid = int(key)
             except ValueError:
                 cid = -1
-            if (
-                cid >= 0
-                and not self._ui._offline
-                and not self._is_subscribed(cid)
-                and not self._ui._client.paused_channels().get(cid)
-            ):
-                self._open_subscribe_modal(cid, target=target)
-                return
+            if cid >= 0 and not self._ui._offline:
+                paused = self._ui._client.paused_channels().get(cid, 0)
+                if paused:
+                    self._open_unpause_modal(cid, target=target, pending=paused)
+                    return
+                if not self._is_subscribed(cid):
+                    self._open_subscribe_modal(cid, target=target)
+                    return
         self._ui._target = target
         asyncio.create_task(self._switch_centre_to(target))
         self._refresh_input_caption()
@@ -3778,6 +3915,42 @@ class _UrwidApp:
 
         asyncio.create_task(_wait())
 
+    def _open_unpause_modal(
+        self, cid: int, *, target: TargetKey, pending: int
+    ) -> None:
+        ref = self._channel_ref(cid)
+        client = self._ui._client
+
+        def default_count_for(n: int) -> int:
+            cap = client.auto_backfill_post_count or 10
+            return min(cap, n)
+
+        modal = UnpauseModal(
+            cid=cid,
+            ref=ref,
+            pending=pending,
+            default_count_for=default_count_for,
+        )
+
+        async def _wait() -> None:
+            n = await self._show_modal(modal)
+            if n is None:
+                return
+            try:
+                await client.unpause_channel(cid, post_count=int(n))
+            except Exception as e:
+                self._status_error(("red", f"[unpause] {e}"))
+                return
+            self._refresh_target_label(target)
+            self._ui._target = target
+            self._add_target(target)
+            await self._switch_centre_to(target)
+            self._refresh_input_caption()
+            self._refresh_footer()
+            self._refresh_thread_header(target)
+
+        asyncio.create_task(_wait())
+
     def _open_unsubscribe_modal(self, cid: int) -> None:
         ref = self._channel_ref(cid)
         modal = UnsubscribeModal(channel_ref=ref)
@@ -4326,13 +4499,14 @@ class _UrwidApp:
                 self._status_error(("yellow", f"/ch: unknown channel {args[0]!r}"))
                 return
             target = ("ch", str(cid))
-            if (
-                not self._ui._offline
-                and not self._is_subscribed(cid)
-                and not self._ui._client.paused_channels().get(cid)
-            ):
-                self._open_subscribe_modal(cid, target=target)
-                return
+            if not self._ui._offline:
+                paused = self._ui._client.paused_channels().get(cid, 0)
+                if paused:
+                    self._open_unpause_modal(cid, target=target, pending=paused)
+                    return
+                if not self._is_subscribed(cid):
+                    self._open_subscribe_modal(cid, target=target)
+                    return
             self._ui._target = target
             self._add_target(target)
             await self._switch_centre_to(target)
@@ -4346,7 +4520,10 @@ class _UrwidApp:
         elif cmd == "/vhistory":
             self._handle_history_toggle(args, verbose=True)
         elif cmd == "/list":
-            self._handle_list(args)
+            # The target list pane already shows subscribed channels and
+            # DM peers, so dumping the same info into the Log pane is
+            # just noise. Silently swallow the command.
+            pass
         elif cmd == "/users":
             self._handle_users()
         else:
@@ -4414,52 +4591,37 @@ class _UrwidApp:
             try:
                 n = int(args[1])
             except ValueError:
-                self._status_error(("yellow", f"/unpause: count must be int"))
+                self._status_error(("yellow", "/unpause: count must be int"))
                 return
-            try:
-                await self._ui._client.unpause_channel(cid, pc=n)
-            except Exception as e:
-                self._status_error(("red", f"/unpause: {e}"))
+            if n <= 0:
+                self._status_error(("yellow", "/unpause: count must be positive"))
                 return
         else:
-            try:
-                await self._ui._client.unpause_channel(cid)
-            except Exception as e:
-                self._status_error(("red", f"/unpause: {e}"))
+            n = self._ui._client.paused_channels().get(cid, 0)
+            if n <= 0:
+                self._status_error(
+                    (
+                        "yellow",
+                        f"/unpause cid={cid}: no pending count from pch "
+                        f"headers; pass /unpause {cid} N",
+                    )
+                )
                 return
-
-    def _handle_list(self, args: list[str]) -> None:
-        which = args[0] if args else None
-        # Channels.
-        if which is None or which == "ch":
-            try:
-                store_chs = list(self._ui._client._store.list_channels())  # type: ignore[attr-defined]
-            except Exception:
-                store_chs = []
-            seen = set()
-            self._status_write(("bold", "Subscribed channels:"))
-            for r in store_chs:
-                cid = int(r["cid"])
-                seen.add(cid)
-                name = r.get("name") or ""
-                self._status_write(f"  ☑ {cid} #{name}")
-            for ch in self._ui._channels:
-                if ch.cid in seen:
-                    continue
-                self._status_write(("dim", f"  ☐ {ch.cid} #{ch.name}"))
-        if which is None or which == "dm":
-            self._status_write(("bold", "DM peers:"))
-            try:
-                for row in self._ui._client._store.list_dm_peers(self._ui._my_call):  # type: ignore[attr-defined]
-                    call = row.get("peer") or ""
-                    self._status_write(f"  {call}")
-            except Exception as e:
-                _log.warning("/list dm: %s", e)
+        try:
+            await self._ui._client.unpause_channel(cid, post_count=n)
+        except Exception as e:
+            self._status_error(("red", f"/unpause: {e}"))
+            return
+        self._refresh_target_label(("ch", str(cid)))
+        self._status_write(
+            ("green", f"[unpause] requested {n} post(s) for {self._channel_ref(cid)}")
+        )
 
     def _handle_users(self) -> None:
-        self._status_write(("bold", "Online users:"))
-        for u in self._online_items.keys():
-            self._status_write(f"  {u}")
+        # Online users live in the always-visible left pane — re-render
+        # from the client's authoritative snapshot rather than dumping
+        # the same list into the Log pane.
+        self._refresh_online_pane(self._ui._client.online_users())
 
     # ------------------------------------------------------------------
     # Event dispatch (invoked by drain worker).
@@ -5052,6 +5214,7 @@ class _UrwidApp:
             if not isinstance(cid, int) or not isinstance(pt, int):
                 continue
             ref = self._channel_ref(cid)
+            self._refresh_target_label(("ch", str(cid)))
             self._write_to_active(
                 [
                     ("yellow", f"[paused {ref}]"),

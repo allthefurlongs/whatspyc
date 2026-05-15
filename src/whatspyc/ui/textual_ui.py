@@ -1444,6 +1444,122 @@ class SubscribeModal(ModalScreen[int | None]):
         self.dismiss(min(n, self._pc))
 
 
+class UnpauseModal(ModalScreen[int | None]):
+    """Two-stage unpause flow.
+
+    Stage 1 ("confirm"): "{ref} paused — {pending} new posts. Unpause?
+    [y/N]". Y advances to the count stage; N or Esc dismiss with
+    ``None``. Stage 2 ("count"): an ``Input`` for the post count —
+    Enter on empty uses the default, Enter on a positive integer
+    fetches that many (capped at ``pending``), Esc dismisses with
+    ``None``.
+
+    Unlike :class:`SubscribeModal` the pending count is known up
+    front (from the cached ``pch`` headers), so there is no
+    "waiting-for-ack" stage.
+
+    Dismiss values:
+    - ``None`` — user cancelled at any stage; the caller does nothing.
+    - ``int > 0`` — caller should call ``unpause_channel(cid,
+      post_count=result)`` and switch the centre pane to the channel.
+    """
+
+    BINDINGS = [
+        Binding("y", "yes", "Yes"),
+        Binding("n", "no", "No"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    UnpauseModal {
+        align: center middle;
+    }
+    #unpause-pane {
+        width: 60;
+        border: round $accent;
+        background: $surface;
+        padding: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        channel_ref: str,
+        pending: int,
+        default_count_for: Callable[[int], int],
+    ) -> None:
+        super().__init__()
+        self._channel_ref = channel_ref
+        self._pending = int(pending)
+        self._default_count_for = default_count_for
+        self._stage = "confirm"
+        self._default = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="unpause-pane"):
+            yield Static(
+                f"[bold]{self._channel_ref}[/] paused — "
+                f"{self._pending} new posts.\nUnpause?",
+                id="unpause-question",
+            )
+            yield Static(
+                "[dim]Y to unpause, N or Esc to cancel[/]",
+                id="unpause-hint",
+            )
+
+    def action_yes(self) -> None:
+        if self._stage != "confirm":
+            return
+        self.run_worker(self._advance_to_count(), exclusive=False)
+
+    def action_no(self) -> None:
+        if self._stage == "confirm":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    async def _advance_to_count(self) -> None:
+        self._stage = "count"
+        self._default = max(1, self._default_count_for(self._pending))
+        self.query_one("#unpause-question", Static).update(
+            f"How many of the {self._pending} pending posts to fetch?"
+        )
+        self.query_one("#unpause-hint", Static).update(
+            f"[dim]Enter to fetch (default {self._default}); Esc to cancel[/]"
+        )
+        pane = self.query_one("#unpause-pane", Vertical)
+        inp = Input(id="unpause-input", placeholder=f"default {self._default}")
+        await pane.mount(inp, before=self.query_one("#unpause-hint", Static))
+        inp.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Stop bubbling so the App-level submit handler doesn't treat
+        # the typed count as a chat message to the previously-active
+        # target.
+        event.stop()
+        if self._stage != "count":
+            return
+        text = event.value.strip()
+        if not text:
+            n = self._default
+        else:
+            try:
+                n = int(text)
+            except ValueError:
+                self.query_one("#unpause-hint", Static).update(
+                    f"[red]Expected integer, got {text!r}[/]"
+                )
+                return
+            if n <= 0:
+                self.query_one("#unpause-hint", Static).update(
+                    "[red]Post count must be positive[/]"
+                )
+                return
+        self.dismiss(min(n, self._pending))
+
+
 class NewDmModal(ModalScreen[str | None]):
     """Tiny modal asking for a callsign to start (or switch to) a DM thread.
 
@@ -1852,7 +1968,7 @@ def _format_connected_line(summary: ConnectSummary) -> str:
     ]
     if summary.paused_channels:
         n = len(summary.paused_channels)
-        parts.append(f"{n} paused channel(s) — see /unpause hint(s) above")
+        parts.append(f"{n} paused channel(s)")
     return "[Connected] " + ", ".join(parts)
 
 
@@ -2540,10 +2656,19 @@ class _WhatspycApp(App):
             except ValueError:
                 return f"ch:{key}{unread_suffix}"
             subscribed = self._is_subscribed(cid) and not unsubscribed
-            check = "☑" if subscribed else "☐"
+            paused = 0
+            if subscribed and self._ui._client is not None:
+                paused = self._ui._client.paused_channels().get(cid, 0)
+            if paused:
+                check = "[yellow]⏸[/]"
+            elif subscribed:
+                check = "☑"
+            else:
+                check = "☐"
             name = self._channel_name(cid)
             label = f"{check} {cid} #{name}" if name else f"{check} {cid}"
-            return f"{label}{unread_suffix}"
+            paused_suffix = f" [yellow]\\[{paused} paused][/]" if paused else ""
+            return f"{label}{unread_suffix}{paused_suffix}"
         return f"{_fmt_user(key, self._ui._client.ham_name)}{unread_suffix}"
 
     def _add_target(self, target: TargetKey, *, unsubscribed: bool = False) -> None:
@@ -2689,24 +2814,29 @@ class _WhatspycApp(App):
                     cid = int(target[1])
                 except ValueError:
                     cid = None
-                # Unsubscribed channel: open the subscribe modal and only
-                # commit the target / centre switch on confirm. Paused
-                # implies subscribed, so it falls through to the normal
-                # path below. Offline mode skips this whole flow — there's
-                # no subscribe to be done; just preview the local store.
-                if cid is not None and not self._is_subscribed(cid) \
-                        and not self._ui._client.paused_channels().get(cid):
-                    self._open_subscribe_modal(cid, target=target)
-                    return
+                if cid is not None:
+                    # Paused channels are subscribed on the server, but
+                    # activating one should prompt to unpause rather than
+                    # silently switching to a frozen view. Esc/N closes
+                    # the modal without switching; activating again
+                    # re-opens it.
+                    paused = self._ui._client.paused_channels().get(cid, 0)
+                    if paused:
+                        self._open_unpause_modal(
+                            cid, target=target, pending=paused
+                        )
+                        return
+                    if not self._is_subscribed(cid):
+                        # Unsubscribed: subscribe modal. Centre switch is
+                        # deferred to the modal's confirm path so a
+                        # cancel leaves the previous target active.
+                        self._open_subscribe_modal(cid, target=target)
+                        return
             self._ui._target = target
             await self._switch_centre_to(target)
             self._refresh_prompt()
             self._refresh_footer()
             self.query_one("#input", Input).focus()
-            if target[0] == "ch":
-                cid = int(target[1])
-                if self._ui._client.paused_channels().get(cid):
-                    self._maybe_print_paused_hint(cid)
             return
         # Active message list: Enter opens the action menu.
         active = self._active_view_id()
@@ -3890,6 +4020,49 @@ class _WhatspycApp(App):
 
         self.run_worker(_run(), exclusive=False)
 
+    def _open_unpause_modal(
+        self, cid: int, *, target: TargetKey, pending: int
+    ) -> None:
+        """Push the two-stage unpause modal for a paused channel.
+
+        On confirm + count answered, sends the ``cu`` frame and switches
+        the centre pane to the channel. On Esc/N at any stage, does
+        nothing — the previous target stays active and the channel
+        remains paused (so re-activating opens the modal again)."""
+        if self._refuse_offline("unpausing"):
+            return
+        c = self._ui._client
+
+        def default_count_for(n: int) -> int:
+            return min(c.auto_backfill_post_count or 10, n)
+
+        async def _run() -> None:
+            modal = UnpauseModal(
+                channel_ref=self._channel_ref(cid),
+                pending=pending,
+                default_count_for=default_count_for,
+            )
+            result = await self.push_screen_wait(modal)
+            if result is None:
+                return
+            try:
+                await c.unpause_channel(cid, post_count=int(result))
+            except Exception as exc:
+                self._status_error(f"[red][unpause][/] {exc}")
+                return
+            self._refresh_target_label(target)
+            self._ui._target = target
+            self._add_target(target)
+            await self._switch_centre_to(target)
+            self._refresh_prompt()
+            self._refresh_footer()
+            try:
+                self.query_one("#input", Input).focus()
+            except Exception:
+                pass
+
+        self.run_worker(_run(), exclusive=False)
+
     def _open_new_dm_modal(self) -> None:
         """Prompt for a callsign and open or switch to that DM thread.
 
@@ -4054,6 +4227,8 @@ class _WhatspycApp(App):
         elif t == "pch":
             for ch in obj.get("ch", []):
                 cid = ch.get("cid")
+                if cid is not None:
+                    self._refresh_target_label(("ch", str(int(cid))))
                 ref = self._channel_ref(int(cid)) if cid is not None else "ch"
                 self._write_to_active(
                     f"[yellow][paused {ref}][/] {ch.get('pt')} pending posts "
@@ -5237,21 +5412,21 @@ class _WhatspycApp(App):
                 self._status_error(f"[yellow]/ch: unknown channel {args[0]!r} (use cid or #name)[/]")
                 return
             target = ("ch", str(cid))
-            # Offline mode skips the subscribe prompt entirely — switching
-            # to an unsubscribed channel just shows whatever local history
-            # we have for it, with no opportunity to subscribe.
-            if not self._ui._offline \
-                    and not self._is_subscribed(cid) \
-                    and not self._ui._client.paused_channels().get(cid):
-                self._open_subscribe_modal(cid, target=target)
-                return
+            # Offline mode skips both prompts entirely — switching to an
+            # unsubscribed/paused channel just shows local history.
+            if not self._ui._offline:
+                paused = self._ui._client.paused_channels().get(cid, 0)
+                if paused:
+                    self._open_unpause_modal(cid, target=target, pending=paused)
+                    return
+                if not self._is_subscribed(cid):
+                    self._open_subscribe_modal(cid, target=target)
+                    return
             self._ui._target = target
             self._add_target(target)
             await self._switch_centre_to(target)
             self._refresh_prompt()
             self._refresh_footer()
-            if self._ui._client.paused_channels().get(cid):
-                self._maybe_print_paused_hint(cid)
         elif cmd == "/set":
             # The TUI replaces the inline /set listing with a modal;
             # any extra args are ignored — the modal is the editor.
@@ -5260,6 +5435,15 @@ class _WhatspycApp(App):
             self._handle_history_toggle(args, verbose=False)
         elif cmd == "/vhistory":
             self._handle_history_toggle(args, verbose=True)
+        elif cmd == "/list":
+            # Target list pane already shows channels and DM peers, so
+            # /list has nothing to add. Swallow silently rather than
+            # firing "unknown or malformed".
+            pass
+        elif cmd == "/users":
+            # Re-render the dedicated online pane from the client's
+            # snapshot instead of duplicating it into the status pane.
+            self._refresh_online_pane(self._ui._client.online_users())
         else:
             self._status_error(f"[yellow]unknown or malformed:[/] {line}")
 
@@ -5362,6 +5546,7 @@ class _WhatspycApp(App):
                 )
                 return
         await self._ui._client.unpause_channel(cid, post_count=n)
+        self._refresh_target_label(("ch", str(cid)))
         self._write_to_active(
             f"[green][unpause][/] requested {n} post(s) for "
             f"{self._channel_ref(cid)}"
