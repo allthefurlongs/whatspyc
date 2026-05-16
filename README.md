@@ -495,6 +495,12 @@ serving whatspyc, e.g. if whatspyc is listening on port 5904 and you
 have `CMDPORT 5904` it will be 0, but if you have `CMDPORT 5903,5904`
 it would be 1, and so on.
 
+The trailing `S` flag is **required** — it tells BPQ to use a
+line-oriented stream so whatspyc's output is flushed line-by-line to
+the connected user. Transparent/host-mode flags (`T` / `TRANS` / `B`)
+buffer output BPQ-side and produce cumulative re-emission where each
+new line arrives prefixed with everything printed so far.
+
 ## Environment variables
 
 | name | meaning |
