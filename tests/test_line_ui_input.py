@@ -111,6 +111,36 @@ def test_bpq_status_regex_matches_variants() -> None:
         assert _BPQ_STATUS_LINE_RE.match(s), s
 
 
+def test_read_line_drops_bpq_status_with_leading_nul(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A NUL keepalive sitting in the buffer when BPQ writes its
+    disconnect notification produces ``\\x00*** Disconnected from
+    Stream 10\\r\\n`` on a single readline. The C0 strip must run
+    *before* the regex match so the leading NUL doesn't defeat the
+    anchored ``^\\*\\*\\*`` pattern."""
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO("\x00*** Disconnected from Stream 10\r\n"),
+    )
+    ui = _make_ui(tmp_path)
+    line = asyncio.run(ui._read_line())
+    assert line == ""
+
+
+def test_read_line_drops_bpq_status_with_trailing_nul(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Trailing NUL — strip is bidirectional, so this drops too."""
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO("*** Disconnected from Stream 10\x00\r\n"),
+    )
+    ui = _make_ui(tmp_path)
+    line = asyncio.run(ui._read_line())
+    assert line == ""
+
+
 def test_bpq_status_regex_ignores_user_text() -> None:
     """The prefix is specific enough that ordinary chat — including
     messages that happen to start with ``***`` — isn't swallowed."""
