@@ -97,8 +97,10 @@ class LineUI:
         # other than the current /ch target. Drives the
         # [New posts in CID:#name (N)] notification line. Cleared
         # per-cid on /ch CID via ``store.mark_channel_read``. Outbound
-        # echoes are excluded both in the live increment path and in
-        # the persistent count.
+        # rows are excluded both in the live increment path and in the
+        # persistent count — see ``_handle_live_post`` for the wider
+        # outbound-non-target policy (silently dropped, parallel to
+        # ``_handle_live_dm``).
         self._unread_posts: dict[int, int] = dict(
             client._store.unread_post_counts_all(my_call)  # type: ignore[attr-defined]
         )
@@ -497,30 +499,40 @@ class LineUI:
 
     def _handle_live_post(self, cid: int | None, p: dict) -> None:
         """Live ``cp`` event: render in full when it belongs to the
-        current /ch target (or it's our own outbound echo); otherwise
-        summarise as ``[New posts in CID:#name (N)]`` per the
-        ``notify_new_posts`` option. ``cid is None`` is treated as
+        current /ch target; otherwise summarise inbound rows as
+        ``[New posts in CID:#name (N)]`` per ``notify_new_posts`` and
+        silently drop outbound rows. ``cid is None`` is treated as
         non-target and ignored — the protocol shouldn't send a `cp`
         without a cid, but defensively we don't track unknown channels.
+
+        Outbound non-target policy mirrors :meth:`_handle_live_dm`: the
+        only way an `fc == my_call` post arrives here without `/ch`
+        being on that channel is a server replay (fresh-DB connect,
+        rolled-back cursor, second client instance posting the same
+        channel) — none of which are fresh sends the user is waiting
+        for echo confirmation on. When the user does post locally,
+        they're already `/ch`'d in, so the target check covers that.
         """
         if cid is None:
             self._render_post(cid, p)
             return
         cid_int = int(cid)
-        is_outbound = self._is_outbound_post(p)
-        if is_outbound or self._is_ch_target(cid_int):
+        if self._is_ch_target(cid_int):
             self._render_post(cid_int, p)
-            if not is_outbound:
+            if not self._is_outbound_post(p):
                 self._client._store.mark_channel_read(cid_int)  # type: ignore[attr-defined]
+            return
+        if self._is_outbound_post(p):
             return
         self._unread_posts[cid_int] = self._unread_posts.get(cid_int, 0) + 1
         if self._options.notify_new_posts:
             print(self._fmt_unread_posts_notice())
 
     def _handle_live_post_batch(self, cid: int | None, items: list[dict]) -> None:
-        """``cpb`` event: render target / outbound items in full and
-        coalesce non-target inbound items into a single notification
-        line at the end (parallels the ``mb`` handling)."""
+        """``cpb`` event: render target items in full, coalesce non-target
+        inbound items into a single notification line at the end, and
+        silently drop non-target outbound items — see
+        :meth:`_handle_live_post`."""
         if cid is None:
             for p in items:
                 self._render_post(cid, p)
@@ -530,10 +542,12 @@ class LineUI:
         active_inbound_seen = False
         for p in items:
             is_outbound = self._is_outbound_post(p)
-            if is_outbound or self._is_ch_target(cid_int):
+            if self._is_ch_target(cid_int):
                 self._render_post(cid_int, p)
                 if not is_outbound:
                     active_inbound_seen = True
+                continue
+            if is_outbound:
                 continue
             self._unread_posts[cid_int] = self._unread_posts.get(cid_int, 0) + 1
             suppressed += 1

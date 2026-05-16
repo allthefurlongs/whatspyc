@@ -1837,12 +1837,15 @@ def test_notify_new_posts_renders_in_full_for_active_target(
     store.close()
 
 
-def test_notify_new_posts_outbound_echo_always_renders(
+def test_notify_new_posts_outbound_non_target_silently_dropped(
     tmp_path: Path, capsys
 ) -> None:
-    """Our own outbound posts (cp echo with fc == my_call) always render
-    in full, regardless of the current target — they aren't 'unread' to
-    summarise."""
+    """Outbound `cp` arriving outside the current /ch target is silently
+    dropped — parallels the DM handling. The only way an fc==my_call
+    post reaches us without /ch on that channel is a server replay or
+    a second client instance; in either case the user has already seen
+    the send context elsewhere, and surfacing it to a non-target
+    channel is just noise."""
     channels = [ChannelInfo(cid=5, name="lounge")]
     ui, store = _make_ui(tmp_path, channels=channels)
     # No /ch target.
@@ -1850,8 +1853,10 @@ def test_notify_new_posts_outbound_echo_always_renders(
         {"t": "cp", "cid": 5, "fc": "M0ABC", "p": "outbound", "ts": 1}
     )
     out = capsys.readouterr().out
-    assert "outbound" in out
+    assert "outbound" not in out
     assert "New posts in" not in out
+    # Outbound rows also don't bump the unread counter.
+    assert ui._unread_posts.get(5, 0) == 0
     store.close()
 
 
@@ -1890,8 +1895,10 @@ def test_notify_new_posts_batch_emits_single_summary(
     tmp_path: Path, capsys
 ) -> None:
     """A `cpb` batch coalesces non-target inbound posts into ONE summary
-    line — same parallel as the `mb` case for DMs. Outbound items in the
-    same batch still render in full."""
+    line — same parallel as the `mb` case for DMs. Outbound items in
+    the same batch (e.g. backlog replay including a row we sent from a
+    second client) are silently dropped, not rendered and not counted
+    toward the summary — parallels :meth:`_handle_live_dm_batch`."""
     channels = [ChannelInfo(cid=5, name="lounge")]
     ui, store = _make_ui(
         tmp_path,
@@ -1905,8 +1912,8 @@ def test_notify_new_posts_batch_emits_single_summary(
             "p": [
                 {"fc": "M0FOO", "p": "x", "ts": 1},
                 {"fc": "G0BAR", "p": "y", "ts": 2},
-                # Outbound — should render in full inside the batch
-                # rather than count toward the summary.
+                # Outbound — should be silently dropped, neither
+                # rendered in full nor counted toward the summary.
                 {"fc": "M0ABC", "p": "z-mine", "ts": 3},
             ],
         }
@@ -1914,9 +1921,9 @@ def test_notify_new_posts_batch_emits_single_summary(
     out = capsys.readouterr().out
     summary = [l for l in out.splitlines() if l.startswith("[New posts in")]
     assert summary == ["[New posts in 5:#lounge (2)]"]
-    # Own post body still renders.
-    assert "z-mine" in out
-    # Inbound bodies do not.
+    # Own post body is suppressed.
+    assert "z-mine" not in out
+    # Inbound bodies do not appear in full either.
     assert "x" not in out.replace("\\x", "")  # rough body-absence check
     store.close()
 
