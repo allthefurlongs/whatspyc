@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from whatspyc.store.store import SqliteStore
-from whatspyc.ui.line import LineUI, _INPUT_CONTROL_STRIP
+from whatspyc.ui.line import LineUI, _BPQ_STATUS_LINE_RE, _INPUT_CONTROL_STRIP
 from whatspyc.ui.options import SessionOptions
 
 
@@ -85,3 +85,40 @@ def test_read_line_preserves_emoji(tmp_path: Path, monkeypatch) -> None:
     ui = _make_ui(tmp_path)
     line = asyncio.run(ui._read_line())
     assert line == "hello \U0001f44d"
+
+
+def test_bpq_disconnect_status_line_dropped(tmp_path: Path, monkeypatch) -> None:
+    """When the user leaves the WPS application back to the node prompt,
+    BPQ writes ``*** Disconnected from Stream <N>`` into stdin. If a
+    /dm or /ch target was set, that line would otherwise be posted as
+    a chat message. ``_read_line`` returns an empty string so the run
+    loop's empty-line skip drops it."""
+    monkeypatch.setattr("sys.stdin", io.StringIO("*** Disconnected from Stream 10\r\n"))
+    ui = _make_ui(tmp_path)
+    line = asyncio.run(ui._read_line())
+    assert line == ""
+
+
+def test_bpq_status_regex_matches_variants() -> None:
+    """The regex matches the canonical form and is lenient about what
+    follows ``Stream`` — any stream id, with or without trailing junk."""
+    for s in (
+        "*** Disconnected from Stream 1",
+        "*** Disconnected from Stream 10",
+        "*** Disconnected from Stream 999",
+        "*** Disconnected from Stream 10 (timeout)",
+    ):
+        assert _BPQ_STATUS_LINE_RE.match(s), s
+
+
+def test_bpq_status_regex_ignores_user_text() -> None:
+    """The prefix is specific enough that ordinary chat — including
+    messages that happen to start with ``***`` — isn't swallowed."""
+    for s in (
+        "*** hello",
+        "hello *** Disconnected from Stream 10",  # not at start
+        "*** Disconnected from stream 10",        # case-sensitive
+        "/quit",
+        "ack received",
+    ):
+        assert not _BPQ_STATUS_LINE_RE.match(s), s

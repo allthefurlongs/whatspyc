@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import re
 import sys
 import time
 from typing import Callable
@@ -46,6 +47,18 @@ _INPUT_CONTROL_STRIP = (
     + "".join(chr(b) for b in range(0x0e, 0x20))    # 0x0e-0x1f  SO..US
     + "\x7f"                                        # DEL
 )
+
+# BPQ writes ``*** Disconnected from Stream <N>`` into the WPS-facing
+# stdin pipe when the user leaves the application back to the node
+# prompt. By then the user has already initiated quit, but the line
+# may still be sitting in the read buffer when the next loop iteration
+# pulls it — and if a /dm or /ch target is set, the line UI would
+# post it as a chat message. Match the prefix and drop the line in
+# ``_read_line``. The trailing portion is left unanchored so this
+# survives any future BPQ variant on the stream-id format or wording
+# after ``Stream`` (a literal user-typed message starting with this
+# prefix is implausible).
+_BPQ_STATUS_LINE_RE = re.compile(r"^\*\*\* Disconnected from Stream\b")
 
 
 class LineUI:
@@ -230,7 +243,12 @@ class LineUI:
                 return None
             # rstrip the line terminator, then strip C0 controls + DEL
             # from both ends. See _INPUT_CONTROL_STRIP for the why.
-            return line.rstrip("\n").rstrip("\r").strip(_INPUT_CONTROL_STRIP)
+            cleaned = line.rstrip("\n").rstrip("\r").strip(_INPUT_CONTROL_STRIP)
+            # Drop BPQ status-line injections so they don't get posted
+            # to whatever target is set. See _BPQ_STATUS_LINE_RE.
+            if _BPQ_STATUS_LINE_RE.match(cleaned):
+                return ""
+            return cleaned
         finally:
             if not stop_task.done():
                 stop_task.cancel()

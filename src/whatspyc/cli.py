@@ -25,7 +25,7 @@ from whatspyc.transport.direct_tcp import DirectTcpStream
 from whatspyc.transport.rhp_session import RhpConfig
 from whatspyc.transport.rhp_tcp import RhpTcpStream
 from whatspyc.transport.rhp_ws import RhpWebSocketStream
-from whatspyc.ui.line import LineUI
+from whatspyc.ui.line import _INPUT_CONTROL_STRIP, LineUI
 from whatspyc.ui.options import SessionOptions
 from whatspyc.ui.textual_ui import TextualUI
 from whatspyc.ui.urwid_ui import UrwidUI
@@ -326,7 +326,17 @@ def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
             default=str(default_idx),
             show_default=True,
         )
-        s = str(raw).strip()
+        # Packet terminals reached through a node sometimes deliver a
+        # bare ``\r`` or a NUL-prefixed blank line for a plain Enter
+        # press, neither of which click.prompt recognises as empty —
+        # it returns the raw bytes instead of the default. Scrub the
+        # same C0+DEL set ``LineUI._read_line`` handles (gotcha 15a)
+        # so an Enter-only line collapses to ``""`` and gets mapped
+        # back to the default. Without this the user sees
+        # ``not a recognised choice: ''`` after every Enter.
+        s = str(raw).strip().strip(_INPUT_CONTROL_STRIP)
+        if not s:
+            s = str(default_idx)
         if s.lower() == "q":
             raise click.exceptions.Exit(0)
         if s.lower() == "v":

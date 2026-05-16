@@ -46,6 +46,40 @@ def test_interactive_pick_returns_offline_for_zero(monkeypatch, capsys) -> None:
     assert cli._is_offline_profile(p)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",        # canonical empty (TTY Enter)
+        "\r",      # bare CR — packet terminal without LF translation
+        "\x00",    # NUL keepalive that survived into the read buffer
+        "\x00\r",  # NUL then CR
+        " ",       # whitespace-only
+    ],
+    ids=["empty", "bare-cr", "nul-only", "nul-cr", "whitespace"],
+)
+def test_interactive_pick_blank_line_uses_default(monkeypatch, raw) -> None:
+    """A plain Enter at the picker — even when the packet terminal sends
+    ``\\r``-only or a NUL-prefixed blank — must select the configured
+    ``default_profile``. Without the scrub-and-substitute in
+    ``_interactive_pick`` these vectors fell through to ``not a
+    recognised choice: ''``."""
+    from whatspyc.config import ConnectProfile
+    c = Config(
+        connect_profiles=[
+            ConnectProfile(name="alpha", transport="direct-tcp", host="h", port=1),
+            ConnectProfile(name="beta", transport="direct-tcp", host="h", port=1),
+        ],
+        default_profile="beta",
+    )
+    # click.prompt returns the raw bytes when the input is non-empty,
+    # falling back to the default when it's truly "". Simulate that
+    # behaviour directly so the test exercises the same branch as the
+    # node-pipe scenario.
+    monkeypatch.setattr(click, "prompt", lambda *a, **kw: raw or kw.get("default", ""))
+    p = cli._interactive_pick(c)
+    assert p.name == "beta"
+
+
 def test_pick_profile_accepts_offline_name() -> None:
     c = Config()
     p = cli._pick_profile(
