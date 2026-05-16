@@ -188,27 +188,39 @@ class WpsClient:
         # immediately re-trip it.
         self._last_outbound_ts = time.monotonic()
         self._stream = self._stream_factory()
-        await self._stream.open()
-        if self._connect_script:
-            # Drive the node-prompt hop chain (e.g. ``C MB7NPW`` →
-            # ``Connected`` → ``C WPS`` → …) before any WPS bytes flow.
-            # Must complete fully before the FrameDecoder starts consuming.
-            await run_connect_script(
-                self._stream,
-                self._connect_script,
-                on_progress=self._hop_progress,
-            )
-        if not self._stream.injects_callsign:
-            # Direct TCP to the WPS daemon: client must send the callsign
-            # line itself. RHP paths skip this — the upstream node has
-            # already pre-sent it on the WPS-facing socket.
-            await self._stream.send(f"{self._my_call}\r\n".encode("utf-8"))
-        record = self._store.connect_record(self._name, self._my_call, CLIENT_VERSION)
-        # _send is not yet usable (connected event isn't set), so log
-        # directly here to keep the trace symmetric with post-handshake
-        # outbound traffic.
-        logger.debug("WPS> %s", json.dumps(record, separators=(",", ":")))
-        await self._stream.send(codec.encode(record))
+        try:
+            await self._stream.open()
+            if self._connect_script:
+                # Drive the node-prompt hop chain (e.g. ``C MB7NPW`` →
+                # ``Connected`` → ``C WPS`` → …) before any WPS bytes flow.
+                # Must complete fully before the FrameDecoder starts consuming.
+                await run_connect_script(
+                    self._stream,
+                    self._connect_script,
+                    on_progress=self._hop_progress,
+                )
+            if not self._stream.injects_callsign:
+                # Direct TCP to the WPS daemon: client must send the callsign
+                # line itself. RHP paths skip this — the upstream node has
+                # already pre-sent it on the WPS-facing socket.
+                await self._stream.send(f"{self._my_call}\r\n".encode("utf-8"))
+            record = self._store.connect_record(self._name, self._my_call, CLIENT_VERSION)
+            # _send is not yet usable (connected event isn't set), so log
+            # directly here to keep the trace symmetric with post-handshake
+            # outbound traffic.
+            logger.debug("WPS> %s", json.dumps(record, separators=(",", ":")))
+            await self._stream.send(codec.encode(record))
+        except BaseException:
+            # Partial handshake — close the half-built stream so the caller
+            # can safely retry open() without leaking the socket / WS / RHP
+            # session it allocated.
+            stream, self._stream = self._stream, None
+            if stream is not None:
+                try:
+                    await stream.close()
+                except Exception:
+                    pass
+            raise
         self._connected.set()
 
     async def close(self) -> None:

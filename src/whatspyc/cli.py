@@ -61,6 +61,18 @@ def _apply_textual_perf_env(c: cfg_mod.Config) -> None:
 OFFLINE_PROFILE_NAME = "<offline>"
 _OFFLINE_PROFILE = ConnectProfile(name=OFFLINE_PROFILE_NAME)
 
+# Initial-connect retry budget. The WS handshake to BPQ-RHP occasionally
+# fails with `InvalidMessage: did not receive a valid HTTP response` (and
+# other transient network blips can produce ConnectionResetError /
+# IncompleteReadError) on the very first attempt right after profile
+# selection. A small bounded retry hides the flake without masking a real
+# config error — five attempts at 1 s caps the worst-case wait at ~5 s
+# before the user sees the same error they'd see today. Distinct from
+# `auto_reconnect` / `reconnect_max_retries`, which govern post-handshake
+# link-loss recovery once a session is up.
+_CONNECT_MAX_ATTEMPTS = 5
+_CONNECT_RETRY_DELAY_S = 1.0
+
 
 def _is_offline_profile(p: ConnectProfile) -> bool:
     return p.name == OFFLINE_PROFILE_NAME
@@ -129,6 +141,15 @@ def _apply_nodecmd_mode(
     call = raw_call.strip().upper()
     if not call:
         raise click.UsageError("--nodecmd: no callsign on stdin")
+
+    # Banner can't go at the very top in --nodecmd (the convention is
+    # silence before reading the callsign), so show it now — first thing
+    # the user sees after their callsign was picked up, before the
+    # first-run name prompt / profile picker / connect output.
+    click.echo(
+        f"\nwhatspyc (v{__version__}) text-only WhatsPac client - WhatsPac is "
+        "designed for GUI experience, try it at http://whatspac.oarc.uk/\n"
+    )
 
     # State dir is keyed on the bare callsign so a single operator gets one
     # store regardless of which SSID their node hands us (some nodes pass
@@ -469,13 +490,13 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
          reconnect_max_retries, log_level, log_file, log_console, conf) -> None:
     """Connect to a WhatsPac service and drop into an interactive prompt."""
     # `--nodecmd` reads the callsign from stdin with no prompt printed
-    # first — that's the convention packet nodes follow. Skip the banner
-    # in that mode so the program's first stdout write is either the
-    # name prompt (first run for that call) or the connect output.
+    # first — that's the convention packet nodes follow. In that mode
+    # the banner is printed inside `_apply_nodecmd_mode` instead, right
+    # after the callsign read.
     if not nodecmd:
         click.echo(
-            f"\nwhatspyc (v{__version__}) text-only WhatsPac client - WhatsPac is designed for "
-            "GUI experience, try it at http://whatspac.oarc.uk/\n"
+            f"\nwhatspyc (v{__version__}) text-only WhatsPac client - WhatsPac is "
+            "designed for GUI experience, try it at http://whatspac.oarc.uk/\n"
         )
     conf_path = conf if conf is not None else cfg_mod.config_path()
     try:
@@ -1098,7 +1119,19 @@ async def _connect_and_run_ui(
     )
 
     async def _connect_phase():
-        await client.open()
+        for attempt in range(1, _CONNECT_MAX_ATTEMPTS + 1):
+            try:
+                await client.open()
+                break
+            except Exception as exc:
+                if attempt == _CONNECT_MAX_ATTEMPTS:
+                    raise
+                click.echo(
+                    f"Connect attempt {attempt}/{_CONNECT_MAX_ATTEMPTS} "
+                    f"failed: {_format_connect_error(exc)}. Retrying in "
+                    f"{_CONNECT_RETRY_DELAY_S:g}s..."
+                )
+                await asyncio.sleep(_CONNECT_RETRY_DELAY_S)
         click.echo("Sending connection details...")
         return await seq.wait()
 
