@@ -25,10 +25,7 @@ from whatspyc.transport.direct_tcp import DirectTcpStream
 from whatspyc.transport.rhp_session import RhpConfig
 from whatspyc.transport.rhp_tcp import RhpTcpStream
 from whatspyc.transport.rhp_ws import RhpWebSocketStream
-from whatspyc.ui.line import _INPUT_CONTROL_STRIP, LineUI
 from whatspyc.ui.options import SessionOptions
-from whatspyc.ui.textual_ui import TextualUI
-from whatspyc.ui.urwid_ui import UrwidUI
 from whatspyc.wps.client import WpsClient
 from whatspyc.wps.connect_seq import ConnectSequence, ConnectSummary
 from whatspyc.wps.hop_script import HopScriptError, HopStep
@@ -314,6 +311,9 @@ def _list_profiles(c: cfg_mod.Config, *, verbose: bool) -> None:
 
 
 def _interactive_pick(c: cfg_mod.Config) -> ConnectProfile:
+    # Lazy: avoids dragging whatspyc.ui.line into a textual/urwid startup.
+    from whatspyc.ui.line import _INPUT_CONTROL_STRIP
+
     _list_profiles(c, verbose=False)
     names = [p.name for p in c.connect_profiles]
     default_idx = next(
@@ -755,7 +755,11 @@ async def _run_session_driven(
     )
     # Picker entries: <offline> at index 0, then configured profiles.
     available = [_OFFLINE_PROFILE] + list(c.connect_profiles)
+    # Lazy: each UI backend drags ~100-200ms of imports cold; only load the
+    # one the user picked. Matters on slow hardware (Pi-class).
     if c.ui == "textual":
+        from whatspyc.ui.textual_ui import TextualUI
+
         ui = TextualUI(
             client=None,
             my_call=c.app_call,  # type: ignore[arg-type]
@@ -770,6 +774,8 @@ async def _run_session_driven(
             is_offline_profile=_is_offline_profile,
         )
     else:
+        from whatspyc.ui.urwid_ui import UrwidUI
+
         ui = UrwidUI(
             client=None,
             my_call=c.app_call,  # type: ignore[arg-type]
@@ -964,6 +970,8 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
         notify_user_conn=c.notify_user_conn,
     )
     if c.ui == "textual":
+        from whatspyc.ui.textual_ui import TextualUI
+
         ui = TextualUI(  # type: ignore[arg-type]
             client,
             my_call=c.app_call,
@@ -974,6 +982,8 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
             cursor_blink=not c.low_power_mode,
         )
     elif c.ui == "urwid":
+        from whatspyc.ui.urwid_ui import UrwidUI
+
         ui = UrwidUI(  # type: ignore[arg-type]
             client,
             my_call=c.app_call,
@@ -983,6 +993,8 @@ async def _run_offline(c: cfg_mod.Config, store: SqliteStore) -> None:
             offline=True,
         )
     else:
+        from whatspyc.ui.line import LineUI
+
         ui = LineUI(  # type: ignore[arg-type]
             client,
             my_call=c.app_call,
@@ -1049,6 +1061,8 @@ async def _connect_and_run_ui(
         notify_user_conn=c.notify_user_conn,
     )
     if c.ui == "textual":
+        from whatspyc.ui.textual_ui import TextualUI
+
         ui = TextualUI(  # type: ignore[arg-type]
             client,
             my_call=c.app_call,
@@ -1058,6 +1072,8 @@ async def _connect_and_run_ui(
             cursor_blink=not c.low_power_mode,
         )
     elif c.ui == "urwid":
+        from whatspyc.ui.urwid_ui import UrwidUI
+
         ui = UrwidUI(  # type: ignore[arg-type]
             client,
             my_call=c.app_call,
@@ -1066,6 +1082,8 @@ async def _connect_and_run_ui(
             options=options,
         )
     else:
+        from whatspyc.ui.line import LineUI
+
         ui = LineUI(  # type: ignore[arg-type]
             client,
             my_call=c.app_call,
