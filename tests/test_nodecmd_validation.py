@@ -118,3 +118,57 @@ def test_nodecmd_eof_before_name_on_first_use(tmp_path: Path, monkeypatch) -> No
             my_call_cli=None,
             state_dir_cli=None,
         )
+
+
+def test_nodecmd_rejects_log_console_stderr(tmp_path: Path, monkeypatch) -> None:
+    """The node pipes our stderr back to the radio user, so any non-off
+    console log sink leaks into their session — reject it explicitly."""
+    monkeypatch.setattr("sys.stdin", io.StringIO("M0ABC\n"))
+    with pytest.raises(click.UsageError, match="log_console=off"):
+        cli._apply_nodecmd_mode(
+            _cfg(tmp_path),
+            ui_mode=None,
+            my_call_cli=None,
+            state_dir_cli=None,
+            log_console_cli="stderr",
+        )
+
+
+def test_nodecmd_rejects_log_console_pane(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO("M0ABC\n"))
+    with pytest.raises(click.UsageError, match="log_console=off"):
+        cli._apply_nodecmd_mode(
+            _cfg(tmp_path),
+            ui_mode=None,
+            my_call_cli=None,
+            state_dir_cli=None,
+            log_console_cli="pane",
+        )
+
+
+def test_nodecmd_accepts_explicit_log_console_off(tmp_path: Path, monkeypatch) -> None:
+    """``--log-console off`` is redundant under --nodecmd but fine."""
+    monkeypatch.setattr("sys.stdin", io.StringIO("M0ABC\nMatt\n"))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    c = _cfg(tmp_path)
+    cli._apply_nodecmd_mode(
+        c,
+        ui_mode=None,
+        my_call_cli=None,
+        state_dir_cli=None,
+        log_console_cli="off",
+    )
+    assert c.log_console == "off"
+
+
+def test_nodecmd_forces_log_console_off(tmp_path: Path, monkeypatch) -> None:
+    """Even without an explicit --log-console flag, nodecmd silences the
+    console sink so a stderr-default config can't leak through the node pipe."""
+    monkeypatch.setattr("sys.stdin", io.StringIO("M0ABC\nMatt\n"))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    c = _cfg(tmp_path)
+    c.log_console = "stderr"
+    cli._apply_nodecmd_mode(
+        c, ui_mode=None, my_call_cli=None, state_dir_cli=None
+    )
+    assert c.log_console == "off"

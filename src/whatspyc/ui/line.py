@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 import sys
 import time
 from typing import Callable
@@ -28,6 +29,8 @@ from whatspyc.ui import (
 )
 from whatspyc.ui.options import SessionOptions
 from whatspyc.wps.client import WpsClient
+
+_log = logging.getLogger(__name__)
 
 
 class LineUI:
@@ -208,6 +211,7 @@ class LineUI:
             if self._stop.is_set():
                 return None
             line = read_fut.result()
+            _log.debug("stdin raw line: %r", line)
             if line == "":  # EOF
                 return None
             return line.rstrip("\n").rstrip("\r")
@@ -237,6 +241,12 @@ class LineUI:
             line = line.strip()
             if not line:
                 continue
+            _log.debug(
+                "stripped line: %r (startswith-slash=%s, target=%r)",
+                line,
+                line.startswith("/"),
+                self._target,
+            )
             try:
                 if line.startswith("/"):
                     await self._handle_command(line)
@@ -924,6 +934,7 @@ class LineUI:
         )
 
     async def _send_to_target(self, text: str) -> None:
+        _log.debug("_send_to_target: text=%r target=%r", text, self._target)
         if self._refuse_offline("sending"):
             return
         if self._target is None:

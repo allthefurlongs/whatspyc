@@ -404,6 +404,11 @@ the per-call data: `--my-call`, `--state-dir`, and `--ui textual` /
 top-level `name = …` config key are ignored — only the per-call
 `name.txt` is consulted.
 
+The console log sink is forced to `off` under `--nodecmd` (the node
+pipes stderr back to the radio user, so anything written there leaks
+into their session). Use `--log-file` to capture logs; `--log-console`
+with any value other than `off` is rejected at startup.
+
 ```toml
 # ~/.config/whatspyc/config.toml on the node
 node_state_dir = "/var/lib/whatspyc/users"

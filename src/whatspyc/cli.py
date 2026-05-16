@@ -75,10 +75,12 @@ def _apply_nodecmd_mode(
     ui_mode: str | None,
     my_call_cli: str | None,
     state_dir_cli: Path | None,
+    log_console_cli: str | None = None,
     conf_path: Path | None = None,
 ) -> None:
     """Apply ``--nodecmd`` mode in place: read callsign + (first-use) name
-    from stdin, derive a per-call state dir, force ``ui = "line"``.
+    from stdin, derive a per-call state dir, force ``ui = "line"``, and
+    silence the console log sink so it can't leak into the node pipe.
 
     Designed for packet-node deployment: the node hands the user's
     callsign to the program on stdin (a long-standing convention) and the
@@ -99,6 +101,15 @@ def _apply_nodecmd_mode(
         raise click.UsageError(
             "--nodecmd derives state-dir from node_state_dir/<CALL>; "
             "--state-dir is not allowed"
+        )
+    if log_console_cli is not None and log_console_cli != "off":
+        # The node pipes our stdout AND stderr back to the radio user,
+        # so any console-targeted log record leaks straight into their
+        # session. Force "off" and reject any explicit non-off override.
+        raise click.UsageError(
+            "--nodecmd forces log_console=off (the node pipes stderr to "
+            f"the radio user); --log-console {log_console_cli!r} cannot "
+            "be used with it. Use --log-file to capture logs instead."
         )
     if c.node_state_dir is None:
         raise click.UsageError(
@@ -149,6 +160,7 @@ def _apply_nodecmd_mode(
     c.name = name
     c.state_dir = state_dir
     c.ui = "line"
+    c.log_console = "off"
 
 
 def _build_stream_for(profile: ConnectProfile, my_call: str) -> AsyncByteStream:
@@ -466,6 +478,7 @@ def main(profile_name, no_prompt, hops, engine, transport, host, port, radio_por
             ui_mode=ui_mode,
             my_call_cli=my_call,
             state_dir_cli=state_dir,
+            log_console_cli=log_console,
             conf_path=conf_path,
         )
     # Precedence: CLI flag > config key > env var (WHATSPYC_LOG, handled in
